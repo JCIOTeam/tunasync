@@ -19,12 +19,23 @@ pub mod runner;
 pub mod schedule;
 pub mod worker;
 
+use std::path::PathBuf;
+
 use anyhow::{Context, Result};
 use config::ProviderKind;
 #[cfg(target_os = "linux")]
 use hooks::CgroupHook;
 use hooks::{BtrfsSnapshotHook, DockerHook, ExecOn, ExecPostHook, JobHook, LogLimitHook, ZfsHook};
 use providers::{CmdProvider, RsyncProvider, TwoStageRsyncProvider};
+
+/// Expand Go template syntax in `log_dir`.
+///
+/// Go's `formatLogDir` uses `html/template` with `{{.Name}}` resolving
+/// to the mirror name. We support `{{.Name}}` only since that is the
+/// only template variable used in practice.
+fn expand_log_dir_template(log_dir: &str, mirror_name: &str) -> String {
+    log_dir.replace("{{.Name}}", mirror_name)
+}
 
 /// Expand `global.include` glob patterns and merge the resulting mirror configs
 /// into `cfg.mirrors_conf`.  Called at startup and on hot-reload.
@@ -121,11 +132,13 @@ fn build_providers(
         };
 
         // Build hooks for this mirror.
-        let log_dir = if mc.log_dir.is_empty() {
-            std::path::PathBuf::from(&cfg.global.log_dir)
+        // Go supports {{.Name}} template syntax in log_dir — we expand it here.
+        let log_dir_raw = if mc.log_dir.is_empty() {
+            cfg.global.log_dir.clone()
         } else {
-            std::path::PathBuf::from(&mc.log_dir)
+            mc.log_dir.clone()
         };
+        let log_dir = PathBuf::from(expand_log_dir_template(&log_dir_raw, &mc.name));
         let working_dir = mc.effective_mirror_dir(&cfg.global);
         let log_file = log_dir.join(format!("{}.log", mc.name));
 
