@@ -52,10 +52,10 @@ exchange the string form.
 | Go field       | JSON key         | Rust field                      |
 |----------------|------------------|---------------------------------|
 | `ID`           | `id`             | `id: String`                    |
-| `URL`          | `url`            | `url: String`                   |
-| `Token`        | `token`          | `token: String`                 |
-| `LastOnline`   | `last_online`    | `last_online: DateTime<Utc>`    |
-| `LastRegister` | `last_register`  | `last_register: DateTime<Utc>`  |
+| `URL`          | `url`            | `url: String`                    |
+| `Token`        | `token`          | `token: String`                  |
+| `LastOnline`   | `last_online`    | `last_online: DateTime<Utc>`     |
+| `LastRegister` | `last_register`  | `last_register: DateTime<Utc>`   |
 
 ## `MirrorSchedule` / `MirrorSchedules`
 
@@ -75,6 +75,75 @@ exchange the string form.
 | `WorkerID`† | `worker_id`† | `worker_id: String`†                    | †`ClientCmd` only              |
 | `Args`      | `args`       | `args: Vec<String>`                     | `serde(default)` accepts omit  |
 | `Options`   | `options`    | `options: HashMap<String, bool>`        | `serde(default)` accepts omit  |
+
+## `WebMirrorStatus`
+
+The `/jobs` API returns `WebMirrorStatus` (not `MirrorStatus`). Each timestamp
+field appears twice: a human-readable text form and a Unix-epoch integer.
+
+| Go field        | JSON key            | Rust field             | Format              |
+|-----------------|----------------------|------------------------|---------------------|
+| `Name`          | `name`               | `name`                 |                     |
+| `IsMaster`      | `is_master`          | `is_master`            |                     |
+| `Status`        | `status`             | `status`               | SyncStatus string   |
+| `LastUpdate`    | `last_update`        | `last_update`          | `"2024-06-15 10:30:45 +0000"` |
+| `LastUpdateTs`  | `last_update_ts`     | `last_update_ts`       | integer seconds     |
+| `LastStarted`   | `last_started`       | `last_started`         | same format         |
+| `LastStartedTs` | `last_started_ts`    | `last_started_ts`      | integer seconds     |
+| `LastEnded`     | `last_ended`         | `last_ended`           | same format         |
+| `LastEndedTs`   | `last_ended_ts`      | `last_ended_ts`        | integer seconds     |
+| `Scheduled`     | `next_schedule`      | `scheduled`            | same format         |
+| `ScheduledTs`   | `next_schedule_ts`   | `scheduled_ts`         | integer seconds     |
+| `Upstream`      | `upstream`           | `upstream`             |                     |
+| `Size`          | `size`               | `size`                 |                     |
+
+## Manager HTTP API
+
+All endpoints match Go's `manager/server.go` route table exactly:
+
+| Path                        | Method | Purpose                                |
+|-----------------------------|--------|----------------------------------------|
+| `/ping`                     | GET    | Health check                           |
+| `/jobs`                     | GET    | List all mirror statuses (Web format)  |
+| `/jobs/disabled`            | DELETE | Flush disabled mirror statuses         |
+| `/workers`                  | GET    | List registered workers                |
+| `/workers`                  | POST   | Register a new worker                  |
+| `/workers/:id`              | DELETE | Delete a worker                        |
+| `/workers/:id/jobs`         | GET    | List mirror statuses for a worker      |
+| `/workers/:id/jobs/:job`    | POST   | Update a mirror's status               |
+| `/workers/:id/jobs/:job/size` | POST  | Update a mirror's size                |
+| `/workers/:id/schedules`    | POST   | Update scheduling info                 |
+| `/cmd`                      | POST   | Send command to a worker               |
+| `/workers/:id/heartbeat`    | POST   | **Rust addition** — explicit heartbeat |
+
+Response bodies use `{"message": "..."}` for info and `{"error": "..."}` for errors,
+matching Go's `_infoKey` / `_errorKey` convention.
+
+## Worker HTTP API
+
+The worker exposes a single command endpoint matching Go:
+
+| Path | Method | Purpose                       |
+|------|--------|-------------------------------|
+| `/`  | POST   | Receive `WorkerCmd` from manager |
+
+Additional Rust-only endpoint (not in Go, harmless addition):
+
+| Path   | Method | Purpose         |
+|--------|--------|-----------------|
+| `/jobs` | GET   | Job introspection |
+
+### Command mapping (`WorkerCmd.cmd` → `CtrlAction`)
+
+| `WorkerCmd.cmd` | `options`          | `CtrlAction`     | Go equivalent    |
+|------------------|--------------------|------------------|------------------|
+| `"start"`        | `{}`               | `Start`          | `jobStart`       |
+| `"start"`        | `{"force": true}`  | `ForceStart`     | `jobForceStart`  |
+| `"stop"`         | `{}`               | `Stop`           | `jobStop`        |
+| `"disable"`      | `{}`               | `Disable`        | `jobDisable`     |
+| `"restart"`      | `{}`               | `Restart`        | `jobRestart`     |
+| `"ping"`         | `{}`               | `Ping`           | `jobPing`        |
+| `"reload"`       | `{}`               | Reload (worker)  | SIGHUP           |
 
 ## Time format
 
@@ -96,3 +165,6 @@ The integration test `crates/protocol/tests/wire_compat.rs` round-trips
 reference payloads and asserts structural equality (parsing the produced
 JSON back into a generic `serde_json::Value` to ignore key-ordering
 differences between Go's `encoding/json` and `serde_json`).
+
+The manager DB adapters (`redb`, `sqlite`) are tested identically via the
+`db_tests!` macro in `crates/manager/tests/integration.rs`.
