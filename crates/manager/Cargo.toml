@@ -1,0 +1,32 @@
+[package]
+name        = "tunasync-manager"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+description = "tunasync manager server"
+
+[dependencies]
+tunasync-protocol = { workspace = true }
+tunasync-common   = { workspace = true }
+
+anyhow      = { workspace = true }
+async-trait = { workspace = true }
+axum        = { workspace = true }
+axum-server = { workspace = true }
+chrono      = { workspace = true }
+reqwest     = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+redb        = { workspace = true }
+rusqlite    = { workspace = true }
+
+[dev-dependencies]
+tower        = { version = "0.5", features = ["util"] }
+axum         = { workspace = true }
+tokio        = { workspace = true }
+serde_json   = { workspace = true }

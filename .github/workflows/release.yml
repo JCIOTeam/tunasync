@@ -1,0 +1,140 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  release:
+    types: [published]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Linux targets ──────────────────────────────────────────
+
+  linux-amd64:
+    name: Linux x86_64 (glibc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - run: cd target/release && tar czf tunasync-linux-amd64.tar.gz tunasync tunasynctl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tunasync-linux-amd64
+          path: target/release/tunasync-linux-amd64.tar.gz
+
+  linux-amd64-musl:
+    name: Linux x86_64 (musl, static)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --target x86_64-unknown-linux-musl
+      - run: cd target/x86_64-unknown-linux-musl/release && tar czf tunasync-linux-amd64-musl.tar.gz tunasync tunasynctl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tunasync-linux-amd64-musl
+          path: target/x86_64-unknown-linux-musl/release/tunasync-linux-amd64-musl.tar.gz
+
+  linux-aarch64:
+    name: Linux aarch64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - run: cargo build --release --target aarch64-unknown-linux-gnu
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      - run: cd target/aarch64-unknown-linux-gnu/release && tar czf tunasync-linux-aarch64.tar.gz tunasync tunasynctl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tunasync-linux-aarch64
+          path: target/aarch64-unknown-linux-gnu/release/tunasync-linux-aarch64.tar.gz
+
+  linux-armv7:
+    name: Linux armv7 (armhf)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-gnueabihf
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf
+      - run: cargo build --release --target armv7-unknown-linux-gnueabihf
+        env:
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+      - run: cd target/armv7-unknown-linux-gnueabihf/release && tar czf tunasync-linux-armv7.tar.gz tunasync tunasynctl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tunasync-linux-armv7
+          path: target/armv7-unknown-linux-gnueabihf/release/tunasync-linux-armv7.tar.gz
+
+  linux-riscv64:
+    name: Linux riscv64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv64gc-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y gcc-riscv64-linux-gnu
+      - run: cargo build --release --target riscv64gc-unknown-linux-gnu
+        env:
+          CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
+      - run: cd target/riscv64gc-unknown-linux-gnu/release && tar czf tunasync-linux-riscv64.tar.gz tunasync tunasynctl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tunasync-linux-riscv64
+          path: target/riscv64gc-unknown-linux-gnu/release/tunasync-linux-riscv64.tar.gz
+
+  # ── Release ────────────────────────────────────────────────
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - linux-amd64
+      - linux-amd64-musl
+      - linux-aarch64
+      - linux-armv7
+      - linux-riscv64
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.tar.gz
+          body: |
+            ## tunasync-rs release
+
+            Wire-compatible Rust port of tuna/tunasync.
+
+            ### Downloads
+
+            | File | Arch | Notes |
+            |------|------|-------|
+            | `tunasync-linux-amd64.tar.gz` | x86_64 | glibc, standard servers |
+            | `tunasync-linux-amd64-musl.tar.gz` | x86_64 | static, container-friendly |
+            | `tunasync-linux-aarch64.tar.gz` | aarch64 | ARM64 servers |
+            | `tunasync-linux-armv7.tar.gz` | armv7 | ARM32 (armhf) |
+            | `tunasync-linux-riscv64.tar.gz` | riscv64 | RISC-V |
+
+            Each tarball contains `tunasync` (manager/worker) and `tunasynctl` (CLI).

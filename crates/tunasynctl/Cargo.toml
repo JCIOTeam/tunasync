@@ -1,0 +1,24 @@
+[package]
+name        = "tunasynctl"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+description = "tunasynctl — CLI to control a tunasync manager"
+
+[[bin]]
+name = "tunasynctl"
+path = "src/main.rs"
+
+[dependencies]
+tunasync-protocol = { workspace = true }
+tunasync-common   = { workspace = true }
+
+anyhow     = { workspace = true }
+clap       = { workspace = true }
+reqwest    = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+tokio      = { workspace = true }
+tracing    = { workspace = true }

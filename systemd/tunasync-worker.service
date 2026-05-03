@@ -1,0 +1,20 @@
+[Unit]
+Description=TUNA mirrors sync worker
+After=network.target
+
+[Service]
+Type=simple
+User=tunasync
+ExecStart=/usr/bin/tunasync worker -c /etc/tunasync/worker.conf --with-systemd
+ExecReload=/bin/kill -SIGHUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+ProtectSystem=strict
+ReadWritePaths=/var/lib/tunasync /srv/mirrors
+ProtectHome=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
