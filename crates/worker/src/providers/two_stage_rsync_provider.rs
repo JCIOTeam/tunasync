@@ -11,6 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 
+use crate::hooks::DockerConfig;
 use crate::provider::MirrorProvider;
 use crate::runner;
 
@@ -62,8 +63,11 @@ pub struct TwoStageRsyncProvider {
     rsync_cmd: String,
     rsync_env: HashMap<String, String>,
     pub success_exit_codes: Vec<i32>,
+    data_size: Mutex<String>,
     current_pid: Arc<Mutex<Option<u32>>>,
     docker_container_name: Option<String>,
+    /// Docker wrapping config — set by `build_providers()` when Docker is active.
+    docker_config: Option<DockerConfig>,
 }
 
 impl TwoStageRsyncProvider {
@@ -183,11 +187,17 @@ impl TwoStageRsyncProvider {
             is_master: mc.is_master(),
             stage1_options,
             stage2_options,
-            rsync_cmd: "rsync".into(),
+            rsync_cmd: if mc.command.is_empty() {
+                "rsync".to_string()
+            } else {
+                mc.command.clone()
+            },
             rsync_env,
             success_exit_codes,
+            data_size: Mutex::new(String::new()),
             current_pid: Arc::new(Mutex::new(None)),
             docker_container_name: None,
+            docker_config: None,
         })
     }
 
@@ -206,6 +216,13 @@ impl TwoStageRsyncProvider {
             &self.stage2_options
         };
         let argv = self.build_argv(opts);
+        // When Docker wrapping is active, wrap argv and use empty env.
+        let (argv, spawn_env) = if let Some(docker) = &self.docker_config {
+            (docker.wrap_argv(&argv), HashMap::new())
+        } else {
+            (argv, self.rsync_env.clone())
+        };
+
         let log_suffix = if stage == 1 {
             "stage1.log"
         } else {
@@ -218,7 +235,7 @@ impl TwoStageRsyncProvider {
         } else {
             Some(log_path.as_path())
         };
-        let proc = runner::spawn(&argv, &self.working_dir, &self.rsync_env, lp)
+        let proc = runner::spawn(&argv, &self.working_dir, &spawn_env, lp)
             .await
             .with_context(|| format!("spawn rsync stage {stage} for {}", self.name))?;
 
@@ -256,8 +273,23 @@ impl MirrorProvider for TwoStageRsyncProvider {
     }
 
     async fn run(&self) -> Result<()> {
+        *self.data_size.lock().unwrap() = String::new();
+
         self.run_stage(1).await?;
-        self.run_stage(2).await
+        self.run_stage(2).await?;
+
+        // Extract size from stage2 log after successful run.
+        let log_path = self.log_dir.join(format!("{}.stage2.log", self.name));
+        if log_path.exists() {
+            let content = tokio::fs::read_to_string(&log_path)
+                .await
+                .unwrap_or_default();
+            let size = tunasync_common::util::extract_size_from_rsync_log(&content);
+            if !size.is_empty() {
+                *self.data_size.lock().unwrap() = size;
+            }
+        }
+        Ok(())
     }
 
     async fn terminate(&self) -> Result<()> {
@@ -287,6 +319,15 @@ impl MirrorProvider for TwoStageRsyncProvider {
             }
         }
         Ok(())
+    }
+
+    fn set_docker_config(&mut self, config: DockerConfig) {
+        self.docker_container_name = Some(config.container_name());
+        self.docker_config = Some(config);
+    }
+
+    fn data_size(&self) -> String {
+        self.data_size.lock().unwrap().clone()
     }
 }
 

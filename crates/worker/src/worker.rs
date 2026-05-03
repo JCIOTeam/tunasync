@@ -61,6 +61,16 @@ pub struct Worker {
     /// Shared mirror name set — kept in sync with `self.jobs` so the HTTP
     /// handler can validate mirror_id before accepting a command.
     mirror_names: Arc<RwLock<HashSet<String>>>,
+    /// Function to build a single mirror's provider+hooks pair.
+    /// Used at startup and on hot-reload for new/modified mirrors.
+    #[allow(clippy::type_complexity)]
+    build_one_provider: fn(
+        &crate::config::MirrorConfig,
+        &WorkerConfig,
+    ) -> anyhow::Result<(
+        Box<dyn crate::provider::MirrorProvider>,
+        Vec<Box<dyn crate::hooks::JobHook>>,
+    )>,
 }
 
 impl Worker {
@@ -146,6 +156,7 @@ impl Worker {
             schedule,
             mirror_statuses,
             mirror_names,
+            build_one_provider: crate::build_one_provider,
         }
     }
 
@@ -536,22 +547,106 @@ impl Worker {
                     }
                     self.jobs.remove(name);
                     self.mirror_statuses.remove(name);
+                    self.schedule.remove(name);
                     tracing::info!(mirror = %name, "hot-reload: deleted job");
                 }
                 DiffOp::Modify => {
+                    // Disable and remove the old job.
                     if let Some(job) = self.jobs.get(name) {
                         job.try_send(CtrlAction::Disable);
                         job.kill();
                     }
                     self.jobs.remove(name);
+                    self.mirror_statuses.remove(name);
+                    self.schedule.remove(name);
+
+                    // Update config.
                     if let Some(pos) = self.cfg.mirrors.iter().position(|m| &m.name == name) {
                         self.cfg.mirrors[pos] = trans.config.clone();
+                    } else {
+                        self.cfg.mirrors.push(trans.config.clone());
                     }
+
+                    // Build new provider + hooks and spawn a new MirrorJob.
+                    match (self.build_one_provider)(&trans.config, &self.cfg) {
+                        Ok((provider, hooks)) => {
+                            let upstream = provider.upstream().to_owned();
+                            let is_master = provider.is_master();
+
+                            self.mirror_statuses.insert(
+                                name.clone(),
+                                MirrorStatus {
+                                    name: name.clone(),
+                                    worker: self.cfg.global.name.clone(),
+                                    is_master,
+                                    status: SyncStatus::None,
+                                    last_update: zero_time(),
+                                    last_started: zero_time(),
+                                    last_ended: zero_time(),
+                                    scheduled: zero_time(),
+                                    upstream,
+                                    size: String::new(),
+                                    error_msg: String::new(),
+                                },
+                            );
+
+                            let job = MirrorJob::spawn(
+                                provider,
+                                hooks,
+                                self.status_tx.clone(),
+                                Arc::clone(&self.semaphore),
+                            );
+                            self.jobs.insert(name.clone(), job);
+                        }
+                        Err(e) => {
+                            tracing::error!(mirror = %name, error = %e, "hot-reload: failed to rebuild provider");
+                            continue;
+                        }
+                    }
+
                     tracing::info!(mirror = %name, "hot-reload: modified job — re-scheduling");
                     self.schedule.push(name.clone(), std::time::Instant::now());
                 }
                 DiffOp::Add => {
                     self.cfg.mirrors.push(trans.config.clone());
+
+                    // Build provider + hooks and spawn new MirrorJob.
+                    match (self.build_one_provider)(&trans.config, &self.cfg) {
+                        Ok((provider, hooks)) => {
+                            let upstream = provider.upstream().to_owned();
+                            let is_master = provider.is_master();
+
+                            self.mirror_statuses.insert(
+                                name.clone(),
+                                MirrorStatus {
+                                    name: name.clone(),
+                                    worker: self.cfg.global.name.clone(),
+                                    is_master,
+                                    status: SyncStatus::None,
+                                    last_update: zero_time(),
+                                    last_started: zero_time(),
+                                    last_ended: zero_time(),
+                                    scheduled: zero_time(),
+                                    upstream,
+                                    size: String::new(),
+                                    error_msg: String::new(),
+                                },
+                            );
+
+                            let job = MirrorJob::spawn(
+                                provider,
+                                hooks,
+                                self.status_tx.clone(),
+                                Arc::clone(&self.semaphore),
+                            );
+                            self.jobs.insert(name.clone(), job);
+                        }
+                        Err(e) => {
+                            tracing::error!(mirror = %name, error = %e, "hot-reload: failed to build new provider");
+                            continue;
+                        }
+                    }
+
                     tracing::info!(mirror = %name, "hot-reload: new job");
                     self.schedule.push(name.clone(), std::time::Instant::now());
                 }

@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 
+use crate::hooks::DockerConfig;
 use crate::provider::MirrorProvider;
 use crate::runner;
 
@@ -30,6 +31,8 @@ pub struct RsyncProvider {
     current_pid: Arc<Mutex<Option<u32>>>,
     /// Docker container name, set when DockerHook wraps the command.
     docker_container_name: Option<String>,
+    /// Docker wrapping config — set by `build_providers()` when Docker is active.
+    docker_config: Option<DockerConfig>,
 }
 
 impl RsyncProvider {
@@ -136,6 +139,7 @@ impl RsyncProvider {
             data_size: Mutex::new(String::new()),
             current_pid: Arc::new(Mutex::new(None)),
             docker_container_name: None,
+            docker_config: None,
         })
     }
 
@@ -171,13 +175,21 @@ impl MirrorProvider for RsyncProvider {
 
     async fn run(&self) -> Result<()> {
         let argv = self.build_argv();
+        // When Docker wrapping is active, the argv is wrapped with `docker run …`
+        // and env vars go through `-e` flags. The host process doesn't need them.
+        let (argv, spawn_env) = if let Some(docker) = &self.docker_config {
+            (docker.wrap_argv(&argv), HashMap::new())
+        } else {
+            (argv, self.rsync_env.clone())
+        };
+
         let log_path = if self.log_file.to_string_lossy() == "/dev/null" {
             None
         } else {
             Some(self.log_file.as_path())
         };
 
-        let proc = runner::spawn(&argv, &self.working_dir, &self.rsync_env, log_path)
+        let proc = runner::spawn(&argv, &self.working_dir, &spawn_env, log_path)
             .await
             .with_context(|| format!("spawn rsync for {}", self.name))?;
 
@@ -233,6 +245,11 @@ impl MirrorProvider for RsyncProvider {
 
     fn data_size(&self) -> String {
         self.data_size.lock().unwrap().clone()
+    }
+
+    fn set_docker_config(&mut self, config: DockerConfig) {
+        self.docker_container_name = Some(config.container_name());
+        self.docker_config = Some(config);
     }
 }
 

@@ -19,13 +19,17 @@ pub mod runner;
 pub mod schedule;
 pub mod worker;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use config::ProviderKind;
 #[cfg(target_os = "linux")]
 use hooks::CgroupHook;
-use hooks::{BtrfsSnapshotHook, DockerHook, ExecOn, ExecPostHook, JobHook, LogLimitHook, ZfsHook};
+use hooks::{
+    BtrfsSnapshotHook, DockerConfig, DockerHook, ExecOn, ExecPostHook, JobHook, LogLimitHook,
+    ZfsHook,
+};
 use providers::{CmdProvider, RsyncProvider, TwoStageRsyncProvider};
 
 /// Expand Go template syntax in `log_dir`.
@@ -120,115 +124,64 @@ fn build_providers(
     let mut out = Vec::new();
 
     for mc in &cfg.mirrors {
-        let result: Result<Box<dyn provider::MirrorProvider>> = match mc.provider {
-            ProviderKind::Command => CmdProvider::from_config(mc, &cfg.global)
-                .map(|p| Box::new(p) as Box<dyn provider::MirrorProvider>),
-            ProviderKind::Rsync => RsyncProvider::from_config(mc, &cfg.global)
-                .map(|p| Box::new(p) as Box<dyn provider::MirrorProvider>),
-            ProviderKind::TwoStageRsync => TwoStageRsyncProvider::from_config(mc, &cfg.global)
-                .map(|p| Box::new(p) as Box<dyn provider::MirrorProvider>),
-        };
-
-        let provider = match result {
-            Ok(p) => p,
+        match build_one_provider(mc, cfg) {
+            Ok((provider, hooks)) => out.push((provider, hooks)),
             Err(e) => {
                 tracing::error!(mirror = %mc.name, error = %e, "failed to build provider — skipping");
-                continue;
-            }
-        };
-
-        // Build hooks for this mirror.
-        // Go supports {{.Name}} template syntax in log_dir — we expand it here.
-        let log_dir_raw = if mc.log_dir.is_empty() {
-            cfg.global.log_dir.clone()
-        } else {
-            mc.log_dir.clone()
-        };
-        let log_dir = PathBuf::from(expand_log_dir_template(&log_dir_raw, &mc.name));
-        let working_dir = mc.effective_mirror_dir(&cfg.global);
-        let log_file = log_dir.join("latest.log");
-
-        let mut hooks: Vec<Box<dyn JobHook>> = Vec::new();
-
-        // loglimit hook (always enabled if log_dir is set).
-        if !log_dir.to_string_lossy().is_empty() {
-            hooks.push(Box::new(LogLimitHook::new(
-                mc.name.clone(),
-                log_dir.clone(),
-            )));
-        }
-
-        // System-level hooks (cgroup, docker, zfs, btrfs).
-        add_system_hooks(&mut hooks, mc, cfg, &working_dir, &log_dir, &log_file);
-
-        // Effective exec_on_success: mirror overrides, then append extras to globals.
-        let exec_on_success = if !mc.exec_on_success.is_empty() {
-            let mut v = mc.exec_on_success.clone();
-            v.extend(mc.exec_on_success_extra.iter().cloned());
-            v
-        } else {
-            let mut v = cfg.global.exec_on_success.clone();
-            v.extend(mc.exec_on_success_extra.iter().cloned());
-            v
-        };
-        for cmd in &exec_on_success {
-            match ExecPostHook::new(
-                cmd,
-                ExecOn::Success,
-                mc.name.clone(),
-                working_dir.clone(),
-                mc.upstream.clone(),
-                log_dir.clone(),
-                log_file.clone(),
-            ) {
-                Ok(h) => hooks.push(Box::new(h)),
-                Err(e) => {
-                    tracing::warn!(mirror = %mc.name, error = %e, "skip exec_on_success hook")
-                }
             }
         }
-
-        let exec_on_failure = if !mc.exec_on_failure.is_empty() {
-            let mut v = mc.exec_on_failure.clone();
-            v.extend(mc.exec_on_failure_extra.iter().cloned());
-            v
-        } else {
-            let mut v = cfg.global.exec_on_failure.clone();
-            v.extend(mc.exec_on_failure_extra.iter().cloned());
-            v
-        };
-        for cmd in &exec_on_failure {
-            match ExecPostHook::new(
-                cmd,
-                ExecOn::Failure,
-                mc.name.clone(),
-                working_dir.clone(),
-                mc.upstream.clone(),
-                log_dir.clone(),
-                log_file.clone(),
-            ) {
-                Ok(h) => hooks.push(Box::new(h)),
-                Err(e) => {
-                    tracing::warn!(mirror = %mc.name, error = %e, "skip exec_on_failure hook")
-                }
-            }
-        }
-
-        out.push((provider, hooks));
     }
 
     out
 }
 
-/// Wire system-level hooks (cgroup, docker, zfs, btrfs) for one mirror.
-fn add_system_hooks(
-    hooks: &mut Vec<Box<dyn JobHook>>,
+/// Build a single mirror's (provider, hooks) pair.
+///
+/// Called at startup (via `build_providers`) and on hot-reload for
+/// new/modified mirrors.
+#[allow(clippy::type_complexity)]
+pub fn build_one_provider(
     mc: &config::MirrorConfig,
     cfg: &config::WorkerConfig,
-    working_dir: &std::path::Path,
-    log_dir: &std::path::Path,
-    log_file: &std::path::Path,
-) {
+) -> Result<(Box<dyn provider::MirrorProvider>, Vec<Box<dyn JobHook>>)> {
+    let result: Result<Box<dyn provider::MirrorProvider>> = match mc.provider {
+        ProviderKind::Command => CmdProvider::from_config(mc, &cfg.global)
+            .map(|p| Box::new(p) as Box<dyn provider::MirrorProvider>),
+        ProviderKind::Rsync => RsyncProvider::from_config(mc, &cfg.global)
+            .map(|p| Box::new(p) as Box<dyn provider::MirrorProvider>),
+        ProviderKind::TwoStageRsync => TwoStageRsyncProvider::from_config(mc, &cfg.global)
+            .map(|p| Box::new(p) as Box<dyn provider::MirrorProvider>),
+    };
+
+    let mut provider = match result {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(e.context(format!("build provider for mirror {:?}", mc.name)));
+        }
+    };
+
+    // Build hooks for this mirror.
+    // Go supports {{.Name}} template syntax in log_dir — we expand it here.
+    let log_dir_raw = if mc.log_dir.is_empty() {
+        cfg.global.log_dir.clone()
+    } else {
+        mc.log_dir.clone()
+    };
+    let log_dir = PathBuf::from(expand_log_dir_template(&log_dir_raw, &mc.name));
+    let working_dir = mc.effective_mirror_dir(&cfg.global);
+    let log_file = log_dir.join("latest.log");
+
+    let mut hooks: Vec<Box<dyn JobHook>> = Vec::new();
+
+    // loglimit hook (always enabled if log_dir is set).
+    if !log_dir.to_string_lossy().is_empty() {
+        hooks.push(Box::new(LogLimitHook::new(
+            mc.name.clone(),
+            log_dir.clone(),
+        )));
+    }
+
+    // Docker hook — also wires up argv wrapping on the provider.
     // Docker and cgroup are mutually exclusive — matches Go:
     //   if docker.Enable && image != "" { DockerHook }
     //   else if cgroup.Enable { CgroupHook }
@@ -241,17 +194,27 @@ fn add_system_hooks(
         let mut options = cfg.docker.options.clone();
         options.extend(mc.docker_options.iter().cloned());
         let mem_limit = mc.memory_limit.map(|m| m.0).unwrap_or(0);
-        hooks.push(Box::new(DockerHook::new(
-            mc.name.clone(),
-            mc.docker_image.clone(),
+
+        // Compute full docker env: provider-specific vars + mirror overrides.
+        let docker_env = compute_docker_env(mc, &cfg.global, &working_dir, &log_dir, &log_file);
+
+        let docker_config = DockerConfig {
+            mirror_name: mc.name.clone(),
+            image: mc.docker_image.clone(),
             volumes,
             options,
-            mem_limit,
-            working_dir.to_owned(),
-            log_dir.to_owned(),
-            log_file.to_owned(),
-            mc.env.clone(),
-        )));
+            memory_limit_bytes: mem_limit,
+            working_dir: working_dir.clone(),
+            log_dir: log_dir.clone(),
+            log_file: log_file.clone(),
+            env: docker_env,
+        };
+
+        // Wire up argv wrapping on the provider.
+        provider.set_docker_config(docker_config.clone());
+
+        // Create DockerHook from the same config for lifecycle hooks.
+        hooks.push(Box::new(DockerHook::new(docker_config)));
     } else {
         // cgroup (Linux only) — only when Docker is not active for this mirror.
         #[cfg(target_os = "linux")]
@@ -285,4 +248,104 @@ fn add_system_hooks(
             "", // mirror-level snapshot path override not yet in MirrorConfig
         )));
     }
+
+    // Effective exec_on_success: mirror overrides, then append extras to globals.
+    let exec_on_success = if !mc.exec_on_success.is_empty() {
+        let mut v = mc.exec_on_success.clone();
+        v.extend(mc.exec_on_success_extra.iter().cloned());
+        v
+    } else {
+        let mut v = cfg.global.exec_on_success.clone();
+        v.extend(mc.exec_on_success_extra.iter().cloned());
+        v
+    };
+    for cmd in &exec_on_success {
+        match ExecPostHook::new(
+            cmd,
+            ExecOn::Success,
+            mc.name.clone(),
+            working_dir.clone(),
+            mc.upstream.clone(),
+            log_dir.clone(),
+            log_file.clone(),
+        ) {
+            Ok(h) => hooks.push(Box::new(h)),
+            Err(e) => {
+                tracing::warn!(mirror = %mc.name, error = %e, "skip exec_on_success hook")
+            }
+        }
+    }
+
+    let exec_on_failure = if !mc.exec_on_failure.is_empty() {
+        let mut v = mc.exec_on_failure.clone();
+        v.extend(mc.exec_on_failure_extra.iter().cloned());
+        v
+    } else {
+        let mut v = cfg.global.exec_on_failure.clone();
+        v.extend(mc.exec_on_failure_extra.iter().cloned());
+        v
+    };
+    for cmd in &exec_on_failure {
+        match ExecPostHook::new(
+            cmd,
+            ExecOn::Failure,
+            mc.name.clone(),
+            working_dir.clone(),
+            mc.upstream.clone(),
+            log_dir.clone(),
+            log_file.clone(),
+        ) {
+            Ok(h) => hooks.push(Box::new(h)),
+            Err(e) => {
+                tracing::warn!(mirror = %mc.name, error = %e, "skip exec_on_failure hook")
+            }
+        }
+    }
+
+    Ok((provider, hooks))
+}
+
+/// Compute the full environment map for Docker `-e` flags.
+///
+/// Includes provider-specific env vars (TUNASYNC_* for all providers,
+/// USER/RSYNC_PASSWORD for rsync providers) plus mirror-level env overrides.
+fn compute_docker_env(
+    mc: &config::MirrorConfig,
+    _global: &config::GlobalConfig,
+    working_dir: &std::path::Path,
+    log_dir: &std::path::Path,
+    log_file: &std::path::Path,
+) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+
+    // TUNASYNC_* env vars (needed by all providers).
+    env.insert("TUNASYNC_MIRROR_NAME".into(), mc.name.clone());
+    env.insert(
+        "TUNASYNC_WORKING_DIR".into(),
+        working_dir.to_string_lossy().into(),
+    );
+    env.insert("TUNASYNC_UPSTREAM_URL".into(), mc.upstream.clone());
+    env.insert("TUNASYNC_LOG_DIR".into(), log_dir.to_string_lossy().into());
+    env.insert(
+        "TUNASYNC_LOG_FILE".into(),
+        log_file.to_string_lossy().into(),
+    );
+
+    // Rsync-specific env vars for Rsync and TwoStageRsync providers.
+    match mc.provider {
+        ProviderKind::Rsync | ProviderKind::TwoStageRsync => {
+            if !mc.username.is_empty() {
+                env.insert("USER".into(), mc.username.clone());
+            }
+            if !mc.password.is_empty() {
+                env.insert("RSYNC_PASSWORD".into(), mc.password.clone());
+            }
+        }
+        _ => {}
+    }
+
+    // Mirror-level env overrides.
+    env.extend(mc.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+
+    env
 }

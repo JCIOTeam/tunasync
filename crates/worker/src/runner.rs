@@ -173,21 +173,31 @@ where
 
     let mut out = BufReader::new(stdout).lines();
     let mut err = BufReader::new(stderr).lines();
+
+    // Drain both streams fully — don't stop when one hits EOF, the other
+    // may still have buffered data. Loop until both are fully exhausted.
     loop {
-        tokio::select! {
-            line = out.next_line() => match line {
-                Ok(Some(l)) => { let _ = file.write_all(l.as_bytes()).await; let _ = file.write_all(b"\n").await; }
-                _ => break,
-            },
-            line = err.next_line() => match line {
-                Ok(Some(l)) => { let _ = file.write_all(l.as_bytes()).await; let _ = file.write_all(b"\n").await; }
-                _ => break,
-            },
+        let out_done = loop {
+            match out.next_line().await {
+                Ok(Some(l)) => {
+                    let _ = file.write_all(l.as_bytes()).await;
+                    let _ = file.write_all(b"\n").await;
+                }
+                Ok(None) | Err(_) => break true,
+            }
+        };
+        let err_done = loop {
+            match err.next_line().await {
+                Ok(Some(l)) => {
+                    let _ = file.write_all(l.as_bytes()).await;
+                    let _ = file.write_all(b"\n").await;
+                }
+                Ok(None) | Err(_) => break true,
+            }
+        };
+        if out_done && err_done {
+            break;
         }
-    }
-    while let Ok(Some(l)) = err.next_line().await {
-        let _ = file.write_all(l.as_bytes()).await;
-        let _ = file.write_all(b"\n").await;
     }
     let _ = file.flush().await;
 }

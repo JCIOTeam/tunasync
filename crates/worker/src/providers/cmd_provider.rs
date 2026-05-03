@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use regex::Regex;
 
+use crate::hooks::DockerConfig;
 use crate::provider::MirrorProvider;
 use crate::runner;
 
@@ -35,6 +36,8 @@ pub struct CmdProvider {
     current_pid: Arc<Mutex<Option<u32>>>,
     /// Docker container name, set when DockerHook wraps the command.
     docker_container_name: Option<String>,
+    /// Docker wrapping config — set by `build_providers()` when Docker is active.
+    docker_config: Option<DockerConfig>,
 }
 
 impl CmdProvider {
@@ -94,6 +97,7 @@ impl CmdProvider {
             data_size: Mutex::new(String::new()),
             current_pid: Arc::new(Mutex::new(None)),
             docker_container_name: None,
+            docker_config: None,
         })
     }
 
@@ -144,13 +148,22 @@ impl MirrorProvider for CmdProvider {
         *self.data_size.lock().unwrap() = String::new();
 
         let env = self.tunasync_env();
+        // When Docker wrapping is active, the argv is wrapped with `docker run …`
+        // and env vars go through `-e` flags (inside the container). The host
+        // `docker run` process doesn't need those env overrides.
+        let (argv, spawn_env) = if let Some(docker) = &self.docker_config {
+            (docker.wrap_argv(&self.command), HashMap::new())
+        } else {
+            (self.command.clone(), env)
+        };
+
         let log_path = if self.log_file.to_string_lossy() == "/dev/null" {
             None
         } else {
             Some(self.log_file.as_path())
         };
 
-        let proc = runner::spawn(&self.command, &self.working_dir, &env, log_path).await?;
+        let proc = runner::spawn(&argv, &self.working_dir, &spawn_env, log_path).await?;
 
         // Store PID so terminate() can send SIGTERM.
         if let Some(pid) = proc.pid() {
@@ -228,6 +241,11 @@ impl MirrorProvider for CmdProvider {
 
     fn data_size(&self) -> String {
         self.data_size.lock().unwrap().clone()
+    }
+
+    fn set_docker_config(&mut self, config: DockerConfig) {
+        self.docker_container_name = Some(config.container_name());
+        self.docker_config = Some(config);
     }
 }
 

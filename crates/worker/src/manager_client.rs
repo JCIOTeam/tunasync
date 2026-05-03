@@ -44,6 +44,7 @@ impl ManagerClient {
     // ------------------------------------------------------------------
 
     /// `POST {manager}/workers/{worker_id}/jobs/{mirror_id}` — POST to all bases.
+    /// Returns Ok if at least one base succeeded (matches Go's behaviour).
     pub async fn report_status(
         &self,
         worker_id: &str,
@@ -53,13 +54,20 @@ impl ManagerClient {
         let errs = self.post_all(&path, status).await;
         if errs.is_empty() {
             Ok(status.clone())
+        } else if errs.len() < self.bases.len() {
+            // At least one base succeeded — partial failure is acceptable.
+            for (url, e) in &errs {
+                tracing::warn!(url = %url, error = %e, "partial status report failure");
+            }
+            Ok(status.clone())
         } else {
-            // Return the last error; at least one base succeeded.
+            // All bases failed.
             Err(errs.into_iter().last().unwrap().1)
         }
     }
 
     /// `POST {manager}/workers/{worker_id}/jobs/{mirror_id}/size` — POST to all bases.
+    /// Returns Ok if at least one base succeeded.
     pub async fn report_size(&self, worker_id: &str, mirror_id: &str, size: &str) -> Result<()> {
         #[derive(serde::Serialize)]
         struct SizeMsg<'a> {
@@ -78,12 +86,18 @@ impl ManagerClient {
             .await;
         if errs.is_empty() {
             Ok(())
+        } else if errs.len() < self.bases.len() {
+            for (url, e) in &errs {
+                tracing::warn!(url = %url, error = %e, "partial size report failure");
+            }
+            Ok(())
         } else {
             Err(errs.into_iter().last().unwrap().1)
         }
     }
 
     /// `POST {manager}/workers/{worker_id}/schedules` — POST to all bases.
+    /// Returns Ok if at least one base succeeded.
     pub async fn report_schedules(
         &self,
         worker_id: &str,
@@ -92,6 +106,11 @@ impl ManagerClient {
         let path = format!("/workers/{worker_id}/schedules");
         let errs = self.post_all(&path, schedules).await;
         if errs.is_empty() {
+            Ok(())
+        } else if errs.len() < self.bases.len() {
+            for (url, e) in &errs {
+                tracing::warn!(url = %url, error = %e, "partial schedule report failure");
+            }
             Ok(())
         } else {
             Err(errs.into_iter().last().unwrap().1)

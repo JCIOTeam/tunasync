@@ -2,14 +2,9 @@
 //!
 //! Mirrors Go's `dockerHook` / `docker.go`.
 //!
-//! Go's runner (`newCmdJob`) injects the docker wrapper at spawn time when
-//! `provider.Docker() != nil`. In our Rust architecture the hook exposes
-//! `DockerHook::wrap_argv()` which providers call inside `run()` to build the
-//! `docker run …` command line before passing it to `runner::spawn`.
-//!
-//! Lifecycle:
-//!   `PreExec`  → ensure working dir exists
-//!   `PostExec` → poll until the container is gone (docker ps), timeout warn
+//! `DockerConfig` holds all the data needed to build `docker run …` argv.
+//! It is shared between `DockerHook` (which runs lifecycle hooks) and
+//! providers (which call `wrap_argv()` inside `run()` to wrap their command).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -21,45 +16,30 @@ use tokio::process::Command;
 
 use crate::hooks::{HookPhase, JobHook};
 
-pub struct DockerHook {
-    mirror_name: String,
+// ---------------------------------------------------------------------------
+// DockerConfig — shared between DockerHook and providers
+// ---------------------------------------------------------------------------
+
+/// Configuration for Docker wrapping — contains all the data needed to build
+/// `docker run …` argv. Created in `build_providers()` and shared with both
+/// the provider (for argv wrapping) and the DockerHook (for lifecycle hooks).
+#[derive(Clone)]
+pub struct DockerConfig {
+    pub mirror_name: String,
     pub image: String,
     pub volumes: Vec<String>,
     pub options: Vec<String>,
     pub memory_limit_bytes: i64,
-    working_dir: PathBuf,
-    log_dir: PathBuf,
-    log_file: PathBuf,
+    pub working_dir: PathBuf,
+    pub log_dir: PathBuf,
+    pub log_file: PathBuf,
     /// Environment variables to pass to the container via `-e` flags.
-    env: HashMap<String, String>,
+    /// Includes provider-specific env (TUNASYNC_* for cmd, USER/RSYNC_PASSWORD
+    /// for rsync) plus mirror-level env overrides.
+    pub env: HashMap<String, String>,
 }
 
-#[allow(clippy::too_many_arguments)]
-impl DockerHook {
-    pub fn new(
-        mirror_name: String,
-        image: String,
-        volumes: Vec<String>, // global + mirror volumes
-        options: Vec<String>, // global + mirror options
-        memory_limit_bytes: i64,
-        working_dir: PathBuf,
-        log_dir: PathBuf,
-        log_file: PathBuf,
-        env: HashMap<String, String>, // environment variables passed via `-e`
-    ) -> Self {
-        Self {
-            mirror_name,
-            image,
-            volumes,
-            options,
-            memory_limit_bytes,
-            working_dir,
-            log_dir,
-            log_file,
-            env,
-        }
-    }
-
+impl DockerConfig {
     /// Container name — `tunasync-job-{mirror_name}`.
     pub fn container_name(&self) -> String {
         format!("tunasync-job-{}", self.mirror_name)
@@ -67,8 +47,6 @@ impl DockerHook {
 
     /// Build the full `docker run …` argv by prepending docker flags to the
     /// provider's original command.
-    ///
-    /// Called by providers to wrap their command inside a container.
     pub fn wrap_argv(&self, inner_argv: &[String]) -> Vec<String> {
         let mut argv = vec!["docker".into(), "run".into(), "--rm".into()];
 
@@ -84,12 +62,16 @@ impl DockerHook {
             format!("{}:{}", unsafe_getuid(), unsafe_getgid()),
         ]);
 
-        // Environment variables via `-e` flags (matches Go's newCmdJob).
+        // Environment variables via `-e` flags.
         for (k, v) in &self.env {
             argv.extend(["-e".into(), format!("{k}={v}")]);
         }
 
-        // Always-needed volume mounts: log dir, log file, working dir.
+        // Configured volume mounts.
+        for vol in &self.volumes {
+            argv.extend(["-v".into(), vol.clone()]);
+        }
+        // Runtime volume mounts: log dir, log file, working dir.
         let runtime_vols = [
             format!("{}:{}", self.log_dir.display(), self.log_dir.display()),
             format!("{}:{}", self.log_file.display(), self.log_file.display()),
@@ -99,9 +81,6 @@ impl DockerHook {
                 self.working_dir.display()
             ),
         ];
-        for vol in &self.volumes {
-            argv.extend(["-v".into(), vol.clone()]);
-        }
         for vol in &runtime_vols {
             argv.extend(["-v".into(), vol.clone()]);
         }
@@ -120,20 +99,38 @@ impl DockerHook {
 
         argv
     }
+}
 
-    // ------------------------------------------------------------------
-    // Lifecycle helpers
-    // ------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// DockerHook — lifecycle hooks using DockerConfig
+// ---------------------------------------------------------------------------
 
-    async fn ensure_working_dir(&self) -> Result<()> {
-        tokio::fs::create_dir_all(&self.working_dir).await?;
-        Ok(())
+pub struct DockerHook {
+    config: DockerConfig,
+}
+
+impl DockerHook {
+    pub fn new(config: DockerConfig) -> Self {
+        Self { config }
+    }
+
+    pub fn config(&self) -> &DockerConfig {
+        &self.config
+    }
+
+    /// Container name — delegates to DockerConfig.
+    pub fn container_name(&self) -> String {
+        self.config.container_name()
+    }
+
+    /// Build wrapped argv — delegates to DockerConfig.
+    pub fn wrap_argv(&self, inner_argv: &[String]) -> Vec<String> {
+        self.config.wrap_argv(inner_argv)
     }
 
     /// Send `docker stop -t 2 {container}` to gracefully stop the container.
-    /// Called by the provider's terminate() when Docker wrapping is active.
     pub async fn terminate_container(&self) {
-        let name = self.container_name();
+        let name = self.config.container_name();
         let out = Command::new("docker")
             .args(["stop", "-t", "2", &name])
             .output()
@@ -153,7 +150,7 @@ impl DockerHook {
 
     /// Poll `docker ps` until the container is gone, or warn after 10 s.
     async fn wait_container_gone(&self) {
-        let name = self.container_name();
+        let name = self.config.container_name();
         for _ in 0..10 {
             let out = Command::new("docker")
                 .args([
@@ -167,7 +164,7 @@ impl DockerHook {
                 .output()
                 .await;
             match out {
-                Ok(o) if o.stdout.is_empty() => return, // container gone
+                Ok(o) if o.stdout.is_empty() => return,
                 Ok(o) => {
                     let status = String::from_utf8_lossy(&o.stdout);
                     tracing::debug!(container = %name, status = %status.trim(), "waiting for container exit");
@@ -183,6 +180,11 @@ impl DockerHook {
             container = %name,
             "container not removed automatically — next sync may fail"
         );
+    }
+
+    async fn ensure_working_dir(&self) -> Result<()> {
+        tokio::fs::create_dir_all(&self.config.working_dir).await?;
+        Ok(())
     }
 }
 

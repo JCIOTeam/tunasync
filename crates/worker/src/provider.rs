@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::hooks::DockerConfig;
+
 /// What the worker scheduler needs from a provider.
 #[async_trait]
 pub trait MirrorProvider: Send + Sync {
@@ -22,4 +24,9 @@ pub trait MirrorProvider: Send + Sync {
     fn data_size(&self) -> String {
         String::new()
     }
+    /// Wire up Docker wrapping — called in `build_providers()` when Docker is
+    /// active for this mirror. The provider uses the config to wrap its argv
+    /// with `docker run …` inside `run()` and set the container name for
+    /// `terminate()`.
+    fn set_docker_config(&mut self, config: DockerConfig);
 }

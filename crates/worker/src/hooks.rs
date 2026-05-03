@@ -11,7 +11,7 @@ pub mod zfs_hook;
 pub use btrfs_hook::BtrfsSnapshotHook;
 #[cfg(target_os = "linux")]
 pub use cgroup_hook::CgroupHook;
-pub use docker_hook::DockerHook;
+pub use docker_hook::{DockerConfig, DockerHook};
 pub use exec_post_hook::{ExecOn, ExecPostHook};
 pub use loglimit_hook::LogLimitHook;
 pub use zfs_hook::ZfsHook;

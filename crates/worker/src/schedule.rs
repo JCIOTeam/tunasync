@@ -62,8 +62,15 @@ impl ScheduleQueue {
     }
 
     /// Peek at the earliest-due entry without removing it.
+    /// Skips stale entries (whose next_run doesn't match the latest map).
     pub fn peek(&self) -> Option<&ScheduleEntry> {
-        self.heap.peek()
+        self.heap.peek().and_then(|entry| {
+            if self.latest.get(&entry.name) == Some(&entry.next_run) {
+                Some(entry)
+            } else {
+                None
+            }
+        })
     }
 
     /// Pop the earliest-due entry, skipping stale duplicates.
