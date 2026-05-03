@@ -137,6 +137,36 @@ Worker 与 Manager 之间使用 HTTP(S) 通信。如果两者运行在同一台�
 
 若需加密通信，Manager 端配置 `ssl_cert` 和 `ssl_key`，Worker 端配置 `ca_cert`，并将 `api_base` 设为 `https://`。
 
+### 以 systemd 服务运行
+
+示例服务文件在 `systemd/` 目录中提供。
+
+```bash
+# 创建 tunasync 用户
+sudo useradd -r -s /bin/false tunasync
+
+# 安装二进制
+sudo cp target/release/tunasync /usr/bin/
+sudo cp target/release/tunasynctl /usr/bin/
+
+# 安装配置和服务文件
+sudo mkdir -p /etc/tunasync /var/lib/tunasync
+sudo cp systemd/tunasync-manager.service /etc/systemd/system/
+sudo cp systemd/tunasync-worker.service /etc/systemd/system/
+sudo cp manager.conf /etc/tunasync/
+sudo cp worker.conf /etc/tunasync/
+
+# 启用并启动
+sudo systemctl daemon-reload
+sudo systemctl enable --now tunasync-manager
+sudo systemctl enable --now tunasync-worker
+
+# 热重载 worker 配置（从磁盘重新读取配置，应用差异）
+sudo systemctl reload tunasync-worker
+```
+
+服务文件中的 `--with-systemd` 参数会抑制日志中的时间戳和 ANSI 颜色，因为 systemd journal 已经自带时间戳。
+
 ## 编译
 
 需要 Rust stable（≥ 1.80），参见 `rust-toolchain.toml`。

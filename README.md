@@ -137,6 +137,36 @@ Worker–manager communication uses HTTP(S). If both run on the same machine, pl
 
 For encrypted communication, set `ssl_cert` and `ssl_key` on the manager, `ca_cert` on the worker, and use `https://` as the `api_base` prefix.
 
+### Running as a systemd service
+
+Example service files are provided in the `systemd/` directory.
+
+```bash
+# Create tunasync user
+sudo useradd -r -s /bin/false tunasync
+
+# Install binaries
+sudo cp target/release/tunasync /usr/bin/
+sudo cp target/release/tunasynctl /usr/bin/
+
+# Install config and service files
+sudo mkdir -p /etc/tunasync /var/lib/tunasync
+sudo cp systemd/tunasync-manager.service /etc/systemd/system/
+sudo cp systemd/tunasync-worker.service /etc/systemd/system/
+sudo cp manager.conf /etc/tunasync/
+sudo cp worker.conf /etc/tunasync/
+
+# Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable --now tunasync-manager
+sudo systemctl enable --now tunasync-worker
+
+# Hot-reload worker config (reads config from disk, applies diff)
+sudo systemctl reload tunasync-worker
+```
+
+The `--with-systemd` flag in the service files suppresses timestamps and ANSI colours in log output, since systemd journal already adds timestamps.
+
 ## Building
 
 Requires Rust stable (≥ 1.80). See `rust-toolchain.toml`.

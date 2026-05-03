@@ -296,7 +296,7 @@ fn print_table_jobs(jobs: &[WebMirrorStatus]) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    tunasync_common::logger::init(cli.verbose);
+    tunasync_common::logger::init(cli.verbose, false);
 
     let base_url = build_base_url(&cli);
     let client = Client::new(base_url, cli.ca_cert.as_ref())?;

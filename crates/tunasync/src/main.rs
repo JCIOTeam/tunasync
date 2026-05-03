@@ -3,8 +3,8 @@
 //! Mirrors the subcommand structure of Go's `cmd/tunasync/tunasync.go`:
 //!
 //! ```text
-//! tunasync manager [--config FILE] [--addr ADDR] [--port PORT] ...
-//! tunasync worker  [--config FILE] ...
+//! tunasync manager [--config FILE] [--with-systemd] ...
+//! tunasync worker  [--config FILE] [--with-systemd] ...
 //! ```
 
 use std::path::PathBuf;
@@ -27,6 +27,11 @@ struct Cli {
     /// Verbose logging (lifts default level from info to debug).
     #[arg(short, long, global = true)]
     verbose: bool,
+
+    /// Adapt logging for systemd: suppress timestamps and ANSI colours
+    /// (systemd journal adds its own timestamps). Matches Go's --with-systemd.
+    #[arg(long, global = true)]
+    with_systemd: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -48,7 +53,7 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    tunasync_common::logger::init(cli.verbose);
+    tunasync_common::logger::init(cli.verbose, cli.with_systemd);
 
     match cli.command {
         Command::Manager { config } => {
