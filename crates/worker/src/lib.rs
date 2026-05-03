@@ -21,9 +21,9 @@ pub mod worker;
 
 use anyhow::{Context, Result};
 use config::ProviderKind;
-use hooks::{ExecOn, ExecPostHook, JobHook, LogLimitHook, DockerHook, ZfsHook, BtrfsSnapshotHook};
 #[cfg(target_os = "linux")]
 use hooks::CgroupHook;
+use hooks::{BtrfsSnapshotHook, DockerHook, ExecOn, ExecPostHook, JobHook, LogLimitHook, ZfsHook};
 use providers::{CmdProvider, RsyncProvider, TwoStageRsyncProvider};
 
 /// Expand `global.include` glob patterns and merge the resulting mirror configs
@@ -96,6 +96,7 @@ pub async fn run(config_path: std::path::PathBuf) -> Result<()> {
 }
 
 /// Build (provider, hooks) pairs from the worker config.
+#[allow(clippy::type_complexity)]
 fn build_providers(
     cfg: &config::WorkerConfig,
 ) -> Vec<(Box<dyn provider::MirrorProvider>, Vec<Box<dyn JobHook>>)> {
@@ -103,18 +104,12 @@ fn build_providers(
 
     for mc in &cfg.mirrors {
         let result: Result<Box<dyn provider::MirrorProvider>> = match mc.provider {
-            ProviderKind::Command => {
-                CmdProvider::from_config(mc, &cfg.global)
-                    .map(|p| Box::new(p) as Box<dyn provider::MirrorProvider>)
-            }
-            ProviderKind::Rsync => {
-                RsyncProvider::from_config(mc, &cfg.global)
-                    .map(|p| Box::new(p) as Box<dyn provider::MirrorProvider>)
-            }
-            ProviderKind::TwoStageRsync => {
-                TwoStageRsyncProvider::from_config(mc, &cfg.global)
-                    .map(|p| Box::new(p) as Box<dyn provider::MirrorProvider>)
-            }
+            ProviderKind::Command => CmdProvider::from_config(mc, &cfg.global)
+                .map(|p| Box::new(p) as Box<dyn provider::MirrorProvider>),
+            ProviderKind::Rsync => RsyncProvider::from_config(mc, &cfg.global)
+                .map(|p| Box::new(p) as Box<dyn provider::MirrorProvider>),
+            ProviderKind::TwoStageRsync => TwoStageRsyncProvider::from_config(mc, &cfg.global)
+                .map(|p| Box::new(p) as Box<dyn provider::MirrorProvider>),
         };
 
         let provider = match result {
@@ -138,7 +133,10 @@ fn build_providers(
 
         // loglimit hook (always enabled if log_dir is set).
         if !log_dir.to_string_lossy().is_empty() {
-            hooks.push(Box::new(LogLimitHook::new(mc.name.clone(), log_dir.clone())));
+            hooks.push(Box::new(LogLimitHook::new(
+                mc.name.clone(),
+                log_dir.clone(),
+            )));
         }
 
         // System-level hooks (cgroup, docker, zfs, btrfs).
@@ -156,12 +154,18 @@ fn build_providers(
         };
         for cmd in &exec_on_success {
             match ExecPostHook::new(
-                cmd, ExecOn::Success,
-                mc.name.clone(), working_dir.clone(),
-                mc.upstream.clone(), log_dir.clone(), log_file.clone(),
+                cmd,
+                ExecOn::Success,
+                mc.name.clone(),
+                working_dir.clone(),
+                mc.upstream.clone(),
+                log_dir.clone(),
+                log_file.clone(),
             ) {
                 Ok(h) => hooks.push(Box::new(h)),
-                Err(e) => tracing::warn!(mirror = %mc.name, error = %e, "skip exec_on_success hook"),
+                Err(e) => {
+                    tracing::warn!(mirror = %mc.name, error = %e, "skip exec_on_success hook")
+                }
             }
         }
 
@@ -176,12 +180,18 @@ fn build_providers(
         };
         for cmd in &exec_on_failure {
             match ExecPostHook::new(
-                cmd, ExecOn::Failure,
-                mc.name.clone(), working_dir.clone(),
-                mc.upstream.clone(), log_dir.clone(), log_file.clone(),
+                cmd,
+                ExecOn::Failure,
+                mc.name.clone(),
+                working_dir.clone(),
+                mc.upstream.clone(),
+                log_dir.clone(),
+                log_file.clone(),
             ) {
                 Ok(h) => hooks.push(Box::new(h)),
-                Err(e) => tracing::warn!(mirror = %mc.name, error = %e, "skip exec_on_failure hook"),
+                Err(e) => {
+                    tracing::warn!(mirror = %mc.name, error = %e, "skip exec_on_failure hook")
+                }
             }
         }
 

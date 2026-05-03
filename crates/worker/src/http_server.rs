@@ -8,12 +8,11 @@
 use std::sync::Arc;
 
 use axum::{
-    Json,
-    Router,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
+    Json, Router,
 };
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -70,7 +69,9 @@ async fn list_jobs(State(state): State<Arc<WorkerHttpState>>) -> impl IntoRespon
     struct Info {
         worker: String,
     }
-    Json(Info { worker: state.worker_name.clone() })
+    Json(Info {
+        worker: state.worker_name.clone(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -92,10 +93,10 @@ pub fn cmd_to_ctrl(cmd: &WorkerCmd) -> Option<CtrlAction> {
                 Some(CtrlAction::Start)
             }
         }
-        Stop    => Some(CtrlAction::Stop),
+        Stop => Some(CtrlAction::Stop),
         Disable => Some(CtrlAction::Disable),
         Restart => Some(CtrlAction::Restart),
-        Ping    => Some(CtrlAction::Ping),
-        Reload  => None, // handled at worker level
+        Ping => Some(CtrlAction::Ping),
+        Reload => None, // handled at worker level
     }
 }

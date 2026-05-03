@@ -19,5 +19,7 @@ pub trait MirrorProvider: Send + Sync {
     async fn run(&self) -> anyhow::Result<()>;
     async fn terminate(&self) -> anyhow::Result<()>;
     /// Human-readable data size after a successful run. Empty = unknown.
-    fn data_size(&self) -> String { String::new() }
+    fn data_size(&self) -> String {
+        String::new()
+    }
 }

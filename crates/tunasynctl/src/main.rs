@@ -27,7 +27,12 @@ struct Cli {
     manager: Option<String>,
 
     /// Manager port (combined with --manager host when manager has no port).
-    #[arg(long, env = "TUNASYNC_MANAGER_PORT", global = true, default_value = "14242")]
+    #[arg(
+        long,
+        env = "TUNASYNC_MANAGER_PORT",
+        global = true,
+        default_value = "14242"
+    )]
     port: u16,
 
     /// CA cert for pinning the manager's TLS certificate.
@@ -206,7 +211,10 @@ impl Client {
 
     async fn set_size(&self, worker_id: &str, mirror: &str, size: &str) -> Result<MirrorStatus> {
         #[derive(serde::Serialize)]
-        struct SizeMsg<'a> { name: &'a str, size: &'a str }
+        struct SizeMsg<'a> {
+            name: &'a str,
+            size: &'a str,
+        }
         self.post(
             &format!("/workers/{worker_id}/jobs/{mirror}/size"),
             &SizeMsg { name: mirror, size },
@@ -268,10 +276,7 @@ fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
 }
 
 fn print_table_jobs(jobs: &[WebMirrorStatus]) {
-    println!(
-        "{:<30} {:<12} {:<20} {}",
-        "Name", "Status", "Last Update", "Size"
-    );
+    println!("{:<30} {:<12} {:<20} Size", "Name", "Status", "Last Update");
     println!("{}", "-".repeat(80));
     for j in jobs {
         println!(
@@ -298,7 +303,11 @@ async fn main() -> Result<()> {
 
     match &cli.command {
         // ── list ──────────────────────────────────────────────────────────
-        Command::List { worker, status, format } => {
+        Command::List {
+            worker,
+            status,
+            format,
+        } => {
             let jobs = if let Some(w) = worker {
                 // List jobs of one worker (MirrorStatus → convert to WebMirrorStatus).
                 client
@@ -352,7 +361,11 @@ async fn main() -> Result<()> {
         }
 
         // ── set-size ──────────────────────────────────────────────────────
-        Command::SetSize { mirror, size, worker } => {
+        Command::SetSize {
+            mirror,
+            size,
+            worker,
+        } => {
             let worker_id = resolve_worker(&client, mirror, worker.as_deref()).await?;
             let updated = client.set_size(&worker_id, mirror, size).await?;
             println!(
@@ -362,10 +375,16 @@ async fn main() -> Result<()> {
         }
 
         // ── job control commands ───────────────────────────────────────────
-        Command::Start { mirror, worker, force } => {
+        Command::Start {
+            mirror,
+            worker,
+            force,
+        } => {
             let worker_id = resolve_worker(&client, mirror, worker.as_deref()).await?;
             let mut options = HashMap::new();
-            if *force { options.insert("force".into(), true); }
+            if *force {
+                options.insert("force".into(), true);
+            }
             client
                 .send_cmd(ClientCmd {
                     cmd: CmdVerb::Start,

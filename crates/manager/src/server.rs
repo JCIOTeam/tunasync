@@ -19,12 +19,11 @@
 use std::sync::Arc;
 
 use axum::{
-    Json,
-    Router,
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
+    Json, Router,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -58,7 +57,9 @@ struct MsgBody {
 }
 
 fn ok_msg(msg: impl Into<String>) -> Json<MsgBody> {
-    Json(MsgBody { message: msg.into() })
+    Json(MsgBody {
+        message: msg.into(),
+    })
 }
 
 /// Map a `DbError` to an axum `Response`.
@@ -67,15 +68,17 @@ fn db_err(e: DbError) -> Response {
         DbError::NotFound(_) => StatusCode::NOT_FOUND,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    (status, Json(ErrBody { error: e.to_string() })).into_response()
+    (
+        status,
+        Json(ErrBody {
+            error: e.to_string(),
+        }),
+    )
+        .into_response()
 }
 
 fn bad_req(msg: impl Into<String>) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(ErrBody { error: msg.into() }),
-    )
-        .into_response()
+    (StatusCode::BAD_REQUEST, Json(ErrBody { error: msg.into() })).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -117,8 +120,10 @@ async fn list_all_jobs(State(state): State<Arc<AppState>>) -> Response {
     match state.db.list_all_mirror_status() {
         Err(e) => db_err(e),
         Ok(statuses) => {
-            let web: Vec<WebMirrorStatus> =
-                statuses.iter().map(WebMirrorStatus::from_mirror_status).collect();
+            let web: Vec<WebMirrorStatus> = statuses
+                .iter()
+                .map(WebMirrorStatus::from_mirror_status)
+                .collect();
             Json(web).into_response()
         }
     }
@@ -170,10 +175,7 @@ async fn register_worker(
 }
 
 /// `DELETE /workers/:id` — remove a worker.
-async fn delete_worker(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Response {
+async fn delete_worker(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     match state.db.delete_worker(&id) {
         Err(DbError::NotFound(_)) => bad_req(format!("invalid workerID {id}")),
         Err(e) => db_err(e),
@@ -185,10 +187,7 @@ async fn delete_worker(
 }
 
 /// `POST /workers/:id/heartbeat` — worker signals it is still alive.
-async fn heartbeat_worker(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Response {
+async fn heartbeat_worker(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     match state.db.refresh_worker(&id) {
         Err(DbError::NotFound(_)) => bad_req(format!("invalid workerID {id}")),
         Err(e) => db_err(e),
@@ -248,13 +247,12 @@ async fn update_job_of_worker(
     let now = Utc::now();
 
     // Timestamp merge — mirrors Go's logic exactly.
-    incoming.last_started = if incoming.status == SyncStatus::PreSyncing
-        && cur.status != SyncStatus::PreSyncing
-    {
-        now
-    } else {
-        cur.last_started
-    };
+    incoming.last_started =
+        if incoming.status == SyncStatus::PreSyncing && cur.status != SyncStatus::PreSyncing {
+            now
+        } else {
+            cur.last_started
+        };
 
     incoming.last_update = if incoming.status == SyncStatus::Success {
         now
@@ -262,18 +260,18 @@ async fn update_job_of_worker(
         cur.last_update
     };
 
-    incoming.last_ended =
-        if matches!(incoming.status, SyncStatus::Success | SyncStatus::Failed) {
-            now
-        } else {
-            cur.last_ended
-        };
+    incoming.last_ended = if matches!(incoming.status, SyncStatus::Success | SyncStatus::Failed) {
+        now
+    } else {
+        cur.last_ended
+    };
 
     // Preserve meaningful size from current record.
-    if !cur.size.is_empty() && cur.size != "unknown" {
-        if incoming.size.is_empty() || incoming.size == "unknown" {
-            incoming.size = cur.size;
-        }
+    if !cur.size.is_empty()
+        && cur.size != "unknown"
+        && (incoming.size.is_empty() || incoming.size == "unknown")
+    {
+        incoming.size = cur.size;
     }
 
     match incoming.status {
@@ -332,10 +330,7 @@ async fn update_mirror_size(
         "mirror size update"
     );
 
-    match state
-        .db
-        .update_mirror_status(&worker_id, &msg.name, status)
-    {
+    match state.db.update_mirror_status(&worker_id, &msg.name, status) {
         Err(e) => db_err(e),
         Ok(stored) => Json(stored).into_response(),
     }
@@ -375,10 +370,9 @@ async fn update_schedules_of_worker(
 
         cur.scheduled = schedule.next_schedule;
 
-        if let Err(e) =
-            state
-                .db
-                .update_mirror_status(&worker_id, &schedule.mirror_name, cur)
+        if let Err(e) = state
+            .db
+            .update_mirror_status(&worker_id, &schedule.mirror_name, cur)
         {
             return db_err(e);
         }
@@ -414,11 +408,7 @@ async fn handle_client_cmd(
     // Pre-update job status for Disable/Stop.
     let changed = matches!(client_cmd.cmd, CmdVerb::Disable | CmdVerb::Stop);
     if changed {
-        if let Ok(mut cur) =
-            state
-                .db
-                .get_mirror_status(worker_id, &client_cmd.mirror_id)
-        {
+        if let Ok(mut cur) = state.db.get_mirror_status(worker_id, &client_cmd.mirror_id) {
             cur.status = match client_cmd.cmd {
                 CmdVerb::Disable => SyncStatus::Disabled,
                 CmdVerb::Stop => SyncStatus::Paused,
@@ -455,13 +445,14 @@ async fn handle_client_cmd(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrBody {
-                error: format!("post command to worker {worker_id} ({}) failed: {e}", worker.url),
+                error: format!(
+                    "post command to worker {worker_id} ({}) failed: {e}",
+                    worker.url
+                ),
             }),
         )
             .into_response(),
-        Ok(_) => {
-            ok_msg(format!("successfully send command to worker {worker_id}")).into_response()
-        }
+        Ok(_) => ok_msg(format!("successfully send command to worker {worker_id}")).into_response(),
     }
 }
 

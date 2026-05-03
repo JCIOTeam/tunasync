@@ -36,7 +36,11 @@ impl BtrfsSnapshotHook {
         } else {
             PathBuf::from(global_snapshot_dir).join(&mirror_name)
         };
-        Self { mirror_name, working_dir, snapshot_path }
+        Self {
+            mirror_name,
+            working_dir,
+            snapshot_path,
+        }
     }
 
     // ------------------------------------------------------------------
@@ -147,11 +151,13 @@ impl BtrfsSnapshotHook {
 
 #[async_trait]
 impl JobHook for BtrfsSnapshotHook {
-    fn name(&self) -> &str { "btrfs_snapshot" }
+    fn name(&self) -> &str {
+        "btrfs_snapshot"
+    }
 
     async fn on_phase(&self, phase: HookPhase) -> Result<()> {
         match phase {
-            HookPhase::PreJob      => self.pre_job().await,
+            HookPhase::PreJob => self.pre_job().await,
             HookPhase::PostSuccess => self.post_success().await,
             _ => Ok(()),
         }

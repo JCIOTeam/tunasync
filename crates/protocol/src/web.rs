@@ -160,7 +160,8 @@ mod tests {
             upstream: "rsync://example.com/".into(),
             size: "1.0T".into(),
         };
-        let json: serde_json::Value = serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
         // Go produces "2024-06-15 10:30:45 +0000" for UTC.
         assert_eq!(json["last_update"], "2024-06-15 10:30:45 +0000");
         // Unix timestamp

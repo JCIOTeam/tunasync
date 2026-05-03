@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 /// Top-level manager configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ManagerConfig {
     #[serde(default)]
     pub debug: bool,
@@ -17,16 +17,6 @@ pub struct ManagerConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub files: FilesConfig,
-}
-
-impl Default for ManagerConfig {
-    fn default() -> Self {
-        Self {
-            debug: false,
-            server: ServerConfig::default(),
-            files: FilesConfig::default(),
-        }
-    }
 }
 
 /// HTTP server bind settings.
@@ -43,8 +33,12 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    fn default_addr() -> String { "127.0.0.1".into() }
-    fn default_port() -> u16 { 14242 }
+    fn default_addr() -> String {
+        "127.0.0.1".into()
+    }
+    fn default_port() -> u16 {
+        14242
+    }
 
     pub fn bind_addr(&self) -> std::net::SocketAddr {
         let ip: IpAddr = self.addr.parse().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
@@ -80,8 +74,12 @@ pub struct FilesConfig {
 }
 
 impl FilesConfig {
-    fn default_db_file() -> PathBuf { PathBuf::from("/var/lib/tunasync/tunasync.db") }
-    fn default_db_type() -> String { "redb".into() }
+    fn default_db_file() -> PathBuf {
+        PathBuf::from("/var/lib/tunasync/tunasync.db")
+    }
+    fn default_db_type() -> String {
+        "redb".into()
+    }
 }
 
 impl Default for FilesConfig {

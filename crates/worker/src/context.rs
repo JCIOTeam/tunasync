@@ -120,7 +120,10 @@ mod tests {
         let ctx = Context::new();
         ctx.enter();
         ctx.set_log_file("/var/log/tunasync/ubuntu.log");
-        assert_eq!(ctx.log_file().as_deref(), Some("/var/log/tunasync/ubuntu.log"));
+        assert_eq!(
+            ctx.log_file().as_deref(),
+            Some("/var/log/tunasync/ubuntu.log")
+        );
         ctx.exit();
         assert_eq!(ctx.log_file(), None);
     }

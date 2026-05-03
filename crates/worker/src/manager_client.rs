@@ -60,19 +60,22 @@ impl ManagerClient {
     }
 
     /// `POST {manager}/workers/{worker_id}/jobs/{mirror_id}/size` — POST to all bases.
-    pub async fn report_size(
-        &self,
-        worker_id: &str,
-        mirror_id: &str,
-        size: &str,
-    ) -> Result<()> {
+    pub async fn report_size(&self, worker_id: &str, mirror_id: &str, size: &str) -> Result<()> {
         #[derive(serde::Serialize)]
         struct SizeMsg<'a> {
             name: &'a str,
             size: &'a str,
         }
         let path = format!("/workers/{worker_id}/jobs/{mirror_id}/size");
-        let errs = self.post_all(&path, &SizeMsg { name: mirror_id, size }).await;
+        let errs = self
+            .post_all(
+                &path,
+                &SizeMsg {
+                    name: mirror_id,
+                    size,
+                },
+            )
+            .await;
         if errs.is_empty() {
             Ok(())
         } else {
@@ -102,11 +105,20 @@ impl ManagerClient {
     /// POST to ALL manager base URLs, collecting errors. Matches Go's behaviour
     /// where status/schedule updates go to every manager in the list.
     async fn post_all<Req>(&self, path: &str, body: &Req) -> Vec<(String, anyhow::Error)>
-    where Req: serde::Serialize {
+    where
+        Req: serde::Serialize,
+    {
         let mut errs = Vec::new();
         for base in &self.bases {
             let url = format!("{base}{path}");
-            match self.client.post(&url).timeout(Duration::from_secs(30)).json(body).send().await {
+            match self
+                .client
+                .post(&url)
+                .timeout(Duration::from_secs(30))
+                .json(body)
+                .send()
+                .await
+            {
                 Err(e) => {
                     tracing::warn!(url = %url, error = %e, "manager request failed");
                     errs.push((base.clone(), e.into()));
@@ -115,7 +127,10 @@ impl ManagerClient {
                     let status = resp.status();
                     if !status.is_success() {
                         let body = resp.text().await.unwrap_or_default();
-                        errs.push((base.clone(), anyhow::anyhow!("POST {url} returned {}: {body}", status)));
+                        errs.push((
+                            base.clone(),
+                            anyhow::anyhow!("POST {url} returned {}: {body}", status),
+                        ));
                     }
                     // success — no need to record it
                 }
@@ -170,9 +185,13 @@ impl ManagerClient {
     /// `GET {manager}/workers/{worker_id}/jobs` — fetch persisted mirror
     /// statuses from the manager (used at startup to restore Paused/Disabled).
     /// Matches Go's `fetchJobStatus()`.
-    pub async fn fetch_job_status(&self, worker_id: &str) -> Result<Vec<tunasync_protocol::MirrorStatus>> {
+    pub async fn fetch_job_status(
+        &self,
+        worker_id: &str,
+    ) -> Result<Vec<tunasync_protocol::MirrorStatus>> {
         let path = format!("/workers/{worker_id}/jobs");
-        self.get::<Vec<tunasync_protocol::MirrorStatus>>(&path).await
+        self.get::<Vec<tunasync_protocol::MirrorStatus>>(&path)
+            .await
     }
 
     /// GET the first available manager base URL.

@@ -58,12 +58,7 @@ impl CgroupHook {
     /// `base_path`: cgroup mount root, e.g. `/sys/fs/cgroup` (empty → default).
     /// `group`: sub-group to use as the parent, e.g. `tunasync`.
     /// `memory_limit_bytes`: 0 = no limit.
-    pub fn new(
-        mirror_name: String,
-        base_path: &str,
-        group: &str,
-        memory_limit_bytes: i64,
-    ) -> Self {
+    pub fn new(mirror_name: String, base_path: &str, group: &str, memory_limit_bytes: i64) -> Self {
         let is_v2 = is_cgroup_v2();
         let base = if base_path.is_empty() {
             "/sys/fs/cgroup"
@@ -90,7 +85,11 @@ impl CgroupHook {
     pub fn procs_file(&self) -> Option<PathBuf> {
         let guard = self.inner.lock().unwrap();
         guard.job_path.as_ref().map(|p| {
-            if self.is_v2 { p.join("cgroup.procs") } else { p.join("tasks") }
+            if self.is_v2 {
+                p.join("cgroup.procs")
+            } else {
+                p.join("tasks")
+            }
         })
     }
 
@@ -158,7 +157,7 @@ impl CgroupHook {
     }
 
     fn kill_all(&self, job_path: &Path) -> Result<()> {
-        use nix::sys::signal::{Signal, kill};
+        use nix::sys::signal::{kill, Signal};
         use nix::unistd::Pid;
 
         let procs_file = if self.is_v2 {
@@ -175,15 +174,22 @@ impl CgroupHook {
                 Ok(c) => c,
                 Err(_) => return Ok(()),
             };
-            let pids: Vec<i32> = content.lines()
+            let pids: Vec<i32> = content
+                .lines()
                 .filter_map(|l| l.trim().parse().ok())
                 .collect();
-            if pids.is_empty() { return Ok(()); }
+            if pids.is_empty() {
+                return Ok(());
+            }
             for pid in &pids {
                 tracing::debug!(pid, "SIGKILL cgroup process");
                 let _ = kill(Pid::from_raw(*pid), Signal::SIGKILL);
             }
-            let sleep_ms = if attempt == 0 { 10 } else { attempt as u64 * 1000 };
+            let sleep_ms = if attempt == 0 {
+                10
+            } else {
+                attempt as u64 * 1000
+            };
             std::thread::sleep(Duration::from_millis(sleep_ms));
         }
         Ok(())
@@ -192,11 +198,13 @@ impl CgroupHook {
 
 #[async_trait]
 impl JobHook for CgroupHook {
-    fn name(&self) -> &str { "cgroup" }
+    fn name(&self) -> &str {
+        "cgroup"
+    }
 
     async fn on_phase(&self, phase: HookPhase) -> Result<()> {
         match phase {
-            HookPhase::PreExec  => tokio::task::block_in_place(|| self.create_cgroup()),
+            HookPhase::PreExec => tokio::task::block_in_place(|| self.create_cgroup()),
             HookPhase::PostExec => tokio::task::block_in_place(|| self.kill_and_delete_cgroup()),
             _ => Ok(()),
         }

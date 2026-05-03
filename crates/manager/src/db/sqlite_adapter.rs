@@ -45,7 +45,9 @@ impl SqliteAdapter {
              );",
         )?;
 
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 }
 
@@ -87,12 +89,11 @@ impl DbAdapter for SqliteAdapter {
     fn delete_worker(&self, id: &str) -> DbResult<()> {
         let conn = self.conn.lock().unwrap();
         // Check existence first (same as Go's kvDBAdapter).
-        let exists: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM workers WHERE id = ?1)",
-                params![id],
-                |row| row.get(0),
-            )?;
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workers WHERE id = ?1)",
+            params![id],
+            |row| row.get(0),
+        )?;
         if !exists {
             return Err(DbError::NotFound(format!("worker {id:?}")));
         }
@@ -173,9 +174,7 @@ impl DbAdapter for SqliteAdapter {
         // cannot contain '/'.
         let suffix = format!("/{worker_id}");
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT data FROM mirror_status WHERE key LIKE '%' || ?1",
-        )?;
+        let mut stmt = conn.prepare("SELECT data FROM mirror_status WHERE key LIKE '%' || ?1")?;
         let rows: Vec<Vec<u8>> = stmt
             .query_map(params![suffix], |row| row.get::<_, Vec<u8>>(0))?
             .filter_map(|r| r.ok())

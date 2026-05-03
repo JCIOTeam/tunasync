@@ -121,13 +121,15 @@ impl LogLimitHook {
 
 #[async_trait]
 impl JobHook for LogLimitHook {
-    fn name(&self) -> &str { "loglimit" }
+    fn name(&self) -> &str {
+        "loglimit"
+    }
 
     async fn on_phase(&self, phase: HookPhase) -> Result<()> {
         match phase {
-            HookPhase::PreExec     => self.pre_exec().await,
+            HookPhase::PreExec => self.pre_exec().await,
             HookPhase::PostSuccess => self.post_success().await,
-            HookPhase::PostFail    => self.post_fail().await,
+            HookPhase::PostFail => self.post_fail().await,
             _ => Ok(()),
         }
     }

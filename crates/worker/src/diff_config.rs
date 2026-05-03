@@ -26,7 +26,7 @@ pub struct MirrorCfgTrans {
 impl std::fmt::Display for MirrorCfgTrans {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let label = match self.op {
-            DiffOp::Add    => "Add",
+            DiffOp::Add => "Add",
             DiffOp::Delete => "Del",
             DiffOp::Modify => "Mod",
         };
@@ -62,18 +62,27 @@ pub fn diff_mirror_config(
         match cmp {
             std::cmp::Ordering::Greater => {
                 // new[j] not in old → Add
-                ops.push(MirrorCfgTrans { op: DiffOp::Add, config: new[j].clone() });
+                ops.push(MirrorCfgTrans {
+                    op: DiffOp::Add,
+                    config: new[j].clone(),
+                });
                 j += 1;
             }
             std::cmp::Ordering::Less => {
                 // old[i] not in new → Delete
-                ops.push(MirrorCfgTrans { op: DiffOp::Delete, config: old[i].clone() });
+                ops.push(MirrorCfgTrans {
+                    op: DiffOp::Delete,
+                    config: old[i].clone(),
+                });
                 i += 1;
             }
             std::cmp::Ordering::Equal => {
                 // Same name — check for modification via PartialEq.
                 if !mirrors_equal(&old[i], &new[j]) {
-                    ops.push(MirrorCfgTrans { op: DiffOp::Modify, config: new[j].clone() });
+                    ops.push(MirrorCfgTrans {
+                        op: DiffOp::Modify,
+                        config: new[j].clone(),
+                    });
                 }
                 i += 1;
                 j += 1;
@@ -101,11 +110,18 @@ mod tests {
     use super::*;
 
     fn mc(name: &str) -> MirrorConfig {
-        MirrorConfig { name: name.into(), ..Default::default() }
+        MirrorConfig {
+            name: name.into(),
+            ..Default::default()
+        }
     }
 
     fn mc_with_upstream(name: &str, up: &str) -> MirrorConfig {
-        MirrorConfig { name: name.into(), upstream: up.into(), ..Default::default() }
+        MirrorConfig {
+            name: name.into(),
+            upstream: up.into(),
+            ..Default::default()
+        }
     }
 
     #[test]

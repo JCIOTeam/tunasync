@@ -10,10 +10,10 @@ use axum::http::{Request, StatusCode};
 use chrono::Utc;
 use serde_json::Value;
 use tower::ServiceExt;
-use tunasync_protocol::{MirrorStatus, SyncStatus, WorkerStatus, zero_time};
+use tunasync_protocol::{zero_time, MirrorStatus, SyncStatus, WorkerStatus};
 
-use tunasync_manager::db::{DbAdapter, open as open_db};
-use tunasync_manager::server::{AppState, build_router};
+use tunasync_manager::db::{open as open_db, DbAdapter};
+use tunasync_manager::server::{build_router, AppState};
 
 // ---------------------------------------------------------------------------
 // DB helpers
@@ -112,13 +112,15 @@ macro_rules! db_tests {
                 assert_eq!(got.status, SyncStatus::Success);
 
                 // list by worker
-                db.update_mirror_status("w1", "debian", sample_status("debian", "w1")).unwrap();
+                db.update_mirror_status("w1", "debian", sample_status("debian", "w1"))
+                    .unwrap();
                 let list = db.list_mirror_status("w1").unwrap();
                 assert_eq!(list.len(), 2);
 
                 // list all
                 db.create_worker(sample_worker("w2")).unwrap();
-                db.update_mirror_status("w2", "fedora", sample_status("fedora", "w2")).unwrap();
+                db.update_mirror_status("w2", "fedora", sample_status("fedora", "w2"))
+                    .unwrap();
                 let all = db.list_all_mirror_status().unwrap();
                 assert_eq!(all.len(), 3);
             }
@@ -162,16 +164,13 @@ fn make_app() -> axum::Router {
 async fn get_json(app: &axum::Router, path: &str) -> (StatusCode, Value) {
     let resp = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri(path)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
         .await
         .unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, json)
 }
@@ -190,7 +189,9 @@ async fn post_json(app: &axum::Router, path: &str, body: &Value) -> (StatusCode,
         .await
         .unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, json)
 }
@@ -208,7 +209,9 @@ async fn delete_req(app: &axum::Router, path: &str) -> (StatusCode, Value) {
         .await
         .unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, json)
 }
@@ -325,7 +328,11 @@ async fn job_status_timestamp_merge() {
         "upstream": "", "size": "", "error_msg": ""
     });
     let (_, r) = post_json(&app, "/workers/w1/jobs/ubuntu", &pre_sync).await;
-    assert_ne!(r["last_started"].as_str().unwrap(), zero, "last_started should be set on pre-syncing");
+    assert_ne!(
+        r["last_started"].as_str().unwrap(),
+        zero,
+        "last_started should be set on pre-syncing"
+    );
 
     // Second: success — last_update and last_ended should be set.
     let success = serde_json::json!({
@@ -336,8 +343,16 @@ async fn job_status_timestamp_merge() {
         "upstream": "", "size": "1.2T", "error_msg": ""
     });
     let (_, r) = post_json(&app, "/workers/w1/jobs/ubuntu", &success).await;
-    assert_ne!(r["last_update"].as_str().unwrap(), zero, "last_update on success");
-    assert_ne!(r["last_ended"].as_str().unwrap(), zero, "last_ended on success");
+    assert_ne!(
+        r["last_update"].as_str().unwrap(),
+        zero,
+        "last_update on success"
+    );
+    assert_ne!(
+        r["last_ended"].as_str().unwrap(),
+        zero,
+        "last_ended on success"
+    );
 }
 
 #[tokio::test]

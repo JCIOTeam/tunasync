@@ -28,7 +28,9 @@ pub enum DbError {
 macro_rules! impl_from_db_error {
     ($t:ty) => {
         impl From<$t> for DbError {
-            fn from(e: $t) -> Self { Self::Storage(e.to_string()) }
+            fn from(e: $t) -> Self {
+                Self::Storage(e.to_string())
+            }
         }
     };
 }
@@ -53,7 +55,12 @@ pub trait DbAdapter: Send + Sync {
     fn delete_worker(&self, id: &str) -> DbResult<()>;
     fn create_worker(&self, w: WorkerStatus) -> DbResult<WorkerStatus>;
     fn refresh_worker(&self, id: &str) -> DbResult<WorkerStatus>;
-    fn update_mirror_status(&self, worker_id: &str, mirror_id: &str, status: MirrorStatus) -> DbResult<MirrorStatus>;
+    fn update_mirror_status(
+        &self,
+        worker_id: &str,
+        mirror_id: &str,
+        status: MirrorStatus,
+    ) -> DbResult<MirrorStatus>;
     fn get_mirror_status(&self, worker_id: &str, mirror_id: &str) -> DbResult<MirrorStatus>;
     fn list_mirror_status(&self, worker_id: &str) -> DbResult<Vec<MirrorStatus>>;
     fn list_all_mirror_status(&self) -> DbResult<Vec<MirrorStatus>>;
@@ -67,9 +74,9 @@ pub trait DbAdapter: Send + Sync {
 
 pub fn open(db_type: &str, db_path: &std::path::Path) -> DbResult<Box<dyn DbAdapter>> {
     match db_type {
-        "redb"   => Ok(Box::new(redb_adapter::RedbAdapter::open(db_path)?)),
+        "redb" => Ok(Box::new(redb_adapter::RedbAdapter::open(db_path)?)),
         "sqlite" => Ok(Box::new(sqlite_adapter::SqliteAdapter::open(db_path)?)),
-        other    => Err(DbError::Storage(format!(
+        other => Err(DbError::Storage(format!(
             "unsupported db_type {other:?}; valid values: \"redb\", \"sqlite\""
         ))),
     }
@@ -85,5 +92,5 @@ pub(crate) fn status_key(mirror_id: &str, worker_id: &str) -> String {
 }
 
 pub(crate) fn worker_id_from_key(key: &str) -> &str {
-    key.splitn(2, '/').nth(1).unwrap_or("")
+    key.split_once('/').map(|x| x.1).unwrap_or("")
 }

@@ -443,19 +443,35 @@ pub struct MirrorConfig {
 impl MirrorConfig {
     /// Effective interval, falling back to global default.
     pub fn effective_interval(&self, global: &GlobalConfig) -> Duration {
-        let mins = if self.interval > 0 { self.interval } else { global.interval.max(1) };
+        let mins = if self.interval > 0 {
+            self.interval
+        } else {
+            global.interval.max(1)
+        };
         Duration::from_secs(mins * 60)
     }
 
     /// Effective retry count, falling back to global default.
     pub fn effective_retry(&self, global: &GlobalConfig) -> u32 {
-        if self.retry > 0 { self.retry } else { global.retry.max(1) }
+        if self.retry > 0 {
+            self.retry
+        } else {
+            global.retry.max(1)
+        }
     }
 
     /// Effective timeout, falling back to global default (`None` = no timeout).
     pub fn effective_timeout(&self, global: &GlobalConfig) -> Option<Duration> {
-        let secs = if self.timeout > 0 { self.timeout } else { global.timeout };
-        if secs == 0 { None } else { Some(Duration::from_secs(secs)) }
+        let secs = if self.timeout > 0 {
+            self.timeout
+        } else {
+            global.timeout
+        };
+        if secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(secs))
+        }
     }
 
     /// Resolved mirror storage directory.
@@ -469,7 +485,9 @@ impl MirrorConfig {
                 base
             }
         } else if !self.mirror_subdir.is_empty() {
-            PathBuf::from(&global.mirror_dir).join(&self.mirror_subdir).join(&self.name)
+            PathBuf::from(&global.mirror_dir)
+                .join(&self.mirror_subdir)
+                .join(&self.name)
         } else {
             PathBuf::from(&global.mirror_dir).join(&self.name)
         }

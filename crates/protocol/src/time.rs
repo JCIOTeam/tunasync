@@ -42,8 +42,7 @@ mod tests {
 
     #[test]
     fn parses_go_zero_value() {
-        let parsed: DateTime<Utc> =
-            serde_json::from_str(r#""0001-01-01T00:00:00Z""#).unwrap();
+        let parsed: DateTime<Utc> = serde_json::from_str(r#""0001-01-01T00:00:00Z""#).unwrap();
         assert!(is_zero_time(&parsed));
     }
 
@@ -58,8 +57,7 @@ mod tests {
         // Go emits RFC 3339 with up to nanosecond precision, e.g. tunasync's
         // last_update timestamp. Make sure chrono preserves it.
         let original = "2024-06-15T10:30:45.123456789Z";
-        let parsed: DateTime<Utc> =
-            serde_json::from_str(&format!(r#""{original}""#)).unwrap();
+        let parsed: DateTime<Utc> = serde_json::from_str(&format!(r#""{original}""#)).unwrap();
         let back = serde_json::to_string(&parsed).unwrap();
         assert_eq!(back, format!(r#""{original}""#));
     }

@@ -17,8 +17,7 @@ use serde::de::DeserializeOwned;
 pub fn load_toml<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("read config from {}", path.display()))?;
-    toml::from_str(&content)
-        .with_context(|| format!("parse TOML config from {}", path.display()))
+    toml::from_str(&content).with_context(|| format!("parse TOML config from {}", path.display()))
 }
 
 /// Parse a TOML config from an in-memory string.

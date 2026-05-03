@@ -111,7 +111,10 @@ mod tests {
 
     #[test]
     fn from_str_round_trip() {
-        assert_eq!(SyncStatus::from_str("syncing").unwrap(), SyncStatus::Syncing);
+        assert_eq!(
+            SyncStatus::from_str("syncing").unwrap(),
+            SyncStatus::Syncing
+        );
         assert!(SyncStatus::from_str("Syncing").is_err());
         assert!(SyncStatus::from_str("unknown").is_err());
     }

@@ -30,13 +30,13 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{error, info, warn};
 use tunasync_protocol::{
-    CmdVerb, MirrorSchedule, MirrorSchedules, MirrorStatus, SyncStatus, WorkerCmd, WorkerStatus,
-    zero_time,
+    zero_time, CmdVerb, MirrorSchedule, MirrorSchedules, MirrorStatus, SyncStatus, WorkerCmd,
+    WorkerStatus,
 };
 
 use crate::config::WorkerConfig;
 use crate::hooks::JobHook;
-use crate::http_server::{WorkerHttpState, build_router, cmd_to_ctrl};
+use crate::http_server::{build_router, cmd_to_ctrl, WorkerHttpState};
 use crate::job::{CtrlAction, JobMessage, MirrorJob};
 use crate::manager_client::ManagerClient;
 use crate::provider::MirrorProvider;
@@ -81,7 +81,12 @@ impl Worker {
         let (status_tx, status_rx) = mpsc::channel::<JobMessage>(128);
         let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>(32);
 
-        let bases = cfg.manager.api_base_list().into_iter().map(String::from).collect();
+        let bases = cfg
+            .manager
+            .api_base_list()
+            .into_iter()
+            .map(String::from)
+            .collect();
         let manager = Arc::new(ManagerClient::new(bases, http_client));
 
         let provider_list = build_jobs(&cfg);
@@ -94,19 +99,22 @@ impl Worker {
             let is_master = provider.is_master();
 
             // Initial zero-value status.
-            mirror_statuses.insert(name.clone(), MirrorStatus {
-                name: name.clone(),
-                worker: cfg.global.name.clone(),
-                is_master,
-                status: SyncStatus::None,
-                last_update: zero_time(),
-                last_started: zero_time(),
-                last_ended: zero_time(),
-                scheduled: zero_time(),
-                upstream,
-                size: String::new(),
-                error_msg: String::new(),
-            });
+            mirror_statuses.insert(
+                name.clone(),
+                MirrorStatus {
+                    name: name.clone(),
+                    worker: cfg.global.name.clone(),
+                    is_master,
+                    status: SyncStatus::None,
+                    last_update: zero_time(),
+                    last_started: zero_time(),
+                    last_ended: zero_time(),
+                    scheduled: zero_time(),
+                    upstream,
+                    size: String::new(),
+                    error_msg: String::new(),
+                },
+            );
 
             let job = MirrorJob::spawn(provider, hooks, status_tx.clone(), Arc::clone(&semaphore));
             jobs.insert(name, job);
@@ -148,7 +156,11 @@ impl Worker {
             worker_name: worker_id.clone(),
         };
         let bind_addr = self.cfg.server.bind_addr();
-        tokio::spawn(run_http_server(http_state, bind_addr, self.cfg.server.clone()));
+        tokio::spawn(run_http_server(
+            http_state,
+            bind_addr,
+            self.cfg.server.clone(),
+        ));
 
         // Fetch persisted job status from manager and restore Paused/Disabled state.
         // Matches Go's `fetchJobStatus()` in `runSchedule`.
@@ -174,7 +186,7 @@ impl Worker {
         // Set up Unix signal handlers.
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{SignalKind, signal};
+            use tokio::signal::unix::{signal, SignalKind};
             let cmd_tx = self.cmd_tx.clone();
             // SIGHUP → send Reload command into the worker's cmd channel.
             if let Ok(mut sighup) = signal(SignalKind::hangup()) {
@@ -248,7 +260,10 @@ impl Worker {
         let mut registered = None;
         for attempt in 0..10 {
             match self.manager.register(&status).await {
-                Ok(r) => { registered = Some(r); break; }
+                Ok(r) => {
+                    registered = Some(r);
+                    break;
+                }
                 Err(e) => {
                     warn!(attempt, error = %e, "registration attempt failed");
                     if attempt < 9 {
@@ -288,9 +303,9 @@ impl Worker {
         // Shutdown signal future (SIGTERM or SIGINT).
         #[cfg(unix)]
         let shutdown = {
-            use tokio::signal::unix::{SignalKind, signal};
+            use tokio::signal::unix::{signal, SignalKind};
             let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-            let mut sigint  = signal(SignalKind::interrupt()).expect("SIGINT handler");
+            let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
             // Return a future that resolves when either signal fires.
             async move {
                 tokio::select! {
@@ -399,7 +414,11 @@ impl Worker {
 
         // Report size separately when a sync succeeds and has a non-empty size.
         if msg.status == SyncStatus::Success && !msg.size.is_empty() {
-            if let Err(e) = self.manager.report_size(worker_id, &msg.name, &msg.size).await {
+            if let Err(e) = self
+                .manager
+                .report_size(worker_id, &msg.name, &msg.size)
+                .await
+            {
                 warn!(mirror = %msg.name, error = %e, "failed to report size to manager");
             }
         }
@@ -443,7 +462,10 @@ impl Worker {
                             job.try_send(action);
                             // Kill running sync on Stop/Disable/Halt so it
                             // terminates promptly instead of waiting for completion.
-                            if matches!(action, CtrlAction::Stop | CtrlAction::Disable | CtrlAction::Halt) {
+                            if matches!(
+                                action,
+                                CtrlAction::Stop | CtrlAction::Disable | CtrlAction::Halt
+                            ) {
                                 job.kill();
                             }
                         }
@@ -451,7 +473,10 @@ impl Worker {
                 } else if let Some(job) = self.jobs.get(&cmd.mirror_id) {
                     if let Some(action) = cmd_to_ctrl(&cmd) {
                         job.try_send(action);
-                        if matches!(action, CtrlAction::Stop | CtrlAction::Disable | CtrlAction::Halt) {
+                        if matches!(
+                            action,
+                            CtrlAction::Stop | CtrlAction::Disable | CtrlAction::Halt
+                        ) {
                             job.kill();
                         }
                     }
@@ -468,17 +493,18 @@ impl Worker {
     /// current mirror list and applies Add / Modify / Delete operations.
     /// Mirrors Go's `Worker.ReloadMirrorConfig`.
     async fn handle_reload(&mut self) {
-        use crate::diff_config::{DiffOp, diff_mirror_config};
+        use crate::diff_config::{diff_mirror_config, DiffOp};
 
         // Re-read the config file from disk.
-        let mut new_cfg: crate::config::WorkerConfig =
-            match tunasync_common::config::load_toml(&self.config_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!(error = %e, "hot-reload: failed to read config — keeping current");
-                    return;
-                }
-            };
+        let mut new_cfg: crate::config::WorkerConfig = match tunasync_common::config::load_toml(
+            &self.config_path,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "hot-reload: failed to read config — keeping current");
+                return;
+            }
+        };
 
         // Merge include files.
         crate::load_include_mirrors(&mut new_cfg);

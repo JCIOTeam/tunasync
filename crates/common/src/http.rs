@@ -32,8 +32,8 @@ impl HttpClientBuilder {
     ///
     /// Equivalent to Go tunasync's `Files.CACert` config field.
     pub fn ca_cert_pem_from_path(mut self, path: &Path) -> Result<Self> {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("read CA cert from {}", path.display()))?;
+        let bytes =
+            std::fs::read(path).with_context(|| format!("read CA cert from {}", path.display()))?;
         self.ca_cert = Some(bytes);
         Ok(self)
     }

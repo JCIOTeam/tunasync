@@ -34,9 +34,12 @@ fn stage1_profile_options(profile: &str) -> anyhow::Result<Vec<String>> {
             "--exclude=ls-lR*".into(),
         ]),
         "debian-oldstyle" => Ok(vec![
-            "--exclude=Packages*".into(), "--exclude=Sources*".into(),
-            "--exclude=Release*".into(), "--exclude=InRelease".into(),
-            "--exclude=i18n/*".into(), "--exclude=ls-lR*".into(),
+            "--exclude=Packages*".into(),
+            "--exclude=Sources*".into(),
+            "--exclude=Release*".into(),
+            "--exclude=InRelease".into(),
+            "--exclude=i18n/*".into(),
+            "--exclude=ls-lR*".into(),
             "--exclude=dep11/*".into(),
         ]),
         _ => anyhow::bail!("invalid Stage 1 Profile: {profile}"),
@@ -84,27 +87,46 @@ impl TwoStageRsyncProvider {
         let log_file = log_dir.join(format!("{}.log", mc.name));
 
         let base_opts_s1: Vec<String> = vec![
-            "-aHvh".into(), "--no-o".into(), "--no-g".into(), "--stats".into(),
-            "--filter".into(), "risk .~tmp~/".into(),
-            "--exclude".into(), ".~tmp~/".into(),
+            "-aHvh".into(),
+            "--no-o".into(),
+            "--no-g".into(),
+            "--stats".into(),
+            "--filter".into(),
+            "risk .~tmp~/".into(),
+            "--exclude".into(),
+            ".~tmp~/".into(),
             "--safe-links".into(),
         ];
         let base_opts_s2: Vec<String> = vec![
-            "-aHvh".into(), "--no-o".into(), "--no-g".into(), "--stats".into(),
-            "--filter".into(), "risk .~tmp~/".into(),
-            "--exclude".into(), ".~tmp~/".into(),
-            "--delete".into(), "--delete-after".into(), "--delay-updates".into(),
+            "-aHvh".into(),
+            "--no-o".into(),
+            "--no-g".into(),
+            "--stats".into(),
+            "--filter".into(),
+            "risk .~tmp~/".into(),
+            "--exclude".into(),
+            ".~tmp~/".into(),
+            "--delete".into(),
+            "--delete-after".into(),
+            "--delay-updates".into(),
             "--safe-links".into(),
         ];
 
         // Build stage2 options: base + timeout + IPv4/6 + exclude-file + global/mirror rsync options.
         let append_common_for_stage2 = |mut opts: Vec<String>| -> Vec<String> {
             if !mc.rsync_no_timeout {
-                let timeo = if mc.rsync_timeout > 0 { mc.rsync_timeout } else { 120 };
+                let timeo = if mc.rsync_timeout > 0 {
+                    mc.rsync_timeout
+                } else {
+                    120
+                };
                 opts.push(format!("--timeout={timeo}"));
             }
-            if mc.use_ipv6 { opts.push("-6".into()); }
-            else if mc.use_ipv4 { opts.push("-4".into()); }
+            if mc.use_ipv6 {
+                opts.push("-6".into());
+            } else if mc.use_ipv4 {
+                opts.push("-4".into());
+            }
             if !mc.exclude_file.is_empty() {
                 opts.extend(["--exclude-from".into(), mc.exclude_file.clone()]);
             }
@@ -116,11 +138,18 @@ impl TwoStageRsyncProvider {
         // Stage1: base options + timeout + IPv4/6 + exclude-file. NO global/mirror rsync options (per Go).
         let mut stage1_options = base_opts_s1.clone();
         if !mc.rsync_no_timeout {
-            let timeo = if mc.rsync_timeout > 0 { mc.rsync_timeout } else { 120 };
+            let timeo = if mc.rsync_timeout > 0 {
+                mc.rsync_timeout
+            } else {
+                120
+            };
             stage1_options.push(format!("--timeout={timeo}"));
         }
-        if mc.use_ipv6 { stage1_options.push("-6".into()); }
-        else if mc.use_ipv4 { stage1_options.push("-4".into()); }
+        if mc.use_ipv6 {
+            stage1_options.push("-6".into());
+        } else if mc.use_ipv4 {
+            stage1_options.push("-4".into());
+        }
         if !mc.exclude_file.is_empty() {
             stage1_options.extend(["--exclude-from".into(), mc.exclude_file.clone()]);
         }
@@ -130,8 +159,12 @@ impl TwoStageRsyncProvider {
         let stage2_options = append_common_for_stage2(base_opts_s2);
 
         let mut rsync_env = HashMap::new();
-        if !mc.username.is_empty() { rsync_env.insert("USER".into(), mc.username.clone()); }
-        if !mc.password.is_empty() { rsync_env.insert("RSYNC_PASSWORD".into(), mc.password.clone()); }
+        if !mc.username.is_empty() {
+            rsync_env.insert("USER".into(), mc.username.clone());
+        }
+        if !mc.password.is_empty() {
+            rsync_env.insert("RSYNC_PASSWORD".into(), mc.password.clone());
+        }
 
         let mut success_exit_codes = mc.success_exit_codes.clone();
         success_exit_codes.extend(global.dangerous_global_success_exit_codes.iter());
@@ -167,12 +200,24 @@ impl TwoStageRsyncProvider {
     }
 
     async fn run_stage(&self, stage: u8) -> Result<()> {
-        let opts = if stage == 1 { &self.stage1_options } else { &self.stage2_options };
+        let opts = if stage == 1 {
+            &self.stage1_options
+        } else {
+            &self.stage2_options
+        };
         let argv = self.build_argv(opts);
-        let log_suffix = if stage == 1 { "stage1.log" } else { "stage2.log" };
+        let log_suffix = if stage == 1 {
+            "stage1.log"
+        } else {
+            "stage2.log"
+        };
         let log_path = self.log_dir.join(format!("{}.{log_suffix}", self.name));
 
-        let lp = if log_path.to_string_lossy() == "/dev/null" { None } else { Some(log_path.as_path()) };
+        let lp = if log_path.to_string_lossy() == "/dev/null" {
+            None
+        } else {
+            Some(log_path.as_path())
+        };
         let proc = runner::spawn(&argv, &self.working_dir, &self.rsync_env, lp)
             .await
             .with_context(|| format!("spawn rsync stage {stage} for {}", self.name))?;
@@ -180,7 +225,8 @@ impl TwoStageRsyncProvider {
         if let Some(pid) = proc.pid() {
             *self.current_pid.lock().unwrap() = Some(pid);
         }
-        let result = proc.wait(&self.success_exit_codes)
+        let result = proc
+            .wait(&self.success_exit_codes)
             .await
             .with_context(|| format!("rsync stage {stage} for {} failed", self.name));
         *self.current_pid.lock().unwrap() = None;
@@ -190,12 +236,24 @@ impl TwoStageRsyncProvider {
 
 #[async_trait]
 impl MirrorProvider for TwoStageRsyncProvider {
-    fn name(&self) -> &str { &self.name }
-    fn upstream(&self) -> &str { &self.upstream }
-    fn is_master(&self) -> bool { self.is_master }
-    fn interval(&self) -> Duration { self.interval }
-    fn retry(&self) -> u32 { self.retry }
-    fn timeout(&self) -> Duration { self.timeout }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn upstream(&self) -> &str {
+        &self.upstream
+    }
+    fn is_master(&self) -> bool {
+        self.is_master
+    }
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+    fn retry(&self) -> u32 {
+        self.retry
+    }
+    fn timeout(&self) -> Duration {
+        self.timeout
+    }
 
     async fn run(&self) -> Result<()> {
         self.run_stage(1).await?;
@@ -223,7 +281,7 @@ impl MirrorProvider for TwoStageRsyncProvider {
                 }
             }
             if let Some(pid) = *self.current_pid.lock().unwrap() {
-                use nix::sys::signal::{Signal, kill};
+                use nix::sys::signal::{kill, Signal};
                 use nix::unistd::Pid;
                 let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
             }

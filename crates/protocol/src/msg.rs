@@ -225,6 +225,9 @@ mod tests {
             args: vec!["--force".into()],
             options: HashMap::new(),
         };
-        assert_eq!(cmd_with_args.to_string(), r#"restart (ubuntu, ["--force"])"#);
+        assert_eq!(
+            cmd_with_args.to_string(),
+            r#"restart (ubuntu, ["--force"])"#
+        );
     }
 }

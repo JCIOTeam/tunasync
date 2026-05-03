@@ -13,12 +13,12 @@ use tokio::net::TcpListener;
 
 use crate::config::ManagerConfig;
 use crate::db::open as open_db;
-use crate::server::{AppState, build_router};
+use crate::server::{build_router, AppState};
 
 /// Start the manager and block until the server exits.
 pub async fn run(config_path: std::path::PathBuf) -> Result<()> {
-    let cfg: ManagerConfig = tunasync_common::config::load_toml(&config_path)
-        .unwrap_or_else(|_| {
+    let cfg: ManagerConfig =
+        tunasync_common::config::load_toml(&config_path).unwrap_or_else(|_| {
             tracing::warn!(
                 path = %config_path.display(),
                 "config file not found or unreadable — using defaults"
@@ -35,10 +35,13 @@ pub async fn run(config_path: std::path::PathBuf) -> Result<()> {
     );
 
     // Open DB adapter.
-    let db = open_db(&cfg.files.db_type, &cfg.files.db_file)
-        .with_context(|| format!(
-            "open {} DB at {}", cfg.files.db_type, cfg.files.db_file.display()
-        ))?;
+    let db = open_db(&cfg.files.db_type, &cfg.files.db_file).with_context(|| {
+        format!(
+            "open {} DB at {}",
+            cfg.files.db_type,
+            cfg.files.db_file.display()
+        )
+    })?;
 
     // Build HTTP client (used by manager to forward commands to workers).
     let http_client = if cfg.files.ca_cert.is_empty() {
@@ -58,9 +61,9 @@ pub async fn run(config_path: std::path::PathBuf) -> Result<()> {
     let shutdown = async {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{SignalKind, signal};
+            use tokio::signal::unix::{signal, SignalKind};
             let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-            let mut sigint  = signal(SignalKind::interrupt()).expect("SIGINT handler");
+            let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
             tokio::select! {
                 _ = sigterm.recv() => tracing::info!("received SIGTERM"),
                 _ = sigint.recv()  => tracing::info!("received SIGINT"),

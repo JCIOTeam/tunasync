@@ -59,11 +59,11 @@ pub enum CtrlAction {
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
-    None     = 0,
-    Ready    = 1,
-    Paused   = 2,
+    None = 0,
+    Ready = 1,
+    Paused = 2,
     Disabled = 3,
-    Halting  = 4,
+    Halting = 4,
 }
 
 impl JobState {
@@ -123,16 +123,15 @@ impl MirrorJob {
 
         let task_state = Arc::clone(&state);
         tokio::spawn(run_job_task(
-            provider,
-            hooks,
-            ctrl_rx,
-            kill_rx,
-            status_tx,
-            semaphore,
-            task_state,
+            provider, hooks, ctrl_rx, kill_rx, status_tx, semaphore, task_state,
         ));
 
-        Self { name, state, ctrl_tx, kill_tx }
+        Self {
+            name,
+            state,
+            ctrl_tx,
+            kill_tx,
+        }
     }
 
     /// Current observable state.
@@ -216,7 +215,12 @@ async fn run_job_task(
 
         // Acquire semaphore slot (concurrency limit). ForceStart skips this.
         let _permit = if action != CtrlAction::ForceStart {
-            Some(Arc::clone(&semaphore).acquire_owned().await.expect("semaphore closed"))
+            Some(
+                Arc::clone(&semaphore)
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore closed"),
+            )
         } else {
             None
         };
@@ -278,6 +282,7 @@ async fn run_job_task(
 /// Mirrors Go's `runJobWrapper` + outer retry loop in `mirrorJob.Run`.
 /// `ctrl_rx` is checked between retries so Stop/Halt/Disable takes effect
 /// without waiting for all retry attempts to expire.
+#[allow(clippy::too_many_arguments)]
 async fn run_sync_with_retry(
     provider: &dyn MirrorProvider,
     hooks: &[Box<dyn JobHook>],
@@ -301,7 +306,10 @@ async fn run_sync_with_retry(
     set_state(state, JobState::Ready); // stays Ready while syncing
 
     // pre-job hooks
-    if run_hooks(hooks, HookPhase::PreJob, name, status_tx).await.is_err() {
+    if run_hooks(hooks, HookPhase::PreJob, name, status_tx)
+        .await
+        .is_err()
+    {
         return;
     }
 
@@ -313,7 +321,10 @@ async fn run_sync_with_retry(
         if attempt > 0 {
             // Check for abort between retries so Stop/Halt doesn't wait for all retries.
             if let Ok(ctrl) = ctrl_rx.try_recv() {
-                if matches!(ctrl, CtrlAction::Halt | CtrlAction::Stop | CtrlAction::Disable) {
+                if matches!(
+                    ctrl,
+                    CtrlAction::Halt | CtrlAction::Stop | CtrlAction::Disable
+                ) {
                     debug!(mirror = %name, "aborting retry loop due to {:?}", ctrl);
                     break 'retry;
                 }
@@ -333,7 +344,10 @@ async fn run_sync_with_retry(
             .await;
 
         // pre-exec hooks
-        if run_hooks(hooks, HookPhase::PreExec, name, status_tx).await.is_err() {
+        if run_hooks(hooks, HookPhase::PreExec, name, status_tx)
+            .await
+            .is_err()
+        {
             break 'retry;
         }
 
@@ -381,7 +395,9 @@ async fn run_sync_with_retry(
 
         // post-exec hooks — run in reverse order per Go's behaviour.
         // If post-exec fails, post-success/post-fail do NOT run.
-        post_exec_ok = run_hooks(hooks, HookPhase::PostExec, name, status_tx).await.is_ok();
+        post_exec_ok = run_hooks(hooks, HookPhase::PostExec, name, status_tx)
+            .await
+            .is_ok();
 
         match run_result {
             Ok(()) => {

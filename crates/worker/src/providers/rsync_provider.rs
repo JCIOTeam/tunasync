@@ -50,7 +50,11 @@ impl RsyncProvider {
         };
         let log_file = log_dir.join(format!("{}.log", mc.name));
 
-        let rsync_cmd = if mc.command.is_empty() { "rsync".to_string() } else { mc.command.clone() };
+        let rsync_cmd = if mc.command.is_empty() {
+            "rsync".to_string()
+        } else {
+            mc.command.clone()
+        };
 
         // Validate: rsync_override_only requires rsync_override to be non-empty.
         if mc.rsync_override_only && mc.rsync_override.is_empty() {
@@ -58,23 +62,32 @@ impl RsyncProvider {
         }
 
         // Build rsync options — matches Go's newRsyncProvider exactly.
-        let mut options: Vec<String> = if !mc.rsync_override.is_empty() && mc.rsync_override_only {
-            mc.rsync_override.clone()
-        } else if !mc.rsync_override.is_empty() {
+        let mut options: Vec<String> = if !mc.rsync_override.is_empty() {
             mc.rsync_override.clone()
         } else {
             vec![
-                "-aHvh".into(), "--no-o".into(), "--no-g".into(), "--stats".into(),
-                "--filter".into(), "risk .~tmp~/".into(),
-                "--exclude".into(), ".~tmp~/".into(),
-                "--delete".into(), "--delete-after".into(), "--delay-updates".into(),
+                "-aHvh".into(),
+                "--no-o".into(),
+                "--no-g".into(),
+                "--stats".into(),
+                "--filter".into(),
+                "risk .~tmp~/".into(),
+                "--exclude".into(),
+                ".~tmp~/".into(),
+                "--delete".into(),
+                "--delete-after".into(),
+                "--delay-updates".into(),
                 "--safe-links".into(),
             ]
         };
 
         if !mc.rsync_override_only {
             if !mc.rsync_no_timeout {
-                let timeo = if mc.rsync_timeout > 0 { mc.rsync_timeout } else { 120 };
+                let timeo = if mc.rsync_timeout > 0 {
+                    mc.rsync_timeout
+                } else {
+                    120
+                };
                 options.push(format!("--timeout={timeo}"));
             }
             if mc.use_ipv6 {
@@ -93,8 +106,12 @@ impl RsyncProvider {
 
         // Environment.
         let mut rsync_env = HashMap::new();
-        if !mc.username.is_empty() { rsync_env.insert("USER".into(), mc.username.clone()); }
-        if !mc.password.is_empty() { rsync_env.insert("RSYNC_PASSWORD".into(), mc.password.clone()); }
+        if !mc.username.is_empty() {
+            rsync_env.insert("USER".into(), mc.username.clone());
+        }
+        if !mc.password.is_empty() {
+            rsync_env.insert("RSYNC_PASSWORD".into(), mc.password.clone());
+        }
 
         // Merge global success exit codes.
         let mut success_exit_codes = mc.success_exit_codes.clone();
@@ -133,12 +150,24 @@ impl RsyncProvider {
 
 #[async_trait]
 impl MirrorProvider for RsyncProvider {
-    fn name(&self) -> &str { &self.name }
-    fn upstream(&self) -> &str { &self.upstream }
-    fn is_master(&self) -> bool { self.is_master }
-    fn interval(&self) -> Duration { self.interval }
-    fn retry(&self) -> u32 { self.retry }
-    fn timeout(&self) -> Duration { self.timeout }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn upstream(&self) -> &str {
+        &self.upstream
+    }
+    fn is_master(&self) -> bool {
+        self.is_master
+    }
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+    fn retry(&self) -> u32 {
+        self.retry
+    }
+    fn timeout(&self) -> Duration {
+        self.timeout
+    }
 
     async fn run(&self) -> Result<()> {
         let argv = self.build_argv();
@@ -161,7 +190,9 @@ impl MirrorProvider for RsyncProvider {
 
         // Extract size from log after successful run.
         if self.log_file.exists() {
-            let content = tokio::fs::read_to_string(&self.log_file).await.unwrap_or_default();
+            let content = tokio::fs::read_to_string(&self.log_file)
+                .await
+                .unwrap_or_default();
             let size = tunasync_common::util::extract_size_from_rsync_log(&content);
             if !size.is_empty() {
                 *self.data_size.lock().unwrap() = size;
@@ -192,7 +223,7 @@ impl MirrorProvider for RsyncProvider {
                 }
             }
             if let Some(pid) = *self.current_pid.lock().unwrap() {
-                use nix::sys::signal::{Signal, kill};
+                use nix::sys::signal::{kill, Signal};
                 use nix::unistd::Pid;
                 let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
             }

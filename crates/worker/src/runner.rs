@@ -54,7 +54,7 @@ impl RunningProcess {
     pub async fn terminate(mut self) {
         #[cfg(unix)]
         {
-            use nix::sys::signal::{Signal, kill};
+            use nix::sys::signal::{kill, Signal};
             use nix::unistd::Pid;
             if let Some(pid) = self.child.id() {
                 let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
@@ -78,7 +78,7 @@ impl RunningProcess {
     pub fn stop_for_cgroup(&self) {
         #[cfg(target_os = "linux")]
         if let Some(pid) = self.child.id() {
-            use nix::sys::signal::{Signal, kill};
+            use nix::sys::signal::{kill, Signal};
             use nix::unistd::Pid;
             let _ = kill(Pid::from_raw(pid as i32), Signal::SIGSTOP);
         }
@@ -88,7 +88,7 @@ impl RunningProcess {
     pub fn cont_after_cgroup(&self) {
         #[cfg(target_os = "linux")]
         if let Some(pid) = self.child.id() {
-            use nix::sys::signal::{Signal, kill};
+            use nix::sys::signal::{kill, Signal};
             use nix::unistd::Pid;
             let _ = kill(Pid::from_raw(pid as i32), Signal::SIGCONT);
         }
@@ -158,8 +158,11 @@ where
         let _ = tokio::fs::create_dir_all(dir).await;
     }
     let mut file = match OpenOptions::new()
-        .create(true).truncate(true).write(true)
-        .open(&log_path).await
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&log_path)
+        .await
     {
         Ok(f) => f,
         Err(e) => {

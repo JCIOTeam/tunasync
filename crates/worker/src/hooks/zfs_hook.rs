@@ -22,7 +22,11 @@ pub struct ZfsHook {
 
 impl ZfsHook {
     pub fn new(mirror_name: String, zpool: String, working_dir: PathBuf) -> Self {
-        Self { mirror_name, zpool, working_dir }
+        Self {
+            mirror_name,
+            zpool,
+            working_dir,
+        }
     }
 
     fn dataset_name(&self) -> String {
@@ -65,7 +69,9 @@ impl ZfsHook {
 
 #[async_trait]
 impl JobHook for ZfsHook {
-    fn name(&self) -> &str { "zfs" }
+    fn name(&self) -> &str {
+        "zfs"
+    }
 
     async fn on_phase(&self, phase: HookPhase) -> Result<()> {
         if phase == HookPhase::PreJob {

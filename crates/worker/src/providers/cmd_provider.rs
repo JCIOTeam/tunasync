@@ -50,18 +50,22 @@ impl CmdProvider {
             anyhow::bail!("mirror {:?}: command is empty", mc.name);
         }
 
-        let fail_on_match = if mc.fail_on_match.is_empty() {
-            None
-        } else {
-            Some(Regex::new(&mc.fail_on_match)
-                .with_context(|| format!("mirror {:?}: invalid fail_on_match regex", mc.name))?)
-        };
+        let fail_on_match =
+            if mc.fail_on_match.is_empty() {
+                None
+            } else {
+                Some(Regex::new(&mc.fail_on_match).with_context(|| {
+                    format!("mirror {:?}: invalid fail_on_match regex", mc.name)
+                })?)
+            };
 
         let size_pattern = if mc.size_pattern.is_empty() {
             None
         } else {
-            Some(Regex::new(&mc.size_pattern)
-                .with_context(|| format!("mirror {:?}: invalid size_pattern regex", mc.name))?)
+            Some(
+                Regex::new(&mc.size_pattern)
+                    .with_context(|| format!("mirror {:?}: invalid size_pattern regex", mc.name))?,
+            )
         };
 
         let working_dir = mc.effective_mirror_dir(global);
@@ -96,10 +100,19 @@ impl CmdProvider {
     fn tunasync_env(&self) -> HashMap<String, String> {
         let mut env = HashMap::new();
         env.insert("TUNASYNC_MIRROR_NAME".into(), self.name.clone());
-        env.insert("TUNASYNC_WORKING_DIR".into(), self.working_dir.to_string_lossy().into());
+        env.insert(
+            "TUNASYNC_WORKING_DIR".into(),
+            self.working_dir.to_string_lossy().into(),
+        );
         env.insert("TUNASYNC_UPSTREAM_URL".into(), self.upstream.clone());
-        env.insert("TUNASYNC_LOG_DIR".into(), self.log_dir.to_string_lossy().into());
-        env.insert("TUNASYNC_LOG_FILE".into(), self.log_file.to_string_lossy().into());
+        env.insert(
+            "TUNASYNC_LOG_DIR".into(),
+            self.log_dir.to_string_lossy().into(),
+        );
+        env.insert(
+            "TUNASYNC_LOG_FILE".into(),
+            self.log_file.to_string_lossy().into(),
+        );
         // User-defined env overrides.
         env.extend(self.env.iter().map(|(k, v)| (k.clone(), v.clone())));
         env
@@ -108,12 +121,24 @@ impl CmdProvider {
 
 #[async_trait]
 impl MirrorProvider for CmdProvider {
-    fn name(&self) -> &str { &self.name }
-    fn upstream(&self) -> &str { &self.upstream }
-    fn is_master(&self) -> bool { self.is_master }
-    fn interval(&self) -> Duration { self.interval }
-    fn retry(&self) -> u32 { self.retry }
-    fn timeout(&self) -> Duration { self.timeout }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn upstream(&self) -> &str {
+        &self.upstream
+    }
+    fn is_master(&self) -> bool {
+        self.is_master
+    }
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+    fn retry(&self) -> u32 {
+        self.retry
+    }
+    fn timeout(&self) -> Duration {
+        self.timeout
+    }
 
     async fn run(&self) -> Result<()> {
         *self.data_size.lock().unwrap() = String::new();
@@ -138,13 +163,12 @@ impl MirrorProvider for CmdProvider {
         // Check fail_on_match regex in the log file.
         if let Some(re) = &self.fail_on_match {
             if self.log_file.exists() {
-                let content = tokio::fs::read_to_string(&self.log_file).await.unwrap_or_default();
+                let content = tokio::fs::read_to_string(&self.log_file)
+                    .await
+                    .unwrap_or_default();
                 let matches: Vec<_> = re.find_iter(&content).collect();
                 if !matches.is_empty() {
-                    anyhow::bail!(
-                        "fail_on_match regex found {} matches in log",
-                        matches.len()
-                    );
+                    anyhow::bail!("fail_on_match regex found {} matches in log", matches.len());
                 }
             }
         }
@@ -154,11 +178,17 @@ impl MirrorProvider for CmdProvider {
         // Our re.find_iter gives full matches; use find_iter + captures to get groups.
         if let Some(re) = &self.size_pattern {
             if self.log_file.exists() {
-                let content = tokio::fs::read_to_string(&self.log_file).await.unwrap_or_default();
+                let content = tokio::fs::read_to_string(&self.log_file)
+                    .await
+                    .unwrap_or_default();
                 let all_captures: Vec<_> = re.captures_iter(&content).collect();
                 if let Some(last_cap) = all_captures.last() {
                     // Capture group 1 if present, else full match (group 0).
-                    let size = last_cap.get(1).or(last_cap.get(0)).map(|m| m.as_str()).unwrap_or_default();
+                    let size = last_cap
+                        .get(1)
+                        .or(last_cap.get(0))
+                        .map(|m| m.as_str())
+                        .unwrap_or_default();
                     *self.data_size.lock().unwrap() = size.to_owned();
                 }
             }
@@ -188,7 +218,7 @@ impl MirrorProvider for CmdProvider {
                 }
             }
             if let Some(pid) = *self.current_pid.lock().unwrap() {
-                use nix::sys::signal::{Signal, kill};
+                use nix::sys::signal::{kill, Signal};
                 use nix::unistd::Pid;
                 let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
             }

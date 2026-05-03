@@ -34,19 +34,30 @@ pub struct DockerHook {
     env: HashMap<String, String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 impl DockerHook {
     pub fn new(
         mirror_name: String,
         image: String,
-        volumes: Vec<String>,         // global + mirror volumes
-        options: Vec<String>,         // global + mirror options
+        volumes: Vec<String>, // global + mirror volumes
+        options: Vec<String>, // global + mirror options
         memory_limit_bytes: i64,
         working_dir: PathBuf,
         log_dir: PathBuf,
         log_file: PathBuf,
         env: HashMap<String, String>, // environment variables passed via `-e`
     ) -> Self {
-        Self { mirror_name, image, volumes, options, memory_limit_bytes, working_dir, log_dir, log_file, env }
+        Self {
+            mirror_name,
+            image,
+            volumes,
+            options,
+            memory_limit_bytes,
+            working_dir,
+            log_dir,
+            log_file,
+            env,
+        }
     }
 
     /// Container name — `tunasync-job-{mirror_name}`.
@@ -68,7 +79,10 @@ impl DockerHook {
         // Working directory inside container.
         argv.extend(["-w".into(), self.working_dir.to_string_lossy().into()]);
         // Run as current user.
-        argv.extend(["-u".into(), format!("{}:{}", unsafe_getuid(), unsafe_getgid())]);
+        argv.extend([
+            "-u".into(),
+            format!("{}:{}", unsafe_getuid(), unsafe_getgid()),
+        ]);
 
         // Environment variables via `-e` flags (matches Go's newCmdJob).
         for (k, v) in &self.env {
@@ -79,7 +93,11 @@ impl DockerHook {
         let runtime_vols = [
             format!("{}:{}", self.log_dir.display(), self.log_dir.display()),
             format!("{}:{}", self.log_file.display(), self.log_file.display()),
-            format!("{}:{}", self.working_dir.display(), self.working_dir.display()),
+            format!(
+                "{}:{}",
+                self.working_dir.display(),
+                self.working_dir.display()
+            ),
         ];
         for vol in &self.volumes {
             argv.extend(["-v".into(), vol.clone()]);
@@ -139,9 +157,12 @@ impl DockerHook {
         for _ in 0..10 {
             let out = Command::new("docker")
                 .args([
-                    "ps", "-a",
-                    "--filter", &format!("name=^{name}$"),
-                    "--format", "{{.Status}}",
+                    "ps",
+                    "-a",
+                    "--filter",
+                    &format!("name=^{name}$"),
+                    "--format",
+                    "{{.Status}}",
                 ])
                 .output()
                 .await;
@@ -167,11 +188,13 @@ impl DockerHook {
 
 #[async_trait]
 impl JobHook for DockerHook {
-    fn name(&self) -> &str { "docker" }
+    fn name(&self) -> &str {
+        "docker"
+    }
 
     async fn on_phase(&self, phase: HookPhase) -> Result<()> {
         match phase {
-            HookPhase::PreExec  => self.ensure_working_dir().await,
+            HookPhase::PreExec => self.ensure_working_dir().await,
             HookPhase::PostExec => {
                 self.wait_container_gone().await;
                 Ok(())
@@ -186,10 +209,18 @@ impl JobHook for DockerHook {
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
-fn unsafe_getuid() -> u32 { unsafe { libc::getuid() } }
+fn unsafe_getuid() -> u32 {
+    unsafe { libc::getuid() }
+}
 #[cfg(unix)]
-fn unsafe_getgid() -> u32 { unsafe { libc::getgid() } }
+fn unsafe_getgid() -> u32 {
+    unsafe { libc::getgid() }
+}
 #[cfg(not(unix))]
-fn unsafe_getuid() -> u32 { 0 }
+fn unsafe_getuid() -> u32 {
+    0
+}
 #[cfg(not(unix))]
-fn unsafe_getgid() -> u32 { 0 }
+fn unsafe_getgid() -> u32 {
+    0
+}

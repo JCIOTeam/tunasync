@@ -10,13 +10,13 @@ use once_cell::sync::Lazy;
 
 static RSYNC_EXIT_VALUES: Lazy<HashMap<i32, &'static str>> = Lazy::new(|| {
     let mut m = HashMap::new();
-    m.insert(0,  "Success");
-    m.insert(1,  "Syntax or usage error");
-    m.insert(2,  "Protocol incompatibility");
-    m.insert(3,  "Errors selecting input/output files, dirs");
-    m.insert(4,  "Requested action not supported");
-    m.insert(5,  "Error starting client-server protocol");
-    m.insert(6,  "Daemon unable to append to log-file");
+    m.insert(0, "Success");
+    m.insert(1, "Syntax or usage error");
+    m.insert(2, "Protocol incompatibility");
+    m.insert(3, "Errors selecting input/output files, dirs");
+    m.insert(4, "Requested action not supported");
+    m.insert(5, "Error starting client-server protocol");
+    m.insert(6, "Daemon unable to append to log-file");
     m.insert(10, "Error in socket I/O");
     m.insert(11, "Error in file I/O");
     m.insert(12, "Error in rsync protocol data stream");
@@ -53,8 +53,8 @@ pub fn translate_rsync_error_code(exit_code: i32) -> (i32, String) {
 /// Mirrors Go's `ExtractSizeFromRsyncLog` / `ExtractSizeFromLog`.
 pub fn extract_size_from_rsync_log(log_content: &str) -> String {
     // (?m) multi-line; match rsync's "Total file size: NNN bytes" line.
-    let re = regex::Regex::new(r"(?m)^Total file size: ([0-9.]+[KMGTP]?) bytes")
-        .expect("static regex");
+    let re =
+        regex::Regex::new(r"(?m)^Total file size: ([0-9.]+[KMGTP]?) bytes").expect("static regex");
     re.captures(log_content)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_owned())
