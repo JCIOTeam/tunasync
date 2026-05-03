@@ -40,24 +40,3 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
-
-  release:
-    name: Build release binaries
-    runs-on: ubuntu-latest
-    needs: [check, test, fmt]
-    if: github.ref == 'refs/heads/rs' && github.event_name == 'push'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release
-      - name: Upload tunasync binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: tunasync-linux-amd64
-          path: target/release/tunasync
-      - name: Upload tunasynctl binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: tunasynctl-linux-amd64
-          path: target/release/tunasynctl
