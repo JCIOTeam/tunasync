@@ -1,0 +1,22 @@
+[package]
+name        = "tunasync"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+description = "tunasync — mirror job management tool (manager + worker dispatcher)"
+
+[[bin]]
+name = "tunasync"
+path = "src/main.rs"
+
+[dependencies]
+tunasync-common  = { workspace = true }
+tunasync-manager = { workspace = true }
+tunasync-worker  = { workspace = true }
+
+anyhow  = { workspace = true }
+clap    = { workspace = true }
+tokio   = { workspace = true }
+tracing = { workspace = true }
