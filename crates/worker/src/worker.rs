@@ -19,7 +19,7 @@
 //!  └──────────────────────────────────────────────────────────┘
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, RwLock, Semaphore};
 use tracing::{error, info, warn};
 use tunasync_protocol::{
     zero_time, CmdVerb, MirrorSchedule, MirrorSchedules, MirrorStatus, SyncStatus, WorkerCmd,
@@ -58,6 +58,9 @@ pub struct Worker {
     semaphore: Arc<Semaphore>,
     schedule: ScheduleQueue,
     mirror_statuses: HashMap<String, MirrorStatus>,
+    /// Shared mirror name set — kept in sync with `self.jobs` so the HTTP
+    /// handler can validate mirror_id before accepting a command.
+    mirror_names: Arc<RwLock<HashSet<String>>>,
 }
 
 impl Worker {
@@ -128,6 +131,8 @@ impl Worker {
             schedule.push(name.clone(), Instant::now() + Duration::from_secs(i as u64));
         }
 
+        let mirror_names = Arc::new(RwLock::new(jobs.keys().cloned().collect()));
+
         Self {
             cfg,
             config_path,
@@ -140,6 +145,7 @@ impl Worker {
             semaphore,
             schedule,
             mirror_statuses,
+            mirror_names,
         }
     }
 
@@ -154,6 +160,7 @@ impl Worker {
         let http_state = WorkerHttpState {
             cmd_tx: self.cmd_tx.clone(),
             worker_name: worker_id.clone(),
+            mirror_names: Arc::clone(&self.mirror_names),
         };
         let bind_addr = self.cfg.server.bind_addr();
         tokio::spawn(run_http_server(
@@ -554,6 +561,15 @@ impl Worker {
         // Update global config (interval/retry defaults etc.) from new file.
         self.cfg.global = new_cfg.global;
         self.cfg.manager = new_cfg.manager;
+
+        // Keep mirror_names in sync so the HTTP handler can validate new mirrors.
+        {
+            let mut names = self.mirror_names.write().await;
+            names.clear();
+            for name in self.jobs.keys() {
+                names.insert(name.clone());
+            }
+        }
     }
 }
 
