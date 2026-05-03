@@ -7,6 +7,13 @@
 //! cgroup, then `SIGCONT`. The window where the child can exec before the
 //! cgroup write is eliminated because the child is stopped.
 //! This requires Linux ≥ 3.5 (all supported distros).
+//!
+//! # Process groups
+//!
+//! Every spawned child gets its own process group (PGID = child PID),
+//! matching Go's `SysProcAttr{Setpgid: true}`. This prevents the child
+//! from receiving signals meant for the parent, and allows clean
+//! termination of the entire child tree via `kill(-pid, signal)`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -16,6 +23,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::sync::mpsc;
 
 // ---------------------------------------------------------------------------
 // RunningProcess
@@ -50,18 +58,20 @@ impl RunningProcess {
         }
     }
 
-    /// SIGTERM → 2 s → SIGKILL. Mirrors Go's `cmdJob.Terminate`.
+    /// SIGTERM the process group → 2 s → SIGKILL the process group.
+    /// Mirrors Go's `cmdJob.Terminate` which uses `kill(-pid, SIGTERM)`.
     pub async fn terminate(mut self) {
         #[cfg(unix)]
         {
             use nix::sys::signal::{kill, Signal};
             use nix::unistd::Pid;
             if let Some(pid) = self.child.id() {
-                let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+                // Kill the entire process group (negative PID).
+                let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGTERM);
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                        tracing::warn!(pid, "SIGTERM timed out — sending SIGKILL");
-                        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+                        tracing::warn!(pid, "SIGTERM timed out — sending SIGKILL to process group");
+                        let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGKILL);
                     }
                     _ = self.child.wait() => {}
                 }
@@ -99,7 +109,7 @@ impl RunningProcess {
 // spawn()
 // ---------------------------------------------------------------------------
 
-/// Spawn a child process.
+/// Spawn a child process in its own process group (matches Go's Setpgid).
 pub async fn spawn(
     argv: &[String],
     working_dir: &Path,
@@ -122,7 +132,8 @@ pub async fn spawn(
         .envs(&env)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .kill_on_drop(true)
+        .process_group(0);
 
     let mut child = cmd
         .spawn()
@@ -146,6 +157,11 @@ pub async fn spawn(
 // I/O helpers
 // ---------------------------------------------------------------------------
 
+/// Drain stdout and stderr concurrently into a log file via an mpsc channel.
+/// Two reader tasks send lines to a shared channel; a single writer task
+/// receives from the channel and writes to the file. This avoids pipe
+/// deadlock: if stderr fills its pipe buffer while we're blocked on stdout,
+/// the child stalls forever. Concurrent drain eliminates this risk.
 async fn tee_to_log<Ro, Re>(stdout: Ro, stderr: Re, log_path: std::path::PathBuf)
 where
     Ro: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -171,33 +187,35 @@ where
         }
     };
 
-    let mut out = BufReader::new(stdout).lines();
-    let mut err = BufReader::new(stderr).lines();
+    let (tx, mut rx) = mpsc::channel::<String>(256);
+    let tx_err = tx.clone();
 
-    // Drain both streams fully — don't stop when one hits EOF, the other
-    // may still have buffered data. Loop until both are fully exhausted.
-    loop {
-        let out_done = loop {
-            match out.next_line().await {
-                Ok(Some(l)) => {
-                    let _ = file.write_all(l.as_bytes()).await;
-                    let _ = file.write_all(b"\n").await;
-                }
-                Ok(None) | Err(_) => break true,
+    // stdout reader — sends each line to the channel.
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(l)) = lines.next_line().await {
+            if tx.send(l).await.is_err() {
+                break;
             }
-        };
-        let err_done = loop {
-            match err.next_line().await {
-                Ok(Some(l)) => {
-                    let _ = file.write_all(l.as_bytes()).await;
-                    let _ = file.write_all(b"\n").await;
-                }
-                Ok(None) | Err(_) => break true,
-            }
-        };
-        if out_done && err_done {
-            break;
         }
+    });
+
+    // stderr reader — sends each line to the channel. When it finishes,
+    // the original `tx` is dropped, closing the channel so the writer knows
+    // both readers are done.
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(l)) = lines.next_line().await {
+            if tx_err.send(l).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Writer: receive lines from the channel and append to the log file.
+    while let Some(l) = rx.recv().await {
+        let _ = file.write_all(l.as_bytes()).await;
+        let _ = file.write_all(b"\n").await;
     }
     let _ = file.flush().await;
 }

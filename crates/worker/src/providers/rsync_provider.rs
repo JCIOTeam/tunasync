@@ -18,7 +18,8 @@ pub struct RsyncProvider {
     pub upstream: String,
     pub working_dir: PathBuf,
     pub log_dir: PathBuf,
-    pub log_file: PathBuf,
+    /// Shared log path — set by LogLimitHook::preExec, read in run().
+    pub log_path_shared: Arc<Mutex<PathBuf>>,
     pub interval: Duration,
     pub retry: u32,
     pub timeout: Duration,
@@ -51,7 +52,7 @@ impl RsyncProvider {
         } else {
             PathBuf::from(&mc.log_dir)
         };
-        let log_file = log_dir.join("latest.log");
+        let log_path_shared = Arc::new(Mutex::new(log_dir.join("latest.log")));
 
         let rsync_cmd = if mc.command.is_empty() {
             "rsync".to_string()
@@ -127,7 +128,7 @@ impl RsyncProvider {
             upstream: mc.upstream.clone(),
             working_dir,
             log_dir,
-            log_file,
+            log_path_shared,
             interval: mc.effective_interval(global),
             retry: mc.effective_retry(global),
             timeout: mc.effective_timeout(global).unwrap_or(Duration::ZERO),
@@ -183,10 +184,11 @@ impl MirrorProvider for RsyncProvider {
             (argv, self.rsync_env.clone())
         };
 
-        let log_path = if self.log_file.to_string_lossy() == "/dev/null" {
+        let log_file = self.log_path_shared.lock().unwrap().clone();
+        let log_path = if log_file.to_string_lossy() == "/dev/null" {
             None
         } else {
-            Some(self.log_file.as_path())
+            Some(log_file.as_path())
         };
 
         let proc = runner::spawn(&argv, &self.working_dir, &spawn_env, log_path)
@@ -201,8 +203,8 @@ impl MirrorProvider for RsyncProvider {
         wait_result?;
 
         // Extract size from log after successful run.
-        if self.log_file.exists() {
-            let content = tokio::fs::read_to_string(&self.log_file)
+        if log_file.exists() {
+            let content = tokio::fs::read_to_string(&log_file)
                 .await
                 .unwrap_or_default();
             let size = tunasync_common::util::extract_size_from_rsync_log(&content);
@@ -250,6 +252,10 @@ impl MirrorProvider for RsyncProvider {
     fn set_docker_config(&mut self, config: DockerConfig) {
         self.docker_container_name = Some(config.container_name());
         self.docker_config = Some(config);
+    }
+
+    fn set_log_path_shared(&mut self, path: Arc<Mutex<PathBuf>>) {
+        self.log_path_shared = path;
     }
 }
 

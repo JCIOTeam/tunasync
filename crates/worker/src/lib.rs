@@ -21,6 +21,7 @@ pub mod worker;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use config::ProviderKind;
@@ -174,11 +175,16 @@ pub fn build_one_provider(
     let mut hooks: Vec<Box<dyn JobHook>> = Vec::new();
 
     // loglimit hook (always enabled if log_dir is set).
+    // Wire up shared log path: LogLimitHook sets the path in PreExec,
+    // the provider reads it in run() so stdout/stderr go to the rotated log.
+    let mut log_path_shared: Option<Arc<Mutex<PathBuf>>> = None;
     if !log_dir.to_string_lossy().is_empty() {
-        hooks.push(Box::new(LogLimitHook::new(
-            mc.name.clone(),
-            log_dir.clone(),
-        )));
+        let ll_hook = LogLimitHook::new(mc.name.clone(), log_dir.clone());
+        log_path_shared = Some(ll_hook.current_log_shared());
+        hooks.push(Box::new(ll_hook));
+    }
+    if let Some(shared) = log_path_shared {
+        provider.set_log_path_shared(shared);
     }
 
     // Docker hook — also wires up argv wrapping on the provider.

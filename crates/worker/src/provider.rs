@@ -3,6 +3,8 @@
 //! Stage 4 adds: `CmdProvider`, `RsyncProvider`, `TwoStageRsyncProvider`.
 //! Stage 5 will add hooks as a dependency injected via the trait.
 
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -29,4 +31,8 @@ pub trait MirrorProvider: Send + Sync {
     /// with `docker run …` inside `run()` and set the container name for
     /// `terminate()`.
     fn set_docker_config(&mut self, config: DockerConfig);
+    /// Wire up log path coordination with `LogLimitHook`. The shared
+    /// `Arc<Mutex<PathBuf>>` is set by `LogLimitHook::preExec` and read
+    /// by the provider in `run()` so stdout/stderr go to the rotated log.
+    fn set_log_path_shared(&mut self, path: Arc<Mutex<PathBuf>>);
 }

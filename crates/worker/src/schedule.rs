@@ -61,16 +61,18 @@ impl ScheduleQueue {
         self.heap.push(ScheduleEntry { name, next_run });
     }
 
-    /// Peek at the earliest-due entry without removing it.
-    /// Skips stale entries (whose next_run doesn't match the latest map).
-    pub fn peek(&self) -> Option<&ScheduleEntry> {
-        self.heap.peek().and_then(|entry| {
-            if self.latest.get(&entry.name) == Some(&entry.next_run) {
-                Some(entry)
-            } else {
-                None
+    /// Peek at the earliest-due entry, removing stale duplicates from the top.
+    /// Returns an owned `ScheduleEntry` (clone of the valid heap top) so the
+    /// caller doesn't hold a borrow that would conflict with a subsequent `pop()`.
+    pub fn peek(&mut self) -> Option<ScheduleEntry> {
+        while let Some(top) = self.heap.peek() {
+            if self.latest.get(&top.name) == Some(&top.next_run) {
+                return Some(top.clone());
             }
-        })
+            // Stale entry — remove from heap and continue.
+            self.heap.pop();
+        }
+        None
     }
 
     /// Pop the earliest-due entry, skipping stale duplicates.

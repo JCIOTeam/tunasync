@@ -21,7 +21,9 @@ pub struct CmdProvider {
     pub upstream: String,
     pub working_dir: PathBuf,
     pub log_dir: PathBuf,
-    pub log_file: PathBuf,
+    /// Shared log path — set by LogLimitHook::preExec, read in run().
+    /// Falls back to `log_dir/latest.log` when PreExec hasn't run yet.
+    pub log_path_shared: Arc<Mutex<PathBuf>>,
     pub interval: Duration,
     pub retry: u32,
     pub timeout: Duration,
@@ -77,14 +79,14 @@ impl CmdProvider {
         } else {
             PathBuf::from(&mc.log_dir)
         };
-        let log_file = log_dir.join("latest.log");
+        let log_path_shared = Arc::new(Mutex::new(log_dir.join("latest.log")));
 
         Ok(Self {
             name: mc.name.clone(),
             upstream: mc.upstream.clone(),
             working_dir,
             log_dir,
-            log_file,
+            log_path_shared,
             interval: mc.effective_interval(global),
             retry: mc.effective_retry(global),
             timeout: mc.effective_timeout(global).unwrap_or(Duration::ZERO),
@@ -102,6 +104,7 @@ impl CmdProvider {
     }
 
     fn tunasync_env(&self) -> HashMap<String, String> {
+        let log_file = self.log_path_shared.lock().unwrap().clone();
         let mut env = HashMap::new();
         env.insert("TUNASYNC_MIRROR_NAME".into(), self.name.clone());
         env.insert(
@@ -115,7 +118,7 @@ impl CmdProvider {
         );
         env.insert(
             "TUNASYNC_LOG_FILE".into(),
-            self.log_file.to_string_lossy().into(),
+            log_file.to_string_lossy().into(),
         );
         // User-defined env overrides.
         env.extend(self.env.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -157,10 +160,11 @@ impl MirrorProvider for CmdProvider {
             (self.command.clone(), env)
         };
 
-        let log_path = if self.log_file.to_string_lossy() == "/dev/null" {
+        let log_file = self.log_path_shared.lock().unwrap().clone();
+        let log_path = if log_file.to_string_lossy() == "/dev/null" {
             None
         } else {
-            Some(self.log_file.as_path())
+            Some(log_file.as_path())
         };
 
         let proc = runner::spawn(&argv, &self.working_dir, &spawn_env, log_path).await?;
@@ -175,8 +179,8 @@ impl MirrorProvider for CmdProvider {
 
         // Check fail_on_match regex in the log file.
         if let Some(re) = &self.fail_on_match {
-            if self.log_file.exists() {
-                let content = tokio::fs::read_to_string(&self.log_file)
+            if log_file.exists() {
+                let content = tokio::fs::read_to_string(&log_file)
                     .await
                     .unwrap_or_default();
                 let matches: Vec<_> = re.find_iter(&content).collect();
@@ -190,8 +194,8 @@ impl MirrorProvider for CmdProvider {
         // Go uses FindAllSubmatch and takes the first capture group of the LAST match.
         // Our re.find_iter gives full matches; use find_iter + captures to get groups.
         if let Some(re) = &self.size_pattern {
-            if self.log_file.exists() {
-                let content = tokio::fs::read_to_string(&self.log_file)
+            if log_file.exists() {
+                let content = tokio::fs::read_to_string(&log_file)
                     .await
                     .unwrap_or_default();
                 let all_captures: Vec<_> = re.captures_iter(&content).collect();
@@ -246,6 +250,10 @@ impl MirrorProvider for CmdProvider {
     fn set_docker_config(&mut self, config: DockerConfig) {
         self.docker_container_name = Some(config.container_name());
         self.docker_config = Some(config);
+    }
+
+    fn set_log_path_shared(&mut self, path: Arc<Mutex<PathBuf>>) {
+        self.log_path_shared = path;
     }
 }
 

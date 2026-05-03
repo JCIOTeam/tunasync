@@ -12,7 +12,7 @@
 //!   - Update `latest` symlink.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -23,17 +23,30 @@ use crate::hooks::{HookPhase, JobHook};
 pub struct LogLimitHook {
     mirror_name: String,
     log_dir: PathBuf,
-    /// The log file path set during `preExec`, used in post phases.
-    current_log: Mutex<PathBuf>,
+    /// The log file path set during `preExec`, shared with the provider
+    /// so the provider writes stdout/stderr to the same rotated log file.
+    current_log: Arc<Mutex<PathBuf>>,
 }
 
 impl LogLimitHook {
     pub fn new(mirror_name: String, log_dir: PathBuf) -> Self {
+        let initial_path = log_dir.join(format!("{mirror_name}.log"));
         Self {
-            current_log: Mutex::new(log_dir.join(format!("{mirror_name}.log"))),
+            current_log: Arc::new(Mutex::new(initial_path)),
             mirror_name,
             log_dir,
         }
+    }
+
+    /// Returns a clone of the shared `Arc<Mutex<PathBuf>>` so the provider
+    /// can read the current log path during `run()`.
+    pub fn current_log_shared(&self) -> Arc<Mutex<PathBuf>> {
+        Arc::clone(&self.current_log)
+    }
+
+    /// The log file path set by the most recent `preExec` call.
+    pub fn current_log_file(&self) -> PathBuf {
+        self.current_log.lock().unwrap().clone()
     }
 
     async fn pre_exec(&self) -> Result<()> {
@@ -111,11 +124,6 @@ impl LogLimitHook {
         }
 
         Ok(())
-    }
-
-    /// The log file path set by the most recent `preExec` call.
-    pub fn current_log_file(&self) -> PathBuf {
-        self.current_log.lock().unwrap().clone()
     }
 }
 
