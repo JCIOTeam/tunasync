@@ -100,36 +100,6 @@ jobs:
           name: tunasync-linux-riscv64
           path: target/riscv64gc-unknown-linux-gnu/release/tunasync-linux-riscv64.tar.gz
 
-  # ── macOS targets ──────────────────────────────────────────
-
-  macos-amd64:
-    name: macOS x86_64
-    runs-on: macos-13
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release
-      - run: cd target/release && tar czf tunasync-macos-amd64.tar.gz tunasync tunasynctl
-      - uses: actions/upload-artifact@v4
-        with:
-          name: tunasync-macos-amd64
-          path: target/release/tunasync-macos-amd64.tar.gz
-
-  macos-aarch64:
-    name: macOS aarch64 (Apple Silicon)
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release
-      - run: cd target/release && tar czf tunasync-macos-aarch64.tar.gz tunasync tunasynctl
-      - uses: actions/upload-artifact@v4
-        with:
-          name: tunasync-macos-aarch64
-          path: target/release/tunasync-macos-aarch64.tar.gz
-
   # ── Release ────────────────────────────────────────────────
 
   release:
@@ -141,8 +111,6 @@ jobs:
       - linux-aarch64
       - linux-armv7
       - linux-riscv64
-      - macos-amd64
-      - macos-aarch64
     permissions:
       contents: write
     steps:
@@ -168,7 +136,5 @@ jobs:
             | `tunasync-linux-aarch64.tar.gz` | aarch64 | ARM64 servers |
             | `tunasync-linux-armv7.tar.gz` | armv7 | ARM32 (armhf) |
             | `tunasync-linux-riscv64.tar.gz` | riscv64 | RISC-V |
-            | `tunasync-macos-amd64.tar.gz` | x86_64 | macOS Intel |
-            | `tunasync-macos-aarch64.tar.gz` | aarch64 | macOS Apple Silicon |
 
             Each tarball contains `tunasync` (manager/worker) and `tunasynctl` (CLI).
