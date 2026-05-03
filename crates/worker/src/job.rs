@@ -412,12 +412,10 @@ async fn run_sync_with_retry(
 
     if success && post_exec_ok {
         let size = provider.data_size();
-        // PostSuccess hooks run in reverse order (matches Go).
-        for hook in hooks.iter().rev() {
-            if let Err(e) = hook.on_phase(HookPhase::PostSuccess).await {
-                error!(mirror = %name, hook = %hook.name(), error = %e, "post-success hook failed");
-            }
-        }
+        // PostSuccess hooks — order handled by run_hooks (reversed per Go).
+        run_hooks(hooks, HookPhase::PostSuccess, name, status_tx)
+            .await
+            .ok();
         let _ = status_tx
             .send(JobMessage {
                 status: SyncStatus::Success,
@@ -428,12 +426,10 @@ async fn run_sync_with_retry(
             })
             .await;
     } else if post_exec_ok {
-        // PostFail hooks run in reverse order (matches Go).
-        for hook in hooks.iter().rev() {
-            if let Err(e) = hook.on_phase(HookPhase::PostFail).await {
-                error!(mirror = %name, hook = %hook.name(), error = %e, "post-fail hook failed");
-            }
-        }
+        // PostFail hooks — order handled by run_hooks (reversed per Go).
+        run_hooks(hooks, HookPhase::PostFail, name, status_tx)
+            .await
+            .ok();
         let _ = status_tx
             .send(JobMessage {
                 status: SyncStatus::Failed,
@@ -455,7 +451,14 @@ async fn run_hooks(
     name: &str,
     status_tx: &mpsc::Sender<JobMessage>,
 ) -> Result<(), ()> {
-    for hook in hooks {
+    // Go reverses hooks for PostExec, PostSuccess, and PostFail.
+    let hooks_to_run: Vec<_> = match phase {
+        HookPhase::PostExec | HookPhase::PostSuccess | HookPhase::PostFail => {
+            hooks.iter().rev().collect()
+        }
+        _ => hooks.iter().collect(),
+    };
+    for hook in hooks_to_run {
         if let Err(e) = hook.on_phase(phase).await {
             error!(
                 mirror = %name,

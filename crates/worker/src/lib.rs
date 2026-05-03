@@ -37,9 +37,15 @@ fn expand_log_dir_template(log_dir: &str, mirror_name: &str) -> String {
     log_dir.replace("{{.Name}}", mirror_name)
 }
 
-/// Expand `global.include` glob patterns and merge the resulting mirror configs
+/// Merge Go's `[include]` section glob into `global.include` array, then
+/// expand all glob patterns and merge the resulting mirror configs
 /// into `cfg.mirrors_conf`.  Called at startup and on hot-reload.
 pub fn load_include_mirrors(cfg: &mut config::WorkerConfig) {
+    // Merge Go-style [include] section into global.include array.
+    if !cfg.include.include_mirrors.is_empty() {
+        cfg.global.include.push(cfg.include.include_mirrors.clone());
+    }
+
     for pattern in cfg.global.include.clone() {
         let entries = match glob::glob(&pattern) {
             Ok(e) => e,
@@ -140,7 +146,7 @@ fn build_providers(
         };
         let log_dir = PathBuf::from(expand_log_dir_template(&log_dir_raw, &mc.name));
         let working_dir = mc.effective_mirror_dir(&cfg.global);
-        let log_file = log_dir.join(format!("{}.log", mc.name));
+        let log_file = log_dir.join("latest.log");
 
         let mut hooks: Vec<Box<dyn JobHook>> = Vec::new();
 
@@ -223,19 +229,9 @@ fn add_system_hooks(
     log_dir: &std::path::Path,
     log_file: &std::path::Path,
 ) {
-    // cgroup (Linux only)
-    #[cfg(target_os = "linux")]
-    if cfg.cgroup.enable {
-        let mem_limit = mc.memory_limit.map(|m| m.0).unwrap_or(0);
-        hooks.push(Box::new(CgroupHook::new(
-            mc.name.clone(),
-            &cfg.cgroup.base_path,
-            &cfg.cgroup.group,
-            mem_limit,
-        )));
-    }
-
-    // docker
+    // Docker and cgroup are mutually exclusive — matches Go:
+    //   if docker.Enable && image != "" { DockerHook }
+    //   else if cgroup.Enable { CgroupHook }
     if cfg.docker.enable && !mc.docker_image.is_empty() {
         let mut volumes = cfg.docker.volumes.clone();
         volumes.extend(mc.docker_volumes.iter().cloned());
@@ -254,8 +250,20 @@ fn add_system_hooks(
             working_dir.to_owned(),
             log_dir.to_owned(),
             log_file.to_owned(),
-            mc.env.clone(), // pass env so DockerHook can emit -e flags
+            mc.env.clone(),
         )));
+    } else {
+        // cgroup (Linux only) — only when Docker is not active for this mirror.
+        #[cfg(target_os = "linux")]
+        if cfg.cgroup.enable {
+            let mem_limit = mc.memory_limit.map(|m| m.0).unwrap_or(0);
+            hooks.push(Box::new(CgroupHook::new(
+                mc.name.clone(),
+                &cfg.cgroup.base_path,
+                &cfg.cgroup.group,
+                mem_limit,
+            )));
+        }
     }
 
     // zfs

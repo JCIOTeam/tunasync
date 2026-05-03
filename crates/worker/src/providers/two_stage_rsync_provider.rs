@@ -84,7 +84,7 @@ impl TwoStageRsyncProvider {
         } else {
             PathBuf::from(&mc.log_dir)
         };
-        let log_file = log_dir.join(format!("{}.log", mc.name));
+        let log_file = log_dir.join("latest.log");
 
         let base_opts_s1: Vec<String> = vec![
             "-aHvh".into(),
