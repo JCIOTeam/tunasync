@@ -74,7 +74,7 @@ impl CmdProvider {
         } else {
             PathBuf::from(&mc.log_dir)
         };
-        let log_file = log_dir.join(format!("{}.log", mc.name));
+        let log_file = log_dir.join("latest.log");
 
         Ok(Self {
             name: mc.name.clone(),

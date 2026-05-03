@@ -27,7 +27,9 @@ struct Cli {
     manager: Option<String>,
 
     /// Manager port (combined with --manager host when manager has no port).
+    /// Short flag `-p` matches Go's tunasynctl CLI.
     #[arg(
+        short,
         long,
         env = "TUNASYNC_MANAGER_PORT",
         global = true,
@@ -52,6 +54,7 @@ enum Command {
     /// List all mirror jobs (WebMirrorStatus, same output as status page).
     List {
         /// List jobs of a specific worker; omit for all workers.
+        /// Short flag `-w` matches Go's tunasynctl CLI.
         #[arg(short, long)]
         worker: Option<String>,
         /// Filter by status (comma-separated: syncing,failed,success,…).
@@ -60,6 +63,9 @@ enum Command {
         /// Output format: `json` (default) or `table`.
         #[arg(long, default_value = "json")]
         format: String,
+        /// Show all workers' jobs (default behaviour, matches Go's `list --all`).
+        #[arg(long)]
+        all: bool,
     },
     /// List all registered workers.
     Workers,
@@ -87,8 +93,8 @@ enum Command {
         /// Restrict to a specific worker.
         #[arg(short, long)]
         worker: Option<String>,
-        /// Ignore concurrency limit (force-start).
-        #[arg(long)]
+        /// Ignore concurrency limit (force-start). Short flag `-f` matches Go.
+        #[arg(short, long)]
         force: bool,
     },
     /// Stop a running mirror job.
@@ -307,6 +313,7 @@ async fn main() -> Result<()> {
             worker,
             status,
             format,
+            all: _,
         } => {
             let jobs = if let Some(w) = worker {
                 // List jobs of one worker (MirrorStatus → convert to WebMirrorStatus).

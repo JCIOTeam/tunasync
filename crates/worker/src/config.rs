@@ -122,6 +122,12 @@ pub struct WorkerConfig {
     #[serde(default)]
     pub docker: DockerConfig,
 
+    /// Go-compatible include section.
+    /// Maps Go's `[include]` with `include_mirrors = "/path/*.conf"`
+    /// into the same `global.include` list.
+    #[serde(default)]
+    pub include: IncludeConfig,
+
     /// `[[mirrors]]` table — inline mirror definitions.
     #[serde(default, rename = "mirrors")]
     pub mirrors_conf: Vec<MirrorConfig>,
@@ -129,6 +135,26 @@ pub struct WorkerConfig {
     /// Resolved mirrors (include files merged in). Populated at runtime.
     #[serde(skip)]
     pub mirrors: Vec<MirrorConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// Include section (Go-compatible)
+// ---------------------------------------------------------------------------
+
+/// Go-compatible `[include]` section.
+///
+/// Go's config uses a separate `[include]` section with a single glob string:
+/// ```toml
+/// [include]
+/// include_mirrors = "/etc/tunasync/mirrors.d/*.conf"
+/// ```
+///
+/// This struct captures that format. After loading, the glob is merged into
+/// `global.include` (our array-based format), so both styles work.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IncludeConfig {
+    #[serde(default)]
+    pub include_mirrors: String,
 }
 
 // ---------------------------------------------------------------------------

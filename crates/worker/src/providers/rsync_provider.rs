@@ -48,7 +48,7 @@ impl RsyncProvider {
         } else {
             PathBuf::from(&mc.log_dir)
         };
-        let log_file = log_dir.join(format!("{}.log", mc.name));
+        let log_file = log_dir.join("latest.log");
 
         let rsync_cmd = if mc.command.is_empty() {
             "rsync".to_string()
