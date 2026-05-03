@@ -12,6 +12,34 @@
 
 Linux（x86_64、aarch64、armv7、riscv64、loongarch64、musl 静态版）和 macOS 的预编译二进制文件可在 [GitHub Releases](https://github.com/JCIOTeam/tunasync/releases) 下载。
 
+## 从 Go 版本迁移
+
+tunasync-rs 与 Go 实现**线路兼容**：Rust manager 可以驱动 Go worker，反之亦然。配置文件格式（TOML）使用相同字段名，现有 Go 配置文件无需修改即可使用。
+
+### 迁移步骤
+
+1. **停止 Go 服务** — `systemctl stop tunasync-manager tunasync-worker`
+2. **安装 Rust 二进制** — 从 [Releases](https://github.com/JCIOTeam/tunasync/releases) 下载或从源码编译，将 `tunasync` 和 `tunasynctl` 复制到 `/usr/bin/`
+3. **保留配置文件** — Rust 版本读取相同 TOML 格式，除非使用 Redis 后端（见下方）
+4. **选择数据库后端** — 如果 Go 版本使用 BoltDB（默认），切换到 `sqlite` 或 `redb`。Rust 版本**不能**读取 BoltDB 文件，需要让其创建新数据库。现有镜像状态会在 worker 注册时自动恢复。
+5. **重启** — `systemctl start tunasync-manager tunasync-worker`
+6. **验证** — `tunasynctl list --all -p <端口>` 应显示所有镜像
+
+### 兼容性对照
+
+| 功能 | Go 版本 | Rust 版本 |
+|------|---------|----------|
+| 配置格式 | TOML，相同字段名 | 兼容 |
+| `[include]` 段 | Glob 匹配加载子配置 | 兼容 |
+| `{{.Name}}` 模板 | log_dir 中模板展开 | 兼容 |
+| SIGHUP 热重载 | 重新加载镜像配置 | 兼容 |
+| 数据库后端 | BoltDB, Redis, MySQL | 仅 redb / sqlite（暂不支持 Redis/MySQL） |
+| Docker hook | 容器包装 | 兼容 |
+| Cgroup hook | v1/v2 内存限制 | 兼容 |
+| Btrfs/ZFS hook | 同步前后快照 | 兼容 |
+| 线路协议 | JSON REST API | 完全兼容 |
+| `tunasynctl` CLI | 相同命令 | 兼容（支持 `-p`、`-w` 短参数） |
+
 ## 设计
 
 架构与上游一致，协议映射详见 `docs/wire-compat.md`。
@@ -68,40 +96,148 @@ mkdir -p ~/tunasync_demo /tmp/tunasync/{log,manager-db}
 
 ```toml
 [global]
-name = "test_worker"
-log_dir = "/tmp/tunasync/log"
-mirror_dir = "/tmp/tunasync"
-concurrent = 10
-interval = 120
+name = "test_worker"                     # Worker 名称（用作 worker_id）
+log_dir = "/tmp/tunasync/log"            # 默认日志目录
+mirror_dir = "/tmp/tunasync"             # 默认镜像数据目录
+concurrent = 10                          # 最大并发同步数（0 = 不限）
+interval = 120                           # 默认同步间隔（分钟）
+retry = 3                                # 默认失败重试次数
+timeout = 600                            # 默认超时时间（秒，0 = 不限）
+# rsync_options = ["--no-motd"]          # 全局 rsync 选项，追加到每个 rsync 任务
+# exec_on_success = []                   # 全局同步成功后执行的命令
+# exec_on_failure = []                   # 全局同步失败后执行的命令
 
 [manager]
-api_base = "http://localhost:12345"
+api_base = "http://localhost:14242"      # Manager URL（单个）
+# api_base_list = [                      # 多个 Manager（覆盖 api_base）
+#     "http://mgr1:14242",
+#     "http://mgr2:14242",
+# ]
+# ca_cert = "/etc/tunasync/ca.crt"       # TLS CA 证书
 
 [server]
-hostname = "localhost"
-listen_addr = "127.0.0.1"
-listen_port = 6000
+hostname = "localhost"                   # Worker 公网主机名
+listen_addr = "127.0.0.1"               # Worker HTTP 监听地址
+listen_port = 6000                       # Worker HTTP 监听端口
+# ssl_cert = ""                          # Worker TLS 证书
+# ssl_key = ""                           # Worker TLS 密钥
 
+# Docker hook — 在容器内运行同步（与 cgroup 互斥）
+[docker]
+enable = false
+# volumes = ["/data:/data"]              # 全局 Docker 卷映射
+# options = ["--network=host"]           # 全局 Docker 选项
+
+# Cgroup hook — 限制每个任务的 CPU/内存（仅 Linux，与 docker 互斥）
+[cgroup]
+enable = false
+# base_path = "/sys/fs/cgroup"          # Cgroup 挂载路径
+# group = "tunasync"                    # Cgroup slice 名称
+
+# ZFS 快照 hook
+[zfs]
+enable = false
+# zpool = "tank"                        # ZFS 池名
+
+# Btrfs 快照 hook（仅 Linux）
+[btrfs_snapshot]
+enable = false
+# snapshot_path = "/snapshots"          # Btrfs 快照目录
+
+# 通过 Glob 包含额外的镜像配置
+[include]
+# include_mirrors = "/etc/tunasync/mirrors.d/*.conf"   # Go 兼容的 [include] 段
+
+# --- 镜像定义 ---
+# provider 类型: "command"、"rsync"、"two-stage-rsync"
+
+# 简单 rsync 镜像
 [[mirrors]]
 name = "elvish"
 provider = "rsync"
 upstream = "rsync://rsync.elv.sh/elvish/"
-use_ipv6 = false
+use_ipv4 = true
+# interval = 60                          # 覆盖全局间隔（分钟）
+# retry = 3                              # 覆盖全局重试次数
+# timeout = 600                          # 覆盖全局超时（秒）
+# mirror_dir = "/data/elvish"            # 覆盖全局 mirror_dir
+# log_dir = "/var/log/tunasync/elvish"   # 覆盖全局 log_dir
+# username = "mirror"                    # Rsync 用户名
+# password = "secret"                    # Rsync 密码（环境变量: RSYNC_PASSWORD）
+# exclude_file = "/etc/tunasync/exclude.txt"  # Rsync exclude-from 文件
+
+# 命令镜像（执行任意 shell 命令）
+[[mirrors]]
+name = "myrepo"
+provider = "command"
+upstream = "https://example.com/repo/"
+command = "wget -m -np -nd {{upstream}} -P {{working_dir}}"
+# fail_on_match = "error|failed"         # 正则匹配日志则判定失败
+# size_pattern = "Total size: ([\\d.]+[KMG])"  # 从日志提取大小
+# success_exit_codes = [0, 1, 2]         # 将这些退出码视为成功
+# env = { "MY_VAR" = "value" }           # 附加环境变量
+
+# 两阶段 rsync（适用于 Debian 等大型仓库）
+[[mirrors]]
+name = "debian"
+provider = "two-stage-rsync"
+upstream = "rsync://ftp.debian.org/debian/"
+stage1_profile = "debian"                # "debian" 或 "debian-oldstyle"
+use_ipv4 = true
+# command = "/usr/local/bin/rsync"       # 自定义 rsync 二进制路径
+
+# Docker 包装的镜像
+# [[mirrors]]
+# name = "docker-mirror"
+# provider = "command"
+# upstream = "https://example.com/"
+# command = "sync-script {{upstream}}"
+# docker_image = "sync-runner:latest"    # Docker 镜像（启用 docker hook）
+# docker_volumes = ["/data:/data"]       # 每个镜像的 Docker 卷映射
+# docker_options = ["--network=host"]    # 每个镜像的 Docker 选项
+# memory_limit = "512M"                  # 内存限制（K/M/G 后缀）
+
+# 自定义角色和钩子的镜像
+# [[mirrors]]
+# name = "slave-mirror"
+# provider = "rsync"
+# upstream = "rsync://master.example.com/mirror/"
+# role = "slave"                         # "master"（默认）或 "slave"
+# exec_on_success = ["curl -s http://notify/success"]
+# exec_on_failure = ["curl -s http://notify/failure"]
 ```
 
 ### Manager 配置 (`~/tunasync_demo/manager.conf`)
 
 ```toml
 [server]
-addr = "127.0.0.1"
-port = 12345
+addr = "127.0.0.1"                       # 监听地址
+port = 14242                             # 监听端口（默认: 14242）
+# ssl_cert = "/etc/tunasync/server.crt"  # TLS 证书
+# ssl_key = "/etc/tunasync/server.key"   # TLS 密钥
+# debug = true                           # 启用调试日志
 
 [files]
-db_type = "sqlite"
-db_file = "/tmp/tunasync/manager-db/tunasync.db"
+db_type = "sqlite"                       # "redb"（默认）或 "sqlite"
+db_file = "/tmp/tunasync/manager-db/tunasync.db"  # 数据库文件路径
+# ca_cert = ""                           # Worker TLS 验证的 CA 证书
 ```
 
 支持的 `db_type`：`redb`（默认）、`sqlite`。注：Go 版本还支持 `redis`，本移植版暂未实现 Redis 后端。
+
+### tunasynctl 配置 (`~/.config/tunasync/ctl.conf`)
+
+```toml
+manager_addr = "127.0.0.1"
+manager_port = 14242
+```
+
+或通过命令行指定：
+
+```bash
+tunasynctl list --all -p 14242
+tunasynctl start elvish -p 14242 -w test_worker
+```
 
 ### 启动
 
@@ -116,19 +252,15 @@ tunasync worker -c ~/tunasync_demo/worker.conf
 
 ```bash
 # 查看所有镜像状态
-tunasynctl list --all -p 12345
+tunasynctl list --all -p 14242
 
 # 启动 / 停止 / 禁用指定镜像
-tunasynctl start elvish -p 12345
-tunasynctl stop elvish -p 12345
-tunasynctl disable elvish -p 12345
-```
+tunasynctl start elvish -p 14242
+tunasynctl stop elvish -p 14242
+tunasynctl disable elvish -p 14242
 
-`tunasynctl` 也可以从 `~/.config/tunasync/ctl.conf` 或 `/etc/tunasync/ctl.conf` 读取配置：
-
-```toml
-manager_addr = "127.0.0.1"
-manager_port = 12345
+# 热重载 Worker 配置（无需重启）
+tunasynctl reload -p 14242
 ```
 
 ### 安全
@@ -161,7 +293,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now tunasync-manager
 sudo systemctl enable --now tunasync-worker
 
-# 热重载 worker 配置（从磁盘重新读取配置，应用差异）
+# 热重载 Worker 配置（从磁盘重新读取配置，应用差异）
 sudo systemctl reload tunasync-worker
 ```
 
@@ -169,7 +301,7 @@ sudo systemctl reload tunasync-worker
 
 ## 编译
 
-需要 Rust stable（≥ 1.80），参见 `rust-toolchain.toml`。
+需要 Rust stable（>= 1.80），参见 `rust-toolchain.toml`。
 
 ```bash
 # 编译 release 二进制
@@ -188,12 +320,12 @@ cargo fmt --all
 
 ```
 crates/
-├── protocol/    # 线路类型 — JSON 格式与 Go 的 internal/msg.go 兼容
-├── common/      # 日志、HTTP 客户端、配置加载
-├── manager/     # Manager HTTP 服务 (axum)、redb/sqlite 存储
-├── worker/      # Worker 运行时：调度器、任务状态机、provider、hook
-├── tunasync/    # 合并 manager+worker 的二进制入口
-└── tunasynctl/  # CLI 控制工具
++-- protocol/    # 线路类型 — JSON 格式与 Go 的 internal/msg.go 兼容
++-- common/      # 日志、HTTP 客户端、配置加载
++-- manager/     # Manager HTTP 服务 (axum)、redb/sqlite 存储
++-- worker/      # Worker 运行时：调度器、任务状态机、provider、hook
++-- tunasync/    # 合并 manager+worker 的二进制入口
++-- tunasynctl/  # CLI 控制工具
 ```
 
 ### Provider（同步提供者）
@@ -219,12 +351,12 @@ crates/
 
 | 阶段 | 范围 | 状态 |
 |------|------|------|
-| 1 | 工作空间、线路协议类型、通用工具 | ✅ |
-| 2 | Manager：HTTP 路由、redb + sqlite 存储、worker 生命周期 | ✅ |
-| 3 | Worker：调度器、任务状态机、cmd_provider、manager 注册 | ✅ |
-| 4 | rsync + 两阶段 rsync provider、exec_post & loglimit hook | ✅ |
-| 5 | cgroup、docker、zfs、btrfs hook | ✅ |
-| 6 | tunasynctl CLI、CI/release、生产加固 | 🔧 |
+| 1 | 工作空间、线路协议类型、通用工具 | 已完成 |
+| 2 | Manager：HTTP 路由、redb + sqlite 存储、worker 生命周期 | 已完成 |
+| 3 | Worker：调度器、任务状态机、cmd_provider、manager 注册 | 已完成 |
+| 4 | rsync + 两阶段 rsync provider、exec_post & loglimit hook | 已完成 |
+| 5 | cgroup、docker、zfs、btrfs hook | 已完成 |
+| 6 | tunasynctl CLI、CI/release、生产加固 | 进行中 |
 
 ## 线路兼容性
 

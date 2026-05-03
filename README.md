@@ -12,6 +12,34 @@ A Rust port of [`tuna/tunasync`](https://github.com/tuna/tunasync), the mirror j
 
 Pre-built binaries for Linux (x86_64, aarch64, armv7, riscv64, loongarch64, musl) and macOS are available at [GitHub Releases](https://github.com/JCIOTeam/tunasync/releases).
 
+## Migrating from the Go version
+
+tunasync-rs is **wire-compatible** with the Go implementation: a Rust manager can drive Go workers and vice versa. The config file format (TOML) uses the same keys, so existing Go config files work without modification.
+
+### Migration steps
+
+1. **Stop the Go services** — `systemctl stop tunasync-manager tunasync-worker`.
+2. **Install the Rust binaries** — download from [Releases](https://github.com/JCIOTeam/tunasync/releases) or build from source, then copy `tunasync` and `tunasynctl` to `/usr/bin/`.
+3. **Keep the config files** — the Rust version reads the same TOML format. No changes needed unless you use Redis as the DB backend (see below).
+4. **Choose a DB backend** — if the Go version uses BoltDB (the default), switch to `sqlite` or `redb`. The Rust version does **not** read BoltDB files, so you need to let it create a fresh DB. Existing mirror states will be re-populated when workers register.
+5. **Restart** — `systemctl start tunasync-manager tunasync-worker`.
+6. **Verify** — `tunasynctl list --all -p <port>` should show all mirrors.
+
+### Compatibility notes
+
+| Feature | Go version | Rust version |
+|---------|-----------|--------------|
+| Config format | TOML, same keys | ✅ Compatible |
+| `[include]` section | Glob-based mirror configs | ✅ Supported |
+| `{{.Name}}` in log_dir | Template expansion | ✅ Supported |
+| SIGHUP hot-reload | Reload mirror config | ✅ Supported |
+| DB backends | BoltDB, Redis, MySQL | redb, sqlite (no Redis/MySQL yet) |
+| Docker hook | Container wrapping | ✅ Compatible |
+| Cgroup hook | v1/v2 memory limit | ✅ Compatible |
+| Btrfs/ZFS hooks | Snapshot before/after | ✅ Compatible |
+| Wire protocol | JSON REST API | ✅ Fully compatible |
+| `tunasynctl` CLI | Same commands | ✅ Compatible (`-p`, `-w` short flags) |
+
 ## Design
 
 Same architecture as upstream — see `docs/wire-compat.md` for the protocol mapping.
@@ -68,40 +96,148 @@ mkdir -p ~/tunasync_demo /tmp/tunasync/{log,manager-db}
 
 ```toml
 [global]
-name = "test_worker"
-log_dir = "/tmp/tunasync/log"
-mirror_dir = "/tmp/tunasync"
-concurrent = 10
-interval = 120
+name = "test_worker"                     # Worker identity (used as worker_id)
+log_dir = "/tmp/tunasync/log"            # Default log directory
+mirror_dir = "/tmp/tunasync"             # Default mirror data directory
+concurrent = 10                          # Max concurrent sync jobs (0 = unlimited)
+interval = 120                           # Default sync interval in minutes
+retry = 3                                # Default retry count on failure
+timeout = 600                            # Default timeout in seconds (0 = no timeout)
+# rsync_options = ["--no-motd"]          # Global rsync options appended to every rsync job
+# exec_on_success = []                   # Global post-success commands
+# exec_on_failure = []                   # Global post-failure commands
 
 [manager]
-api_base = "http://localhost:12345"
+api_base = "http://localhost:14242"      # Manager URL (single)
+# api_base_list = [                      # Multiple managers (overrides api_base)
+#     "http://mgr1:14242",
+#     "http://mgr2:14242",
+# ]
+# ca_cert = "/etc/tunasync/ca.crt"       # CA cert for TLS
 
 [server]
-hostname = "localhost"
-listen_addr = "127.0.0.1"
-listen_port = 6000
+hostname = "localhost"                   # Public hostname for worker URL
+listen_addr = "127.0.0.1"               # Worker HTTP listener address
+listen_port = 6000                       # Worker HTTP listener port
+# ssl_cert = ""                          # Worker TLS cert
+# ssl_key = ""                           # Worker TLS key
 
+# Docker hook — wraps sync jobs in containers (mutually exclusive with cgroup)
+[docker]
+enable = false
+# volumes = ["/data:/data"]              # Global Docker volumes
+# options = ["--network=host"]           # Global Docker options
+
+# Cgroup hook — limits CPU/memory per job (Linux only, mutually exclusive with docker)
+[cgroup]
+enable = false
+# base_path = "/sys/fs/cgroup"          # Cgroup mount point
+# group = "tunasync"                    # Cgroup slice name
+
+# ZFS snapshot hook
+[zfs]
+enable = false
+# zpool = "tank"                        # ZFS pool name
+
+# Btrfs snapshot hook (Linux only)
+[btrfs_snapshot]
+enable = false
+# snapshot_path = "/snapshots"          # Btrfs snapshot directory
+
+# Include additional mirror configs via glob
+[include]
+# include_mirrors = "/etc/tunasync/mirrors.d/*.conf"   # Go-compatible [include] section
+
+# --- Mirror definitions ---
+# provider types: "command", "rsync", "two-stage-rsync"
+
+# Simple rsync mirror
 [[mirrors]]
 name = "elvish"
 provider = "rsync"
 upstream = "rsync://rsync.elv.sh/elvish/"
-use_ipv6 = false
+use_ipv4 = true
+# interval = 60                          # Override global interval (minutes)
+# retry = 3                              # Override global retry count
+# timeout = 600                          # Override global timeout (seconds)
+# mirror_dir = "/data/elvish"            # Override global mirror_dir
+# log_dir = "/var/log/tunasync/elvish"   # Override global log_dir
+# username = "mirror"                    # Rsync username
+# password = "secret"                    # Rsync password (env: RSYNC_PASSWORD)
+# exclude_file = "/etc/tunasync/exclude.txt"  # Rsync exclude-from file
+
+# Command mirror (arbitrary shell command)
+[[mirrors]]
+name = "myrepo"
+provider = "command"
+upstream = "https://example.com/repo/"
+command = "wget -m -np -nd {{upstream}} -P {{working_dir}}"
+# fail_on_match = "error|failed"         # Fail if regex matches log output
+# size_pattern = "Total size: ([\\d.]+[KMG])"  # Extract size from log
+# success_exit_codes = [0, 1, 2]         # Treat these exit codes as success
+# env = { "MY_VAR" = "value" }           # Extra environment variables
+
+# Two-stage rsync (for large repos like Debian)
+[[mirrors]]
+name = "debian"
+provider = "two-stage-rsync"
+upstream = "rsync://ftp.debian.org/debian/"
+stage1_profile = "debian"                # "debian" or "debian-oldstyle"
+use_ipv4 = true
+# command = "/usr/local/bin/rsync"       # Override rsync binary path
+
+# Docker-wrapped mirror
+# [[mirrors]]
+# name = "docker-mirror"
+# provider = "command"
+# upstream = "https://example.com/"
+# command = "sync-script {{upstream}}"
+# docker_image = "sync-runner:latest"    # Docker image (enables docker hook)
+# docker_volumes = ["/data:/data"]       # Per-mirror Docker volumes
+# docker_options = ["--network=host"]    # Per-mirror Docker options
+# memory_limit = "512M"                  # Memory limit (K/M/G suffix)
+
+# Mirror with custom role and hooks
+# [[mirrors]]
+# name = "slave-mirror"
+# provider = "rsync"
+# upstream = "rsync://master.example.com/mirror/"
+# role = "slave"                         # "master" (default) or "slave"
+# exec_on_success = ["curl -s http://notify/success"]
+# exec_on_failure = ["curl -s http://notify/failure"]
 ```
 
 ### Manager config (`~/tunasync_demo/manager.conf`)
 
 ```toml
 [server]
-addr = "127.0.0.1"
-port = 12345
+addr = "127.0.0.1"                       # Listen address
+port = 14242                             # Listen port (default: 14242)
+# ssl_cert = "/etc/tunasync/server.crt"  # TLS certificate
+# ssl_key = "/etc/tunasync/server.key"   # TLS private key
+# debug = true                           # Enable debug logging
 
 [files]
-db_type = "sqlite"
-db_file = "/tmp/tunasync/manager-db/tunasync.db"
+db_type = "sqlite"                       # "redb" (default) or "sqlite"
+db_file = "/tmp/tunasync/manager-db/tunasync.db"  # DB file path
+# ca_cert = ""                           # CA cert for worker TLS verification
 ```
 
 Supported `db_type` values: `redb` (default), `sqlite`. Note: the Go version also supports `redis`; this port does not yet include a Redis backend.
+
+### tunasynctl config (`~/.config/tunasync/ctl.conf`)
+
+```toml
+manager_addr = "127.0.0.1"
+manager_port = 14242
+```
+
+Or specify on the command line:
+
+```bash
+tunasynctl list --all -p 14242
+tunasynctl start elvish -p 14242 -w test_worker
+```
 
 ### Running
 
@@ -116,24 +252,20 @@ Mirror data will be synced into `/tmp/tunasync/`.
 
 ```bash
 # List all mirror statuses
-tunasynctl list --all -p 12345
+tunasynctl list --all -p 14242
 
 # Start / stop / disable a specific mirror
-tunasynctl start elvish -p 12345
-tunasynctl stop elvish -p 12345
-tunasynctl disable elvish -p 12345
-```
+tunasynctl start elvish -p 14242
+tunasynctl stop elvish -p 14242
+tunasynctl disable elvish -p 14242
 
-`tunasynctl` also reads config from `~/.config/tunasync/ctl.conf` or `/etc/tunasync/ctl.conf`:
-
-```toml
-manager_addr = "127.0.0.1"
-manager_port = 12345
+# Reload worker config (hot-reload without restart)
+tunasynctl reload -p 14242
 ```
 
 ### Security
 
-Worker–manager communication uses HTTP(S). If both run on the same machine, plain HTTP is sufficient — leave `ssl_cert` / `ssl_key` empty on the manager and `ca_cert` empty on the worker, with `api_base` using `http://`.
+Worker-manager communication uses HTTP(S). If both run on the same machine, plain HTTP is sufficient — leave `ssl_cert` / `ssl_key` empty on the manager and `ca_cert` empty on the worker, with `api_base` using `http://`.
 
 For encrypted communication, set `ssl_cert` and `ssl_key` on the manager, `ca_cert` on the worker, and use `https://` as the `api_base` prefix.
 
@@ -169,7 +301,7 @@ The `--with-systemd` flag in the service files suppresses timestamps and ANSI co
 
 ## Building
 
-Requires Rust stable (≥ 1.80). See `rust-toolchain.toml`.
+Requires Rust stable (>= 1.80). See `rust-toolchain.toml`.
 
 ```bash
 # Build release binaries
@@ -188,12 +320,12 @@ cargo fmt --all
 
 ```
 crates/
-├── protocol/    # Wire types — JSON-compatible with Go's internal/msg.go
-├── common/      # Logging, HTTP client helpers, config loader
-├── manager/     # Manager HTTP server (axum), redb/sqlite storage
-├── worker/      # Worker runtime: scheduler, job state machine, providers, hooks
-├── tunasync/    # Combined manager+worker dispatcher binary
-└── tunasynctl/  # CLI control tool
++-- protocol/    # Wire types -- JSON-compatible with Go's internal/msg.go
++-- common/      # Logging, HTTP client helpers, config loader
++-- manager/     # Manager HTTP server (axum), redb/sqlite storage
++-- worker/      # Worker runtime: scheduler, job state machine, providers, hooks
++-- tunasync/    # Combined manager+worker dispatcher binary
++-- tunasynctl/  # CLI control tool
 ```
 
 ### Providers
@@ -219,21 +351,21 @@ crates/
 
 | Stage | Scope | Status |
 |-------|-------|--------|
-| 1 | Workspace, wire-compat protocol types, common utilities | ✅ |
-| 2 | Manager: HTTP routes, redb + sqlite adapters, worker lifecycle | ✅ |
-| 3 | Worker: scheduler, job state machine, cmd_provider, manager handshake | ✅ |
-| 4 | rsync + two-stage rsync providers, exec_post & loglimit hooks | ✅ |
-| 5 | cgroup, docker, zfs, btrfs hooks | ✅ |
-| 6 | tunasynctl CLI, CI/release, production hardening | 🔧 |
+| 1 | Workspace, wire-compat protocol types, common utilities | Done |
+| 2 | Manager: HTTP routes, redb + sqlite adapters, worker lifecycle | Done |
+| 3 | Worker: scheduler, job state machine, cmd_provider, manager handshake | Done |
+| 4 | rsync + two-stage rsync providers, exec_post & loglimit hooks | Done |
+| 5 | cgroup, docker, zfs, btrfs hooks | Done |
+| 6 | tunasynctl CLI, CI/release, production hardening | In progress |
 
 ## Wire compatibility
 
 `tunasync-protocol` round-trips every JSON shape Go produces. See `crates/protocol/tests/wire_compat.rs` for the conformance suite. Notable subtleties:
 
-- `SyncStatus::PreSyncing` serialises as `"pre-syncing"` (hyphen) — matches Go.
-- Go's `time.Time{}` zero value (`"0001-01-01T00:00:00Z"`) is preserved by `tunasync_protocol::zero_time()`. Do **not** use `chrono::DateTime::default()` for "unset" timestamps — that's the Unix epoch, a different sentinel.
-- `MirrorStatus::scheduled` → `next_schedule` on the wire (matching Go's struct tag).
-- `MirrorSchedule::mirror_name` → `name` on the wire.
+- `SyncStatus::PreSyncing` serialises as `"pre-syncing"` (hyphen) -- matches Go.
+- Go's `time.Time{}` zero value (`"0001-01-01T00:00:00Z"`) is preserved by `tunasync_protocol::zero_time()`. Do **not** use `chrono::DateTime::default()` for "unset" timestamps -- that's the Unix epoch, a different sentinel.
+- `MirrorStatus::scheduled` -> `next_schedule` on the wire (matching Go's struct tag).
+- `MirrorSchedule::mirror_name` -> `name` on the wire.
 
 ### Known differences from Go
 
