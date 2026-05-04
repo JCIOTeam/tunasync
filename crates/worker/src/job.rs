@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::{mpsc, watch};
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 use tunasync_protocol::SyncStatus;
 
@@ -171,32 +171,25 @@ async fn run_job_task(
     state: Arc<AtomicU32>,
 ) {
     let name = provider.name().to_owned();
-    let interval = provider.interval();
     let max_retry = provider.retry();
 
     set_state(&state, JobState::Ready);
     debug!(mirror = %name, "job task started, state=Ready");
 
-    // When Some, skip waiting on ctrl_rx and immediately run a sync.
-    // Set when Start/Restart/ForceStart arrives during the interval wait.
-    let mut pending_action: Option<CtrlAction> = None;
-
     loop {
-        // Wait for a start signal, unless a prior interval-wake gave us one.
-        let action = if let Some(a) = pending_action.take() {
-            a
-        } else {
-            match ctrl_rx.recv().await {
-                Some(a) => a,
-                None => {
-                    info!(mirror = %name, "ctrl channel closed — exiting");
-                    break;
-                }
+        // Wait for a start signal (the scheduler sends Start when the
+        // job's next-run time arrives). This matches Go's design where
+        // the job itself has no interval sleep — scheduling is external.
+        let action = match ctrl_rx.recv().await {
+            Some(a) => a,
+            None => {
+                info!(mirror = %name, "ctrl channel closed — exiting");
+                break;
             }
         };
 
-        // Handle the initial control action. Start/Restart/ForceStart fall
-        // through to the sync; Stop/Disable/Halt exit or loop back.
+        // Handle the control action. Start/Restart/ForceStart fall through
+        // to the sync; Stop/Disable/Halt exit or loop back.
         match action {
             CtrlAction::Halt => {
                 info!(mirror = %name, "halting job");
@@ -246,10 +239,12 @@ async fn run_job_task(
         )
         .await;
 
-        // Re-schedule after completing.
+        // Notify the scheduler that this job completed so it can enqueue
+        // the next run at now + interval (matching Go's jobMessage with
+        // schedule=true).
         let _ = status_tx
             .send(JobMessage {
-                status: SyncStatus::None, // scheduler will set actual status
+                status: SyncStatus::None,
                 name: name.clone(),
                 msg: String::new(),
                 schedule: true,
@@ -257,39 +252,9 @@ async fn run_job_task(
             })
             .await;
 
-        // Yield before waiting for next interval trigger.
-        set_state(&state, JobState::Ready);
-
-        // Wait for interval or next control action.  If Start/Restart/
-        // ForceStart arrives during the wait we re-enter the sync
-        // immediately (matching Go's behaviour where ctrlStart/ctrlRestart
-        // in the idle select causes a new run).
-        tokio::select! {
-            _ = sleep(interval) => {},
-            Some(ctrl) = ctrl_rx.recv() => {
-                match ctrl {
-                    CtrlAction::Halt => {
-                        set_state(&state, JobState::Halting);
-                        break;
-                    }
-                    CtrlAction::Disable => {
-                        set_state(&state, JobState::Disabled);
-                        break;
-                    }
-                    CtrlAction::Stop => {
-                        set_state(&state, JobState::Paused);
-                        continue;
-                    }
-                    CtrlAction::Start | CtrlAction::Restart | CtrlAction::ForceStart => {
-                        pending_action = Some(ctrl);
-                        continue;
-                    }
-                    CtrlAction::Ping => {
-                        continue;
-                    }
-                }
-            }
-        }
+        // Loop back to wait for the scheduler's next Start signal.
+        // The job does NOT sleep for its interval here — that is the
+        // scheduler's responsibility, matching Go's design.
     }
 
     debug!(mirror = %name, "job task exiting");
