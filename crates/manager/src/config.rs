@@ -66,7 +66,11 @@ impl Default for ServerConfig {
 pub struct FilesConfig {
     #[serde(default = "FilesConfig::default_db_file")]
     pub db_file: PathBuf,
-    /// "redb" (default) or "sqlite"
+    /// "redb" (default), "sqlite", or "redis".
+    ///
+    /// When db_type = "redis", db_file is a Redis URL:
+    ///   redis://localhost:6379/0
+    ///   redis://:password@redis.example.com:6379/1
     #[serde(default = "FilesConfig::default_db_type")]
     pub db_type: String,
     #[serde(default)]

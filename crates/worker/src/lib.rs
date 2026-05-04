@@ -34,11 +34,25 @@ use providers::{CmdProvider, RsyncProvider, TwoStageRsyncProvider};
 
 /// Expand Go template syntax in `log_dir`.
 ///
-/// Go's `formatLogDir` uses `html/template` with `{{.Name}}` resolving
-/// to the mirror name. We support `{{.Name}}` only since that is the
-/// only template variable used in practice.
-fn expand_log_dir_template(log_dir: &str, mirror_name: &str) -> String {
-    log_dir.replace("{{.Name}}", mirror_name)
+/// Go's `formatLogDir` uses `html/template` with fields like `{{.Name}}`,
+/// `{{.Provider}}`, `{{.Upstream}}`, `{{.Role}}`, `{{.MirrorSubDir}}` etc.
+/// We support the same template variables since Go exposes all MirrorConfig
+/// fields in the template context.
+fn expand_log_dir_template(log_dir: &str, mc: &config::MirrorConfig) -> String {
+    let mut result = log_dir.to_string();
+    result = result.replace("{{.Name}}", &mc.name);
+    result = result.replace(
+        "{{.Provider}}",
+        match mc.provider {
+            config::ProviderKind::Command => "command",
+            config::ProviderKind::Rsync => "rsync",
+            config::ProviderKind::TwoStageRsync => "two-stage-rsync",
+        },
+    );
+    result = result.replace("{{.Upstream}}", &mc.upstream);
+    result = result.replace("{{.Role}}", &mc.role);
+    result = result.replace("{{.MirrorSubDir}}", &mc.mirror_subdir);
+    result
 }
 
 /// Merge Go's `[include]` section glob into `global.include` array, then
@@ -96,7 +110,9 @@ pub async fn run(config_path: std::path::PathBuf) -> Result<()> {
 
     // Merge include files before building the mirror list.
     load_include_mirrors(&mut cfg);
-    cfg.mirrors = cfg.mirrors_conf.clone();
+
+    // Flatten nested mirror configs (Go's recursiveMirrors).
+    cfg.mirrors = config::flatten_mirrors(&cfg.mirrors_conf);
 
     tracing::info!(
         worker = %cfg.global.name,
@@ -167,7 +183,7 @@ pub fn build_one_provider(
     } else {
         mc.log_dir.clone()
     };
-    let log_dir = PathBuf::from(expand_log_dir_template(&log_dir_raw, &mc.name));
+    let log_dir = PathBuf::from(expand_log_dir_template(&log_dir_raw, mc));
     let working_dir = mc.effective_mirror_dir(&cfg.global);
 
     let mut hooks: Vec<Box<dyn JobHook>> = Vec::new();
@@ -356,4 +372,48 @@ fn compute_docker_env(
     env.extend(mc.env.iter().map(|(k, v)| (k.clone(), v.clone())));
 
     env
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::MirrorConfig;
+    use crate::config::ProviderKind;
+
+    #[test]
+    fn expand_log_dir_name() {
+        let mc = MirrorConfig::default();
+        let result = crate::expand_log_dir_template("/var/log/{{.Name}}", &mc);
+        assert_eq!(result, "/var/log/");
+        let mc = MirrorConfig {
+            name: "ubuntu".into(),
+            ..Default::default()
+        };
+        let result = crate::expand_log_dir_template("/var/log/{{.Name}}", &mc);
+        assert_eq!(result, "/var/log/ubuntu");
+    }
+
+    #[test]
+    fn expand_log_dir_provider() {
+        let mc = MirrorConfig {
+            name: "debian".into(),
+            provider: ProviderKind::Rsync,
+            ..Default::default()
+        };
+        let result = crate::expand_log_dir_template("/var/log/{{.Provider}}/{{.Name}}", &mc);
+        assert_eq!(result, "/var/log/rsync/debian");
+    }
+
+    #[test]
+    fn expand_log_dir_multiple_vars() {
+        let mc = MirrorConfig {
+            name: "archlinux".into(),
+            provider: ProviderKind::TwoStageRsync,
+            upstream: "rsync://rsync.archlinux.org/archlinux/".into(),
+            role: "master".into(),
+            ..Default::default()
+        };
+        let result =
+            crate::expand_log_dir_template("/var/log/{{.Provider}}/{{.Name}}/{{.Role}}", &mc);
+        assert_eq!(result, "/var/log/two-stage-rsync/archlinux/master");
+    }
 }

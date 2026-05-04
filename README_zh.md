@@ -20,8 +20,8 @@ tunasync-rs 与 Go 实现**线路兼容**：Rust manager 可以驱动 Go worker�
 
 1. **停止 Go 服务** — `systemctl stop tunasync-manager tunasync-worker`
 2. **安装 Rust 二进制** — 从 [Releases](https://github.com/JCIOTeam/tunasync/releases) 下载或从源码编译，将 `tunasync` 和 `tunasynctl` 复制到 `/usr/bin/`
-3. **保留配置文件** — Rust 版本读取相同 TOML 格式，除非使用 Redis 后端（见下方）
-4. **选择数据库后端** — 如果 Go 版本使用 BoltDB（默认），切换到 `sqlite` 或 `redb`。Rust 版本**不能**读取 BoltDB 文件，需要让其创建新数据库。现有镜像状态会在 worker 注册时自动恢复。
+3. **保留配置文件** — Rust 版本读取相同 TOML 格式，无需修改。
+4. **选择数据库后端** — 如果 Go 版本使用 BoltDB（默认），切换到 `sqlite` 或 `redb`。Rust 版本**不能**读取 BoltDB 文件，需要让其创建新数据库。现有镜像状态会在 worker 注册时自动恢复。如果 Go 版本使用 Redis，无需迁移 — 两个版本可以共享同一个 Redis 实例。
 5. **重启** — `systemctl start tunasync-manager tunasync-worker`
 6. **验证** — `tunasynctl list --all -p <端口>` 应显示所有镜像
 
@@ -33,7 +33,7 @@ tunasync-rs 与 Go 实现**线路兼容**：Rust manager 可以驱动 Go worker�
 | `[include]` 段 | Glob 匹配加载子配置 | 兼容 |
 | `{{.Name}}` 模板 | log_dir 中模板展开 | 兼容 |
 | SIGHUP 热重载 | 重新加载镜像配置 | 兼容 |
-| 数据库后端 | BoltDB, Redis, MySQL | 仅 redb / sqlite（暂不支持 Redis/MySQL） |
+| 数据库后端 | BoltDB, Redis, MySQL | redb / sqlite / redis（暂不支持 MySQL） |
 | Docker hook | 容器包装 | 兼容 |
 | Cgroup hook | v1/v2 内存限制 | 兼容 |
 | Btrfs/ZFS hook | 同步前后快照 | 兼容 |
@@ -60,7 +60,8 @@ tunasync-rs 与 Go 实现**线路兼容**：Rust manager 可以驱动 Go worker�
 +------------+ |   <------------------+   |    |     Scheduler     |
 |  redb /    | |   |                  |   |    +-------------------+
 |  sqlite    | +---+                  +---+
-+------------+
+|  redis     |                          |
++------------+                          +
 ```
 
 ### Job 运行流程
@@ -218,12 +219,12 @@ port = 14242                             # 监听端口（默认: 14242）
 # debug = true                           # 启用调试日志
 
 [files]
-db_type = "sqlite"                       # "redb"（默认）或 "sqlite"
+db_type = "sqlite"                       # "redb"（默认）、"sqlite" 或 "redis"
 db_file = "/tmp/tunasync/manager-db/tunasync.db"  # 数据库文件路径
 # ca_cert = ""                           # Worker TLS 验证的 CA 证书
 ```
 
-支持的 `db_type`：`redb`（默认）、`sqlite`。注：Go 版本还支持 `redis`，本移植版暂未实现 Redis 后端。
+支持的 `db_type`：`redb`（默认）、`sqlite`、`redis`。使用 Redis 时，`db_file` 应设为 Redis URL（如 `redis://localhost:6379/0`）。数据与 Go 版完全兼容 — 两个版本可以共享同一个 Redis 实例。
 
 ### tunasynctl 配置 (`~/.config/tunasync/ctl.conf`)
 
@@ -374,7 +375,7 @@ crates/
 | Manager: size 更新 | 使用 `&&` 而非 Go 的有 bug 的 `||` | Go 的条件永远为 true |
 | Manager: heartbeat | 新增 `POST /workers/:id/heartbeat` | 显式心跳比隐式刷新更可靠 |
 | Manager: deleteWorker | 无效 ID 返回 400（Go 返回 500） | 更有用的错误信息 |
-| Manager: DB | 暂无 Redis 后端 | 仅支持 redb/sqlite |
+| Manager: DB | Redis 后端已实现 | 支持 redb、sqlite、redis |
 | Worker: GET /jobs | 额外的自省端点 | 无害的新增功能 |
 
 ## 许可证

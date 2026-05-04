@@ -1,11 +1,12 @@
 //! Manager persistence layer.
 //!
-//! Implements the `DbAdapter` trait for **redb** and **sqlite** backends.
+//! Implements the `DbAdapter` trait for **redb**, **sqlite**, and **redis** backends.
 //! Values are JSON bytes (same as the Go `kvDBAdapter` approach).
 //!
 //! Mirror-status key: `"{mirror_id}/{worker_id}"` — matches Go exactly.
 
 pub mod redb_adapter;
+pub mod redis_adapter;
 pub mod sqlite_adapter;
 
 use thiserror::Error;
@@ -42,6 +43,7 @@ impl_from_db_error!(redb::TableError);
 impl_from_db_error!(redb::StorageError);
 impl_from_db_error!(redb::CommitError);
 impl_from_db_error!(rusqlite::Error);
+impl_from_db_error!(redis::RedisError);
 
 pub type DbResult<T> = Result<T, DbError>;
 
@@ -76,8 +78,14 @@ pub fn open(db_type: &str, db_path: &std::path::Path) -> DbResult<Box<dyn DbAdap
     match db_type {
         "redb" => Ok(Box::new(redb_adapter::RedbAdapter::open(db_path)?)),
         "sqlite" => Ok(Box::new(sqlite_adapter::SqliteAdapter::open(db_path)?)),
+        "redis" => {
+            let url = db_path.to_str().ok_or_else(|| {
+                DbError::Storage("db_file for redis must be a valid UTF-8 URL".into())
+            })?;
+            Ok(Box::new(redis_adapter::RedisAdapter::open(url)?))
+        }
         other => Err(DbError::Storage(format!(
-            "unsupported db_type {other:?}; valid values: \"redb\", \"sqlite\""
+            "unsupported db_type {other:?}; valid values: \"redb\", \"sqlite\", \"redis\""
         ))),
     }
 }

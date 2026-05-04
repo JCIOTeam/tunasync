@@ -464,6 +464,234 @@ pub struct MirrorConfig {
     pub docker_volumes: Vec<String>,
     #[serde(default)]
     pub docker_options: Vec<String>,
+
+    /// Nested child mirrors — Go's `[[mirrors.mirrors]]` inheritance.
+    /// After TOML parsing, `flatten_mirrors()` recursively merges children
+    /// with parents (non-zero child fields override parent defaults) and
+    /// produces a flat `Vec<MirrorConfig>` without any `child_mirrors`.
+    #[serde(default, rename = "mirrors")]
+    pub child_mirrors: Vec<MirrorConfig>,
+}
+
+/// Recursively flatten nested mirror configs.
+///
+/// Mirrors Go's `recursiveMirrors()`: start with parent (or empty), merge
+/// child's non-default fields over parent, then if the merged result has
+/// children, recurse; otherwise append to the flat output list.
+pub fn flatten_mirrors(nested: &[MirrorConfig]) -> Vec<MirrorConfig> {
+    let mut flat = Vec::new();
+    for m in nested {
+        recurse_flatten(None, m, &mut flat);
+    }
+    flat
+}
+
+fn recurse_flatten(
+    parent: Option<&MirrorConfig>,
+    child: &MirrorConfig,
+    out: &mut Vec<MirrorConfig>,
+) {
+    let base = parent.cloned().unwrap_or_default();
+    let merged = merge_mirror(base, child.clone());
+
+    if merged.child_mirrors.is_empty() {
+        let mut final_m = merged;
+        final_m.child_mirrors = Vec::new(); // clear for cleanliness
+        out.push(final_m);
+    } else {
+        let children = merged.child_mirrors.clone();
+        let parent_for_children = {
+            let mut p = merged;
+            p.child_mirrors = Vec::new();
+            p
+        };
+        for grandchild in &children {
+            recurse_flatten(Some(&parent_for_children), grandchild, out);
+        }
+    }
+}
+
+/// Merge child into parent: for each field, child's non-default value
+/// overrides parent's value. Matches Go's `mergo.Merge` with override.
+fn merge_mirror(parent: MirrorConfig, child: MirrorConfig) -> MirrorConfig {
+    MirrorConfig {
+        name: if child.name.is_empty() {
+            parent.name
+        } else {
+            child.name
+        },
+        provider: if child.provider == ProviderKind::default() {
+            parent.provider
+        } else {
+            child.provider
+        },
+        upstream: if child.upstream.is_empty() {
+            parent.upstream
+        } else {
+            child.upstream
+        },
+        interval: if child.interval == 0 {
+            parent.interval
+        } else {
+            child.interval
+        },
+        retry: if child.retry == 0 {
+            parent.retry
+        } else {
+            child.retry
+        },
+        timeout: if child.timeout == 0 {
+            parent.timeout
+        } else {
+            child.timeout
+        },
+        mirror_dir: if child.mirror_dir.is_empty() {
+            parent.mirror_dir
+        } else {
+            child.mirror_dir
+        },
+        mirror_subdir: if child.mirror_subdir.is_empty() {
+            parent.mirror_subdir
+        } else {
+            child.mirror_subdir
+        },
+        log_dir: if child.log_dir.is_empty() {
+            parent.log_dir
+        } else {
+            child.log_dir
+        },
+        env: if child.env.is_empty() {
+            parent.env
+        } else {
+            child.env
+        },
+        role: if child.role.is_empty() {
+            parent.role
+        } else {
+            child.role
+        },
+        exec_on_success: if child.exec_on_success.is_empty() {
+            parent.exec_on_success
+        } else {
+            child.exec_on_success
+        },
+        exec_on_failure: if child.exec_on_failure.is_empty() {
+            parent.exec_on_failure
+        } else {
+            child.exec_on_failure
+        },
+        exec_on_success_extra: if child.exec_on_success_extra.is_empty() {
+            parent.exec_on_success_extra
+        } else {
+            child.exec_on_success_extra
+        },
+        exec_on_failure_extra: if child.exec_on_failure_extra.is_empty() {
+            parent.exec_on_failure_extra
+        } else {
+            child.exec_on_failure_extra
+        },
+        success_exit_codes: if child.success_exit_codes.is_empty() {
+            parent.success_exit_codes
+        } else {
+            child.success_exit_codes
+        },
+        rsync_success_exit_codes: if child.rsync_success_exit_codes.is_empty() {
+            parent.rsync_success_exit_codes
+        } else {
+            child.rsync_success_exit_codes
+        },
+        command: if child.command.is_empty() {
+            parent.command
+        } else {
+            child.command
+        },
+        fail_on_match: if child.fail_on_match.is_empty() {
+            parent.fail_on_match
+        } else {
+            child.fail_on_match
+        },
+        size_pattern: if child.size_pattern.is_empty() {
+            parent.size_pattern
+        } else {
+            child.size_pattern
+        },
+        use_ipv6: if !child.use_ipv6 {
+            parent.use_ipv6
+        } else {
+            child.use_ipv6
+        },
+        use_ipv4: if !child.use_ipv4 {
+            parent.use_ipv4
+        } else {
+            child.use_ipv4
+        },
+        exclude_file: if child.exclude_file.is_empty() {
+            parent.exclude_file
+        } else {
+            child.exclude_file
+        },
+        username: if child.username.is_empty() {
+            parent.username
+        } else {
+            child.username
+        },
+        password: if child.password.is_empty() {
+            parent.password
+        } else {
+            child.password
+        },
+        rsync_no_timeout: if !child.rsync_no_timeout {
+            parent.rsync_no_timeout
+        } else {
+            child.rsync_no_timeout
+        },
+        rsync_timeout: if child.rsync_timeout == 0 {
+            parent.rsync_timeout
+        } else {
+            child.rsync_timeout
+        },
+        rsync_options: if child.rsync_options.is_empty() {
+            parent.rsync_options
+        } else {
+            child.rsync_options
+        },
+        rsync_override: if child.rsync_override.is_empty() {
+            parent.rsync_override
+        } else {
+            child.rsync_override
+        },
+        rsync_override_only: if !child.rsync_override_only {
+            parent.rsync_override_only
+        } else {
+            child.rsync_override_only
+        },
+        stage1_profile: if child.stage1_profile.is_empty() {
+            parent.stage1_profile
+        } else {
+            child.stage1_profile
+        },
+        memory_limit: if child.memory_limit.is_none() {
+            parent.memory_limit
+        } else {
+            child.memory_limit
+        },
+        docker_image: if child.docker_image.is_empty() {
+            parent.docker_image
+        } else {
+            child.docker_image
+        },
+        docker_volumes: if child.docker_volumes.is_empty() {
+            parent.docker_volumes
+        } else {
+            child.docker_volumes
+        },
+        docker_options: if child.docker_options.is_empty() {
+            parent.docker_options
+        } else {
+            child.docker_options
+        },
+        child_mirrors: child.child_mirrors, // always take child's children
+    }
 }
 
 impl MirrorConfig {
@@ -561,5 +789,111 @@ upstream = "rsync://rsync.archlinux.org/archlinux/"
 "#;
         let cfg: WorkerConfig = tunasync_common::config::parse_toml(toml).unwrap();
         assert_eq!(cfg.mirrors_conf[0].provider, ProviderKind::TwoStageRsync);
+    }
+
+    #[test]
+    fn flatten_nested_mirrors_basic() {
+        // Parent is an inheritance container — only leaf mirrors appear in
+        // the flat list (matches Go's recursiveMirrors).
+        let toml = r#"
+[[mirrors]]
+name = "debian"
+provider = "rsync"
+upstream = "rsync://ftp.debian.org/debian/"
+interval = 600
+
+[[mirrors.mirrors]]
+name = "debian-security"
+upstream = "rsync://security.debian.org/debian-security/"
+
+[[mirrors.mirrors]]
+name = "debian-backports"
+upstream = "rsync://ftp.debian.org/debian-backports/"
+"#;
+        let cfg: WorkerConfig = tunasync_common::config::parse_toml(toml).unwrap();
+        let flat = flatten_mirrors(&cfg.mirrors_conf);
+        assert_eq!(flat.len(), 2);
+        // Children inherit parent's provider and interval.
+        assert_eq!(flat[0].name, "debian-security");
+        assert_eq!(flat[0].provider, ProviderKind::Rsync);
+        assert_eq!(flat[0].interval, 600);
+        assert_eq!(
+            flat[0].upstream,
+            "rsync://security.debian.org/debian-security/"
+        );
+        assert_eq!(flat[1].name, "debian-backports");
+        assert_eq!(flat[1].provider, ProviderKind::Rsync);
+        assert_eq!(flat[1].interval, 600);
+    }
+
+    #[test]
+    fn flatten_nested_mirrors_override() {
+        // Child's non-default fields override parent.
+        let toml = r#"
+[[mirrors]]
+name = "centos"
+provider = "command"
+interval = 300
+
+[[mirrors.mirrors]]
+name = "centos-stream"
+provider = "rsync"
+upstream = "rsync://mirror.centos.org/centos-stream/"
+interval = 120
+"#;
+        let cfg: WorkerConfig = tunasync_common::config::parse_toml(toml).unwrap();
+        let flat = flatten_mirrors(&cfg.mirrors_conf);
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].name, "centos-stream");
+        assert_eq!(flat[0].provider, ProviderKind::Rsync);
+        assert_eq!(flat[0].interval, 120);
+        assert_eq!(flat[0].upstream, "rsync://mirror.centos.org/centos-stream/");
+    }
+
+    #[test]
+    fn flatten_deeply_nested() {
+        // Two-level nesting: grandparent → parent → leaf.
+        let toml = r#"
+[[mirrors]]
+name = "fedora"
+provider = "rsync"
+interval = 900
+use_ipv6 = true
+
+[[mirrors.mirrors]]
+name = "fedora-epel"
+mirror_subdir = "epel"
+
+[[mirrors.mirrors]]
+name = "fedora-updates"
+upstream = "rsync://ftp.fedora.org/updates/"
+"#;
+        let cfg: WorkerConfig = tunasync_common::config::parse_toml(toml).unwrap();
+        let flat = flatten_mirrors(&cfg.mirrors_conf);
+        assert_eq!(flat.len(), 2);
+        assert_eq!(flat[0].name, "fedora-epel");
+        assert_eq!(flat[0].provider, ProviderKind::Rsync);
+        assert_eq!(flat[0].interval, 900);
+        assert_eq!(flat[0].use_ipv6, true);
+        assert_eq!(flat[0].mirror_subdir, "epel");
+        assert_eq!(flat[1].name, "fedora-updates");
+        assert_eq!(flat[1].provider, ProviderKind::Rsync);
+        assert_eq!(flat[1].use_ipv6, true);
+    }
+
+    #[test]
+    fn flatten_leaf_only() {
+        // A mirror with no children is a leaf and gets added directly.
+        let toml = r#"
+[[mirrors]]
+name = "ubuntu"
+provider = "rsync"
+upstream = "rsync://archive.ubuntu.com/ubuntu/"
+"#;
+        let cfg: WorkerConfig = tunasync_common::config::parse_toml(toml).unwrap();
+        let flat = flatten_mirrors(&cfg.mirrors_conf);
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].name, "ubuntu");
+        assert_eq!(flat[0].provider, ProviderKind::Rsync);
     }
 }

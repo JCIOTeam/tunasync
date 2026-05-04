@@ -20,8 +20,8 @@ tunasync-rs is **wire-compatible** with the Go implementation: a Rust manager ca
 
 1. **Stop the Go services** — `systemctl stop tunasync-manager tunasync-worker`.
 2. **Install the Rust binaries** — download from [Releases](https://github.com/JCIOTeam/tunasync/releases) or build from source, then copy `tunasync` and `tunasynctl` to `/usr/bin/`.
-3. **Keep the config files** — the Rust version reads the same TOML format. No changes needed unless you use Redis as the DB backend (see below).
-4. **Choose a DB backend** — if the Go version uses BoltDB (the default), switch to `sqlite` or `redb`. The Rust version does **not** read BoltDB files, so you need to let it create a fresh DB. Existing mirror states will be re-populated when workers register.
+3. **Keep the config files** — the Rust version reads the same TOML format. No changes needed.
+4. **Choose a DB backend** — if the Go version uses BoltDB (the default), switch to `sqlite` or `redb`. The Rust version does **not** read BoltDB files, so you need to let it create a fresh DB. Existing mirror states will be re-populated when workers register. If the Go version uses Redis, no migration is needed — both versions can share the same Redis instance.
 5. **Restart** — `systemctl start tunasync-manager tunasync-worker`.
 6. **Verify** — `tunasynctl list --all -p <port>` should show all mirrors.
 
@@ -33,7 +33,7 @@ tunasync-rs is **wire-compatible** with the Go implementation: a Rust manager ca
 | `[include]` section | Glob-based mirror configs | ✅ Supported |
 | `{{.Name}}` in log_dir | Template expansion | ✅ Supported |
 | SIGHUP hot-reload | Reload mirror config | ✅ Supported |
-| DB backends | BoltDB, Redis, MySQL | redb, sqlite (no Redis/MySQL yet) |
+| DB backends | BoltDB, Redis, MySQL | redb, sqlite, redis (no MySQL yet) |
 | Docker hook | Container wrapping | ✅ Compatible |
 | Cgroup hook | v1/v2 memory limit | ✅ Compatible |
 | Btrfs/ZFS hooks | Snapshot before/after | ✅ Compatible |
@@ -60,7 +60,8 @@ Same architecture as upstream — see `docs/wire-compat.md` for the protocol map
 +------------+ |   <------------------+   |    |     Scheduler     |
 |  redb /    | |   |                  |   |    +-------------------+
 |  sqlite    | +---+                  +---+
-+------------+
+|  redis     |                          |
++------------+                          +
 ```
 
 ### Job Run Process
@@ -218,12 +219,12 @@ port = 14242                             # Listen port (default: 14242)
 # debug = true                           # Enable debug logging
 
 [files]
-db_type = "sqlite"                       # "redb" (default) or "sqlite"
+db_type = "sqlite"                       # "redb" (default), "sqlite", or "redis"
 db_file = "/tmp/tunasync/manager-db/tunasync.db"  # DB file path
 # ca_cert = ""                           # CA cert for worker TLS verification
 ```
 
-Supported `db_type` values: `redb` (default), `sqlite`. Note: the Go version also supports `redis`; this port does not yet include a Redis backend.
+Supported `db_type` values: `redb` (default), `sqlite`, `redis`. When using Redis, set `db_file` to a Redis URL (e.g. `redis://localhost:6379/0`). Data is wire-compatible with Go — both versions can share the same Redis instance.
 
 ### tunasynctl config (`~/.config/tunasync/ctl.conf`)
 
@@ -374,7 +375,7 @@ crates/
 | Manager: size update | `&&` instead of Go's buggy `||` | Go bug: condition always true |
 | Manager: heartbeat | Added `POST /workers/:id/heartbeat` | More robust than implicit refresh |
 | Manager: deleteWorker | 400 on invalid ID (Go: 500) | More useful error |
-| Manager: DB | No Redis backend yet | Only redb/sqlite supported |
+| Manager: DB | Redis backend added | redb, sqlite, redis all supported |
 | Worker: GET /jobs | Additional introspection endpoint | Harmless addition |
 
 ## License

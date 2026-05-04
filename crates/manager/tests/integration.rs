@@ -1,7 +1,8 @@
 //! Integration tests for the manager server and DB adapters.
 //!
-//! Each test suite is parameterised over both `redb` and `sqlite` backends
-//! to ensure they behave identically.
+//! Each test suite is parameterised over `redb`, `sqlite`, and `redis` backends
+//! to ensure they behave identically. Redis tests auto-skip when
+//! `TUNASYNC_TEST_REDIS_URL` is not set.
 
 use std::sync::Arc;
 
@@ -149,6 +150,98 @@ macro_rules! db_tests {
 
 db_tests!(redb_db, "redb");
 db_tests!(sqlite_db, "sqlite");
+
+// ---------------------------------------------------------------------------
+// Redis DB tests — auto-skip when TUNASYNC_TEST_REDIS_URL is not set
+// ---------------------------------------------------------------------------
+
+mod redis_db {
+    use super::*;
+
+    fn redis_url() -> Option<String> {
+        std::env::var("TUNASYNC_TEST_REDIS_URL").ok()
+    }
+
+    fn open() -> Option<Box<dyn DbAdapter>> {
+        let url = redis_url()?;
+        let path = std::path::PathBuf::from(&url);
+        open_db("redis", &path).ok()
+    }
+
+    /// Flush test data before each test.
+    fn flush_test_db() {
+        if let Some(url) = redis_url() {
+            let client = redis::Client::open(url.as_str()).unwrap();
+            let mut conn = client.get_connection().unwrap();
+            redis::cmd("FLUSHDB").execute(&mut conn);
+        }
+    }
+
+    #[test]
+    fn worker_crud() {
+        let Some(db) = open() else { return };
+        flush_test_db();
+
+        let w = sample_worker("worker-1");
+        let created = db.create_worker(w.clone()).unwrap();
+        assert_eq!(created.id, "worker-1");
+
+        let got = db.get_worker("worker-1").unwrap();
+        assert_eq!(got.id, "worker-1");
+
+        let list = db.list_workers().unwrap();
+        assert_eq!(list.len(), 1);
+
+        let refreshed = db.refresh_worker("worker-1").unwrap();
+        assert!(refreshed.last_online > zero_time());
+
+        db.delete_worker("worker-1").unwrap();
+        assert!(db.get_worker("worker-1").is_err());
+        assert!(db.delete_worker("worker-1").is_err());
+    }
+
+    #[test]
+    fn mirror_status_crud() {
+        let Some(db) = open() else { return };
+        flush_test_db();
+
+        db.create_worker(sample_worker("w1")).unwrap();
+        let s = sample_status("ubuntu", "w1");
+        db.update_mirror_status("w1", "ubuntu", s).unwrap();
+
+        let got = db.get_mirror_status("w1", "ubuntu").unwrap();
+        assert_eq!(got.status, SyncStatus::Success);
+
+        db.update_mirror_status("w1", "debian", sample_status("debian", "w1"))
+            .unwrap();
+        assert_eq!(db.list_mirror_status("w1").unwrap().len(), 2);
+
+        db.create_worker(sample_worker("w2")).unwrap();
+        db.update_mirror_status("w2", "fedora", sample_status("fedora", "w2"))
+            .unwrap();
+        assert_eq!(db.list_all_mirror_status().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn flush_disabled() {
+        let Some(db) = open() else { return };
+        flush_test_db();
+
+        db.create_worker(sample_worker("w1")).unwrap();
+        let mut s = sample_status("ubuntu", "w1");
+        s.status = SyncStatus::Disabled;
+        db.update_mirror_status("w1", "ubuntu", s).unwrap();
+
+        let s2 = sample_status("debian", "w1");
+        db.update_mirror_status("w1", "debian", s2).unwrap();
+
+        db.flush_disabled_jobs().unwrap();
+
+        let all = db.list_all_mirror_status().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "debian");
+    }
+}
 
 // ---------------------------------------------------------------------------
 // HTTP server route tests
