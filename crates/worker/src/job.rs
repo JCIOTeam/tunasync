@@ -124,18 +124,8 @@ impl MirrorJob {
         let (kill_tx, kill_rx) = watch::channel(false);
 
         let task_state = Arc::clone(&state);
-        // Clone kill_tx for the task so it can reset the kill signal
-        // after a kill+restart cycle (sends false to reset the watch).
-        let task_kill_tx = kill_tx.clone();
         tokio::spawn(run_job_task(
-            provider,
-            hooks,
-            ctrl_rx,
-            kill_rx,
-            task_kill_tx,
-            status_tx,
-            semaphore,
-            task_state,
+            provider, hooks, ctrl_rx, kill_rx, status_tx, semaphore, task_state,
         ));
 
         Self {
@@ -173,12 +163,6 @@ impl MirrorJob {
     pub fn kill(&self) {
         let _ = self.kill_tx.send(true);
     }
-
-    /// Reset the kill signal so a subsequent sync is not immediately killed.
-    /// Must be called before starting a new sync after a kill.
-    pub fn reset_kill(&self) {
-        let _ = self.kill_tx.send(false);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +175,6 @@ async fn run_job_task(
     hooks: Vec<Box<dyn JobHook>>,
     mut ctrl_rx: mpsc::Receiver<CtrlAction>,
     mut kill_rx: watch::Receiver<bool>,
-    kill_tx: watch::Sender<bool>,
     status_tx: mpsc::Sender<JobMessage>,
     semaphore: Arc<tokio::sync::Semaphore>,
     state: Arc<AtomicU32>,
@@ -236,6 +219,11 @@ async fn run_job_task(
             }
             CtrlAction::Start | CtrlAction::Restart | CtrlAction::ForceStart => {
                 set_state(&state, JobState::Ready);
+                // Brief pause for cleanup after a Restart kill (matches Go's
+                // time.Sleep(time.Second) after Restart kill).
+                if action == CtrlAction::Restart {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
             }
             CtrlAction::Ping => {
                 debug!(mirror = %name, "ping");
@@ -261,12 +249,6 @@ async fn run_job_task(
             None
         };
 
-        // Reset the kill signal before starting the sync. If a Restart
-        // killed the previous sync, kill_rx holds true. We must reset
-        // to false so the next kill_rx.changed() only fires on a fresh
-        // kill signal (not the stale one from the previous cycle).
-        let _ = kill_tx.send(false);
-
         // Run the sync with retry logic.
         let killed = run_sync_with_retry(
             &*provider,
@@ -283,23 +265,6 @@ async fn run_job_task(
         // If the sync was killed (Restart/Stop/Disable/Halt), skip scheduling.
         // Matches Go: `schedule: (m.State() == stateReady)`.
         if killed {
-            // For Restart: wait briefly for the old process to clean up,
-            // matching Go's `time.Sleep(time.Second)` after Restart kill.
-            // The Restart CtrlAction was already sent by handle_worker_cmd
-            // before kill(), so it's buffered in ctrl_rx. The next loop
-            // iteration will receive it and start a fresh sync.
-            if let Ok(CtrlAction::Restart) = ctrl_rx.try_recv() {
-                info!(mirror = %name, "restarting after kill — brief pause for cleanup");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                // Re-inject Restart so the next loop iteration picks it up.
-                // Use the sender stored on MirrorJob indirectly — but we
-                // don't have access to it here. Instead, use a simple
-                // pending_action approach.
-                // Actually: just continue. The handle_worker_cmd already
-                // sent Restart to ctrl_tx before calling kill(). But we
-                // just consumed it via try_recv(). We need to process it.
-                // Simplest: loop back and the scheduler will re-send.
-            }
             continue;
         }
 
@@ -370,8 +335,9 @@ async fn run_sync_with_retry(
         if attempt > 0 {
             // Check for abort between retries. If killed, exit immediately
             // (matches Go's stopASAP flag).
-            if killed || kill_rx.has_changed().unwrap_or(false) {
+            if killed || *kill_rx.borrow() {
                 debug!(mirror = %name, "aborting retry loop — killed");
+                killed = true;
                 break 'retry;
             }
             // Check for Stop/Halt/Disable between retries.
@@ -467,9 +433,12 @@ async fn run_sync_with_retry(
     }
 
     if killed {
-        // Don't send terminal status for killed syncs — the caller (job task)
-        // handles the Restart/Stop/Disable flow. Sending Failed here would
-        // incorrectly overwrite the status when the sync is being restarted.
+        // Consume any pending kill notification so subsequent changed()
+        // calls don't fire on a stale version (e.g. when the kill was
+        // detected via borrow() between retries rather than via changed()
+        // in a select block). borrow_and_update() marks the current value
+        // as "seen" without waiting.
+        let _ = kill_rx.borrow_and_update();
         return true;
     }
 
