@@ -235,6 +235,9 @@ impl Worker {
     /// Mirrors Go's `fetchJobStatus()` — on startup the worker queries the
     /// manager for the last known state of each mirror. Mirrors that were
     /// previously `Disabled` or `Paused` are not scheduled for immediate sync.
+    /// Mirrors that were `Syncing` or `PreSyncing` (interrupted by a crash or
+    /// kill) are corrected to `Failed` so the manager no longer shows stale
+    /// "syncing" status for a mirror that is not actually syncing.
     async fn restore_job_state(&mut self, worker_id: &str) {
         match self.manager.fetch_job_status(worker_id).await {
             Ok(statuses) => {
@@ -243,18 +246,51 @@ impl Worker {
                     if let Some(entry) = self.mirror_statuses.get_mut(&status.name) {
                         *entry = status.clone();
                     }
-                    // If a mirror was Disabled or Paused, don't enqueue it.
-                    if matches!(status.status, SyncStatus::Disabled | SyncStatus::Paused) {
-                        if let Some(job) = self.jobs.get(&status.name) {
-                            if status.status == SyncStatus::Disabled {
+
+                    match status.status {
+                        // Paused/Disabled mirrors stay paused — remove from schedule.
+                        SyncStatus::Disabled => {
+                            if let Some(job) = self.jobs.get(&status.name) {
                                 job.try_send(CtrlAction::Disable);
-                            } else {
-                                job.try_send(CtrlAction::Stop); // Stop → Paused
                             }
+                            self.schedule.remove(&status.name);
+                            tracing::info!(mirror = %status.name, "restored Disabled state");
                         }
-                        // Remove from schedule queue so it doesn't run.
-                        self.schedule.remove(&status.name);
-                        tracing::info!(mirror = %status.name, status = %status.status, "restored state from manager");
+                        SyncStatus::Paused => {
+                            if let Some(job) = self.jobs.get(&status.name) {
+                                job.try_send(CtrlAction::Stop);
+                            }
+                            self.schedule.remove(&status.name);
+                            tracing::info!(mirror = %status.name, "restored Paused state");
+                        }
+                        // Syncing/PreSyncing means the previous run was interrupted
+                        // (worker was killed mid-sync). Correct the stale status so
+                        // the manager and UI don't show a phantom "syncing" state.
+                        SyncStatus::Syncing | SyncStatus::PreSyncing => {
+                            tracing::warn!(
+                                mirror = %status.name,
+                                status = %status.status,
+                                "stale syncing status from previous run — correcting to Failed"
+                            );
+                            if let Some(entry) = self.mirror_statuses.get_mut(&status.name) {
+                                entry.status = SyncStatus::Failed;
+                                entry.error_msg = "previous sync was interrupted".into();
+                                entry.last_ended = Utc::now();
+                            }
+                            // Report the corrected status to manager immediately.
+                            if let Some(entry) = self.mirror_statuses.get(&status.name) {
+                                if let Err(e) = self
+                                    .manager
+                                    .report_status(worker_id, entry)
+                                    .await
+                                {
+                                    warn!(mirror = %status.name, error = %e, "failed to report corrected status");
+                                }
+                            }
+                            // Keep in schedule queue — the interrupted mirror
+                            // should be re-synced soon.
+                        }
+                        _ => {}
                     }
                 }
                 tracing::info!(mirrors = statuses.len(), "restored job states from manager");
