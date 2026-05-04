@@ -105,6 +105,21 @@ impl RunningProcess {
     }
 }
 
+impl Drop for RunningProcess {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.child.id() {
+            use nix::sys::signal::{kill, Signal};
+            use nix::unistd::Pid;
+            let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGKILL);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self.child.start_kill();
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // spawn()
 // ---------------------------------------------------------------------------
