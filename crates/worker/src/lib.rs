@@ -7,7 +7,6 @@
 #![warn(rust_2018_idioms)]
 
 pub mod config;
-pub mod context;
 pub mod diff_config;
 pub mod hooks;
 pub mod http_server;
@@ -170,22 +169,24 @@ pub fn build_one_provider(
     };
     let log_dir = PathBuf::from(expand_log_dir_template(&log_dir_raw, &mc.name));
     let working_dir = mc.effective_mirror_dir(&cfg.global);
-    let log_file = log_dir.join("latest.log");
 
     let mut hooks: Vec<Box<dyn JobHook>> = Vec::new();
 
     // loglimit hook (always enabled if log_dir is set).
     // Wire up shared log path: LogLimitHook sets the path in PreExec,
     // the provider reads it in run() so stdout/stderr go to the rotated log.
+    // The shared Arc<Mutex<PathBuf>> is also passed to ExecPostHook and
+    // DockerConfig so they read the current rotated path dynamically.
     let mut log_path_shared: Option<Arc<Mutex<PathBuf>>> = None;
     if !log_dir.to_string_lossy().is_empty() {
         let ll_hook = LogLimitHook::new(mc.name.clone(), log_dir.clone());
         log_path_shared = Some(ll_hook.current_log_shared());
         hooks.push(Box::new(ll_hook));
     }
-    if let Some(shared) = log_path_shared {
-        provider.set_log_path_shared(shared);
-    }
+    // Fallback if no LogLimitHook — create a standalone default path.
+    let log_path_arc =
+        log_path_shared.unwrap_or_else(|| Arc::new(Mutex::new(log_dir.join("latest.log"))));
+    provider.set_log_path_shared(Arc::clone(&log_path_arc));
 
     // Docker hook — also wires up argv wrapping on the provider.
     // Docker and cgroup are mutually exclusive — matches Go:
@@ -201,8 +202,9 @@ pub fn build_one_provider(
         options.extend(mc.docker_options.iter().cloned());
         let mem_limit = mc.memory_limit.map(|m| m.0).unwrap_or(0);
 
-        // Compute full docker env: provider-specific vars + mirror overrides.
-        let docker_env = compute_docker_env(mc, &cfg.global, &working_dir, &log_dir, &log_file);
+        // Compute docker env: TUNASYNC_LOG_FILE is set dynamically from
+        // the shared Arc when wrap_argv() is called.
+        let docker_env = compute_docker_env(mc, &cfg.global, &working_dir, &log_dir);
 
         let docker_config = DockerConfig {
             mirror_name: mc.name.clone(),
@@ -212,7 +214,7 @@ pub fn build_one_provider(
             memory_limit_bytes: mem_limit,
             working_dir: working_dir.clone(),
             log_dir: log_dir.clone(),
-            log_file: log_file.clone(),
+            log_file: Arc::clone(&log_path_arc),
             env: docker_env,
         };
 
@@ -273,7 +275,7 @@ pub fn build_one_provider(
             working_dir.clone(),
             mc.upstream.clone(),
             log_dir.clone(),
-            log_file.clone(),
+            Arc::clone(&log_path_arc),
         ) {
             Ok(h) => hooks.push(Box::new(h)),
             Err(e) => {
@@ -299,7 +301,7 @@ pub fn build_one_provider(
             working_dir.clone(),
             mc.upstream.clone(),
             log_dir.clone(),
-            log_file.clone(),
+            Arc::clone(&log_path_arc),
         ) {
             Ok(h) => hooks.push(Box::new(h)),
             Err(e) => {
@@ -315,12 +317,14 @@ pub fn build_one_provider(
 ///
 /// Includes provider-specific env vars (TUNASYNC_* for all providers,
 /// USER/RSYNC_PASSWORD for rsync providers) plus mirror-level env overrides.
+/// TUNASYNC_LOG_FILE is NOT included here — it is set dynamically from
+/// the shared `Arc<Mutex<PathBuf>>` each time `wrap_argv()` is called,
+/// so it always reflects the rotated timestamped log path.
 fn compute_docker_env(
     mc: &config::MirrorConfig,
     _global: &config::GlobalConfig,
     working_dir: &std::path::Path,
     log_dir: &std::path::Path,
-    log_file: &std::path::Path,
 ) -> HashMap<String, String> {
     let mut env = HashMap::new();
 
@@ -332,10 +336,8 @@ fn compute_docker_env(
     );
     env.insert("TUNASYNC_UPSTREAM_URL".into(), mc.upstream.clone());
     env.insert("TUNASYNC_LOG_DIR".into(), log_dir.to_string_lossy().into());
-    env.insert(
-        "TUNASYNC_LOG_FILE".into(),
-        log_file.to_string_lossy().into(),
-    );
+    // TUNASYNC_LOG_FILE is injected dynamically in wrap_argv() from the
+    // shared Arc<Mutex<PathBuf>> — not baked into this static env map.
 
     // Rsync-specific env vars for Rsync and TwoStageRsync providers.
     match mc.provider {

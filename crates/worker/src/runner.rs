@@ -132,7 +132,6 @@ pub async fn spawn(
         .envs(&env)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
         .process_group(0);
 
     let mut child = cmd

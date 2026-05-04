@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -32,10 +33,12 @@ pub struct DockerConfig {
     pub memory_limit_bytes: i64,
     pub working_dir: PathBuf,
     pub log_dir: PathBuf,
-    pub log_file: PathBuf,
+    /// Shared log path — read dynamically so `-e TUNASYNC_LOG_FILE`
+    /// reflects the rotated timestamped file from LogLimitHook.
+    pub log_file: Arc<Mutex<PathBuf>>,
     /// Environment variables to pass to the container via `-e` flags.
-    /// Includes provider-specific env (TUNASYNC_* for cmd, USER/RSYNC_PASSWORD
-    /// for rsync) plus mirror-level env overrides.
+    /// The TUNASYNC_LOG_FILE entry is rebuilt dynamically from log_file
+    /// each time wrap_argv() is called.
     pub env: HashMap<String, String>,
 }
 
@@ -63,18 +66,29 @@ impl DockerConfig {
         ]);
 
         // Environment variables via `-e` flags.
+        // Read log_file dynamically to get the rotated timestamped path.
+        let log_file_path = self.log_file.lock().unwrap().clone();
         for (k, v) in &self.env {
-            argv.extend(["-e".into(), format!("{k}={v}")]);
+            if k == "TUNASYNC_LOG_FILE" {
+                argv.extend([
+                    "-e".into(),
+                    format!("{k}={}", log_file_path.to_string_lossy()),
+                ]);
+            } else {
+                argv.extend(["-e".into(), format!("{k}={v}")]);
+            }
         }
 
         // Configured volume mounts.
         for vol in &self.volumes {
             argv.extend(["-v".into(), vol.clone()]);
         }
-        // Runtime volume mounts: log dir, log file, working dir.
+        // Runtime volume mounts: log dir and working dir.
+        // Note: log_dir already contains all log files including the rotated
+        // ones, so no separate log_file mount is needed (avoids Docker
+        // creating an unwanted directory if the file doesn't exist yet).
         let runtime_vols = [
             format!("{}:{}", self.log_dir.display(), self.log_dir.display()),
-            format!("{}:{}", self.log_file.display(), self.log_file.display()),
             format!(
                 "{}:{}",
                 self.working_dir.display(),

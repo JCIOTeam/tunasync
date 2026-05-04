@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -27,7 +28,9 @@ pub struct ExecPostHook {
     working_dir: PathBuf,
     upstream: String,
     log_dir: PathBuf,
-    log_file: PathBuf,
+    /// Shared log path — read dynamically so TUNASYNC_LOG_FILE reflects
+    /// the rotated timestamped file set by LogLimitHook::preExec.
+    log_file: Arc<Mutex<PathBuf>>,
 }
 
 impl ExecPostHook {
@@ -38,7 +41,7 @@ impl ExecPostHook {
         working_dir: PathBuf,
         upstream: String,
         log_dir: PathBuf,
-        log_file: PathBuf,
+        log_file: Arc<Mutex<PathBuf>>,
     ) -> Result<Self> {
         let command = shell_words::split(command_str)
             .with_context(|| format!("parse exec_post command for mirror {mirror_name:?}"))?;
@@ -61,6 +64,9 @@ impl ExecPostHook {
             ExecOn::Success => "success",
             ExecOn::Failure => "failure",
         };
+        // Read log path dynamically — LogLimitHook::preExec sets the
+        // timestamped path before this hook runs.
+        let log_file = self.log_file.lock().unwrap().clone();
         let mut env = HashMap::new();
         env.insert("TUNASYNC_MIRROR_NAME".into(), self.mirror_name.clone());
         env.insert(
@@ -74,7 +80,7 @@ impl ExecPostHook {
         );
         env.insert(
             "TUNASYNC_LOG_FILE".into(),
-            self.log_file.to_string_lossy().into(),
+            log_file.to_string_lossy().into(),
         );
         env.insert("TUNASYNC_JOB_EXIT_STATUS".into(), exit_status.into());
 
