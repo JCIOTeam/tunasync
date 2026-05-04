@@ -34,6 +34,11 @@ pub struct RsyncProvider {
     docker_container_name: Option<String>,
     /// Docker wrapping config — set by `build_providers()` when Docker is active.
     docker_config: Option<DockerConfig>,
+    /// CgroupHook reference — set by `build_providers()` on Linux when cgroup is
+    /// active. The provider calls `add_pid_stopped` after spawn so the child
+    /// process is placed inside the cgroup before execution begins.
+    #[cfg(target_os = "linux")]
+    cgroup_hook: Option<std::sync::Arc<crate::hooks::CgroupHook>>,
 }
 
 impl RsyncProvider {
@@ -141,6 +146,8 @@ impl RsyncProvider {
             current_pid: Arc::new(Mutex::new(None)),
             docker_container_name: None,
             docker_config: None,
+            #[cfg(target_os = "linux")]
+            cgroup_hook: None,
         })
     }
 
@@ -197,6 +204,14 @@ impl MirrorProvider for RsyncProvider {
 
         if let Some(pid) = proc.pid() {
             *self.current_pid.lock().unwrap() = Some(pid);
+        }
+        // Place the child PID into the cgroup (Linux only). Must happen between
+        // spawn() and wait() so the process is in the cgroup before it executes.
+        #[cfg(target_os = "linux")]
+        if let Some(ref hook) = self.cgroup_hook {
+            if let Err(e) = hook.add_pid_stopped(&proc) {
+                tracing::warn!(mirror = %self.name, error = %e, "failed to add PID to cgroup");
+            }
         }
         let wait_result = proc.wait(&self.success_exit_codes).await;
         *self.current_pid.lock().unwrap() = None;
@@ -256,6 +271,11 @@ impl MirrorProvider for RsyncProvider {
 
     fn set_log_path_shared(&mut self, path: Arc<Mutex<PathBuf>>) {
         self.log_path_shared = path;
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_cgroup_hook(&mut self, hook: std::sync::Arc<crate::hooks::CgroupHook>) {
+        self.cgroup_hook = Some(hook);
     }
 }
 

@@ -244,12 +244,16 @@ pub fn build_one_provider(
         #[cfg(target_os = "linux")]
         if cfg.cgroup.enable {
             let mem_limit = mc.memory_limit.map(|m| m.0).unwrap_or(0);
-            hooks.push(Box::new(CgroupHook::new(
+            // Share the same CgroupHook between the provider (PID placement) and
+            // the hooks vec (PreExec cgroup creation, PostExec cleanup).
+            let hook = std::sync::Arc::new(CgroupHook::new(
                 mc.name.clone(),
                 &cfg.cgroup.base_path,
                 &cfg.cgroup.group,
                 mem_limit,
-            )));
+            ));
+            provider.set_cgroup_hook(std::sync::Arc::clone(&hook));
+            hooks.push(Box::new(hook));
         }
     }
 

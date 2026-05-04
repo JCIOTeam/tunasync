@@ -71,6 +71,9 @@ pub struct TwoStageRsyncProvider {
     docker_container_name: Option<String>,
     /// Docker wrapping config — set by `build_providers()` when Docker is active.
     docker_config: Option<DockerConfig>,
+    /// CgroupHook reference — set on Linux when cgroup is active.
+    #[cfg(target_os = "linux")]
+    cgroup_hook: Option<std::sync::Arc<crate::hooks::CgroupHook>>,
 }
 
 impl TwoStageRsyncProvider {
@@ -201,6 +204,8 @@ impl TwoStageRsyncProvider {
             current_pid: Arc::new(Mutex::new(None)),
             docker_container_name: None,
             docker_config: None,
+            #[cfg(target_os = "linux")]
+            cgroup_hook: None,
         })
     }
 
@@ -241,6 +246,14 @@ impl TwoStageRsyncProvider {
 
         if let Some(pid) = proc.pid() {
             *self.current_pid.lock().unwrap() = Some(pid);
+        }
+        // Place the child PID into the cgroup (Linux only). Both stages are
+        // placed individually since each stage is a separate spawn/wait cycle.
+        #[cfg(target_os = "linux")]
+        if let Some(ref hook) = self.cgroup_hook {
+            if let Err(e) = hook.add_pid_stopped(&proc) {
+                tracing::warn!(mirror = %self.name, stage, error = %e, "failed to add PID to cgroup");
+            }
         }
         let result = proc
             .wait(&self.success_exit_codes)
@@ -330,6 +343,11 @@ impl MirrorProvider for TwoStageRsyncProvider {
 
     fn set_log_path_shared(&mut self, path: Arc<Mutex<PathBuf>>) {
         self.log_path_shared = path;
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_cgroup_hook(&mut self, hook: std::sync::Arc<crate::hooks::CgroupHook>) {
+        self.cgroup_hook = Some(hook);
     }
 
     fn data_size(&self) -> String {

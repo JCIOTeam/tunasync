@@ -35,4 +35,10 @@ pub trait MirrorProvider: Send + Sync {
     /// `Arc<Mutex<PathBuf>>` is set by `LogLimitHook::preExec` and read
     /// by the provider in `run()` so stdout/stderr go to the rotated log.
     fn set_log_path_shared(&mut self, path: Arc<Mutex<PathBuf>>);
+    /// Wire up a `CgroupHook` so the provider can place the spawned child PID
+    /// into the cgroup between `spawn()` and `wait()`.
+    /// Only called on Linux when `[cgroup] enable = true` and Docker is off.
+    /// Default no-op keeps non-Linux builds and cgroup-off configs compiling.
+    #[cfg(target_os = "linux")]
+    fn set_cgroup_hook(&mut self, _hook: std::sync::Arc<crate::hooks::CgroupHook>) {}
 }

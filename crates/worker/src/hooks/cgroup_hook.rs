@@ -210,3 +210,20 @@ impl JobHook for CgroupHook {
         }
     }
 }
+
+/// Allow `Arc<CgroupHook>` to be used as a `Box<dyn JobHook>`.
+///
+/// `lib.rs` needs to share the same `CgroupHook` instance between the
+/// provider (which calls `add_pid_stopped` after spawn) and the hooks
+/// lifecycle system (which runs `PreExec`/`PostExec`). An `Arc` lets both
+/// sides reference the same object without cloning the inner `Mutex` state.
+#[async_trait]
+impl JobHook for std::sync::Arc<CgroupHook> {
+    fn name(&self) -> &str {
+        self.as_ref().name()
+    }
+
+    async fn on_phase(&self, phase: HookPhase) -> Result<()> {
+        self.as_ref().on_phase(phase).await
+    }
+}

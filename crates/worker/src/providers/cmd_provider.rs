@@ -40,6 +40,9 @@ pub struct CmdProvider {
     docker_container_name: Option<String>,
     /// Docker wrapping config — set by `build_providers()` when Docker is active.
     docker_config: Option<DockerConfig>,
+    /// CgroupHook reference — set on Linux when cgroup is active.
+    #[cfg(target_os = "linux")]
+    cgroup_hook: Option<std::sync::Arc<crate::hooks::CgroupHook>>,
 }
 
 impl CmdProvider {
@@ -100,6 +103,8 @@ impl CmdProvider {
             current_pid: Arc::new(Mutex::new(None)),
             docker_container_name: None,
             docker_config: None,
+            #[cfg(target_os = "linux")]
+            cgroup_hook: None,
         })
     }
 
@@ -172,6 +177,13 @@ impl MirrorProvider for CmdProvider {
         // Store PID so terminate() can send SIGTERM.
         if let Some(pid) = proc.pid() {
             *self.current_pid.lock().unwrap() = Some(pid);
+        }
+        // Place the child PID into the cgroup (Linux only).
+        #[cfg(target_os = "linux")]
+        if let Some(ref hook) = self.cgroup_hook {
+            if let Err(e) = hook.add_pid_stopped(&proc) {
+                tracing::warn!(mirror = %self.name, error = %e, "failed to add PID to cgroup");
+            }
         }
         let wait_result = proc.wait(&self.success_exit_codes).await;
         *self.current_pid.lock().unwrap() = None;
@@ -254,6 +266,11 @@ impl MirrorProvider for CmdProvider {
 
     fn set_log_path_shared(&mut self, path: Arc<Mutex<PathBuf>>) {
         self.log_path_shared = path;
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_cgroup_hook(&mut self, hook: std::sync::Arc<crate::hooks::CgroupHook>) {
+        self.cgroup_hook = Some(hook);
     }
 }
 
