@@ -5,6 +5,7 @@
 //! ```text
 //! GET    /ping
 //! GET    /jobs
+//! HEAD   /jobs
 //! DELETE /jobs/disabled
 //! GET    /workers
 //! POST   /workers
@@ -93,7 +94,7 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .route("/ping", get(ping))
-        .route("/jobs", get(list_all_jobs))
+        .route("/jobs", get(list_all_jobs).head(list_all_jobs_head))
         .route("/jobs/disabled", delete(flush_disabled_jobs))
         .route("/jobs/:name", get(list_mirror_by_name))
         .route("/workers", get(list_workers).post(register_worker))
@@ -127,6 +128,14 @@ async fn list_all_jobs(State(state): State<Arc<AppState>>) -> Response {
                 .collect();
             Json(web).into_response()
         }
+    }
+}
+
+/// `HEAD /jobs` — check availability and count without returning body.
+async fn list_all_jobs_head(State(state): State<Arc<AppState>>) -> Response {
+    match state.db.list_all_mirror_status() {
+        Err(e) => db_err(e),
+        Ok(_) => StatusCode::OK.into_response(),
     }
 }
 

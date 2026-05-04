@@ -384,6 +384,7 @@ crates/
 |--------|------|-------------|
 | GET | `/ping` | Liveness check → `{ "message": "pong" }` |
 | GET | `/jobs` | List all mirrors (summary, no `error_msg`) |
+| HEAD | `/jobs` | Check mirror availability (same as GET, no body) |
 | GET | `/jobs/:name` | Mirror detail across all workers (includes `error_msg`, timestamps) |
 | DELETE | `/jobs/disabled` | Flush all disabled mirror rows |
 | GET | `/workers` | List registered workers (tokens redacted) |

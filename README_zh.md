@@ -384,6 +384,7 @@ crates/
 |------|------|------|
 | GET | `/ping` | 存活检查 → `{ "message": "pong" }` |
 | GET | `/jobs` | 列出所有镜像（摘要，不含 `error_msg`） |
+| HEAD | `/jobs` | 检查镜像可用性（同 GET，无响应体） |
 | GET | `/jobs/:name` | 镜像详情，跨所有 worker（含 `error_msg`、时间戳） |
 | DELETE | `/jobs/disabled` | 清除所有已禁用的镜像行 |
 | GET | `/workers` | 列出已注册 worker（token 已脱敏） |
