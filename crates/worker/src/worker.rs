@@ -408,8 +408,12 @@ impl Worker {
                 error_msg: String::new(),
             });
 
-        // Update local status.
-        status_entry.status = msg.status;
+        // Update local status — but skip overwriting status when the message
+        // carries SyncStatus::None (used for scheduling-only updates after a
+        // sync completes, where the real terminal status was already reported).
+        if msg.status != SyncStatus::None {
+            status_entry.status = msg.status;
+        }
         status_entry.error_msg = msg.msg.clone();
         if !msg.size.is_empty() {
             status_entry.size = msg.size.clone();
