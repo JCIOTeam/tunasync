@@ -1942,6 +1942,7 @@ name = "tunasync-common"
 version = "0.1.4"
 dependencies = [
  "anyhow",
+ "chrono",
  "once_cell",
  "regex",
  "reqwest",

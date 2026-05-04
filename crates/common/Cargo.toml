@@ -7,6 +7,9 @@ license.workspace      = true
 repository.workspace   = true
 description = "Shared utilities for tunasync-rs (logging, HTTP client, config loading)"
 
+[build-dependencies]
+chrono = { workspace = true }
+
 [dependencies]
 anyhow      = { workspace = true }
 reqwest     = { workspace = true }
