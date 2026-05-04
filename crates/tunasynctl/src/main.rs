@@ -17,7 +17,7 @@ use tunasync_protocol::{ClientCmd, CmdVerb, MirrorStatus, WebMirrorStatus, Worke
 #[derive(Parser, Debug)]
 #[command(
     name = "tunasynctl",
-    version,
+    version = tunasync_common::VERSION,
     about = "Control a tunasync manager",
     long_about = None,
 )]

@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser, Debug)]
 #[command(
     name = "tunasync",
-    version,
+    version = tunasync_common::VERSION,
     about = "Mirror job management tool (Rust port of tuna/tunasync)",
     long_about = None,
 )]

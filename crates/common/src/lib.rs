@@ -11,3 +11,12 @@ pub mod config;
 pub mod http;
 pub mod logger;
 pub mod util;
+
+/// Full version string: `PKG_VERSION (git SHORT_SHA)`.
+/// Set at compile time by the build script.
+pub const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (git ",
+    env!("TUNASYNC_GIT_SHA"),
+    ")"
+);
