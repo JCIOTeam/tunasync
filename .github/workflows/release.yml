@@ -20,7 +20,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
-      - run: cd target/release && tar czf tunasync-linux-amd64.tar.gz tunasync tunasynctl tunasync-migrate
+      - run: cd target/release && tar czf tunasync-linux-amd64.tar.gz tunasync tunasynctl
       - uses: actions/upload-artifact@v4
         with:
           name: tunasync-linux-amd64
@@ -37,7 +37,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --target x86_64-unknown-linux-musl
-      - run: cd target/x86_64-unknown-linux-musl/release && tar czf tunasync-linux-amd64-musl.tar.gz tunasync tunasynctl tunasync-migrate
+      - run: cd target/x86_64-unknown-linux-musl/release && tar czf tunasync-linux-amd64-musl.tar.gz tunasync tunasynctl
       - uses: actions/upload-artifact@v4
         with:
           name: tunasync-linux-amd64-musl
@@ -56,7 +56,7 @@ jobs:
       - run: cargo build --release --target aarch64-unknown-linux-gnu
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-      - run: cd target/aarch64-unknown-linux-gnu/release && tar czf tunasync-linux-aarch64.tar.gz tunasync tunasynctl tunasync-migrate
+      - run: cd target/aarch64-unknown-linux-gnu/release && tar czf tunasync-linux-aarch64.tar.gz tunasync tunasynctl
       - uses: actions/upload-artifact@v4
         with:
           name: tunasync-linux-aarch64
@@ -75,7 +75,7 @@ jobs:
       - run: cargo build --release --target armv7-unknown-linux-gnueabihf
         env:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
-      - run: cd target/armv7-unknown-linux-gnueabihf/release && tar czf tunasync-linux-armv7.tar.gz tunasync tunasynctl tunasync-migrate
+      - run: cd target/armv7-unknown-linux-gnueabihf/release && tar czf tunasync-linux-armv7.tar.gz tunasync tunasynctl
       - uses: actions/upload-artifact@v4
         with:
           name: tunasync-linux-armv7
@@ -94,7 +94,7 @@ jobs:
       - run: cargo build --release --target riscv64gc-unknown-linux-gnu
         env:
           CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
-      - run: cd target/riscv64gc-unknown-linux-gnu/release && tar czf tunasync-linux-riscv64.tar.gz tunasync tunasynctl tunasync-migrate
+      - run: cd target/riscv64gc-unknown-linux-gnu/release && tar czf tunasync-linux-riscv64.tar.gz tunasync tunasynctl
       - uses: actions/upload-artifact@v4
         with:
           name: tunasync-linux-riscv64
@@ -176,4 +176,4 @@ jobs:
             | `tunasync-linux-armv7.tar.gz` | armv7 | ARM32 (armhf) |
             | `tunasync-linux-riscv64.tar.gz` | riscv64 | RISC-V |
 
-            Each tarball contains `tunasync` (manager/worker), `tunasynctl` (CLI), and `tunasync-migrate` (migration tool).
+            Each tarball contains `tunasync` (manager/worker) and `tunasynctl` (CLI).
