@@ -285,11 +285,7 @@ impl Worker {
                             }
                             // Report the corrected status to manager immediately.
                             if let Some(entry) = self.mirror_statuses.get(&status.name) {
-                                if let Err(e) = self
-                                    .manager
-                                    .report_status(worker_id, entry)
-                                    .await
-                                {
+                                if let Err(e) = self.manager.report_status(worker_id, entry).await {
                                     warn!(mirror = %status.name, error = %e, "failed to report corrected status");
                                 }
                             }
@@ -322,9 +318,7 @@ impl Worker {
                         if next_utc <= now_utc {
                             Instant::now()
                         } else {
-                            let delay = (next_utc - now_utc)
-                                .to_std()
-                                .unwrap_or(Duration::ZERO);
+                            let delay = (next_utc - now_utc).to_std().unwrap_or(Duration::ZERO);
                             Instant::now() + delay
                         }
                     };
