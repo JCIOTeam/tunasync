@@ -133,13 +133,9 @@ impl Worker {
             jobs.insert(name, job);
         }
 
-        let mut schedule = ScheduleQueue::new();
-        // Enqueue all jobs for immediate first run, staggered by 1s each to
-        // avoid thundering herd (matches Go's behaviour where all jobs start
-        // roughly simultaneously but the goroutine scheduler spreads them out).
-        for (i, name) in jobs.keys().enumerate() {
-            schedule.push(name.clone(), Instant::now() + Duration::from_secs(i as u64));
-        }
+        // Schedule queue is populated in restore_job_state() after startup,
+        // using last_update + interval from the manager (matching Go's runSchedule).
+        let schedule = ScheduleQueue::new();
 
         let mirror_names = Arc::new(RwLock::new(jobs.keys().cloned().collect()));
 
@@ -232,16 +228,24 @@ impl Worker {
 
     /// Fetch persisted job status from manager and restore Paused/Disabled mirrors.
     ///
-    /// Mirrors Go's `fetchJobStatus()` — on startup the worker queries the
-    /// manager for the last known state of each mirror. Mirrors that were
-    /// previously `Disabled` or `Paused` are not scheduled for immediate sync.
-    /// Mirrors that were `Syncing` or `PreSyncing` (interrupted by a crash or
-    /// kill) are corrected to `Failed` so the manager no longer shows stale
-    /// "syncing" status for a mirror that is not actually syncing.
+    /// Mirrors Go's `fetchJobStatus()` + initial schedule setup in `runSchedule()`:
+    ///
+    /// - Disabled → send Disable, remove from schedule
+    /// - Paused   → send Stop, remove from schedule
+    /// - All other known mirrors → schedule at `last_update + interval`
+    ///   (if that time has passed, fires immediately; otherwise waits)
+    /// - Mirrors not yet in manager (brand new) → schedule now (immediate)
+    ///
+    /// This is the ONLY place that populates the schedule queue on startup.
     async fn restore_job_state(&mut self, worker_id: &str) {
+        // Collect all job names; we'll subtract the ones seen in manager response.
+        let mut unseen: HashSet<String> = self.jobs.keys().cloned().collect();
+
         match self.manager.fetch_job_status(worker_id).await {
             Ok(statuses) => {
                 for status in &statuses {
+                    unseen.remove(&status.name);
+
                     // Update local mirror_status with persisted data.
                     if let Some(entry) = self.mirror_statuses.get_mut(&status.name) {
                         *entry = status.clone();
@@ -255,6 +259,7 @@ impl Worker {
                             }
                             self.schedule.remove(&status.name);
                             tracing::info!(mirror = %status.name, "restored Disabled state");
+                            continue; // do not enqueue
                         }
                         SyncStatus::Paused => {
                             if let Some(job) = self.jobs.get(&status.name) {
@@ -262,10 +267,11 @@ impl Worker {
                             }
                             self.schedule.remove(&status.name);
                             tracing::info!(mirror = %status.name, "restored Paused state");
+                            continue; // do not enqueue
                         }
-                        // Syncing/PreSyncing means the previous run was interrupted
-                        // (worker was killed mid-sync). Correct the stale status so
-                        // the manager and UI don't show a phantom "syncing" state.
+                        // Syncing/PreSyncing means the previous run was interrupted.
+                        // Correct the stale status so the manager and UI don't show
+                        // a phantom "syncing" state, then fall through to scheduling.
                         SyncStatus::Syncing | SyncStatus::PreSyncing => {
                             tracing::warn!(
                                 mirror = %status.name,
@@ -287,17 +293,63 @@ impl Worker {
                                     warn!(mirror = %status.name, error = %e, "failed to report corrected status");
                                 }
                             }
-                            // Keep in schedule queue — the interrupted mirror
-                            // should be re-synced soon.
+                            // Fall through — schedule a re-sync below.
                         }
                         _ => {}
                     }
+
+                    // Compute next_run = last_update + interval (matching Go's
+                    // `stime := m.LastUpdate.Add(job.provider.Interval())`).
+                    // If last_update is the zero time (mirror exists in manager but
+                    // has never completed a sync), or if next_run is in the past,
+                    // the job fires immediately.
+                    let interval = self
+                        .cfg
+                        .mirrors
+                        .iter()
+                        .find(|m| m.name == status.name)
+                        .map(|m| m.effective_interval(&self.cfg.global))
+                        .unwrap_or_else(|| Duration::from_secs(3600));
+
+                    let next_run = if tunasync_protocol::is_zero_time(&status.last_update) {
+                        // Never synced before — start immediately.
+                        Instant::now()
+                    } else {
+                        let next_utc = status.last_update
+                            + chrono::Duration::from_std(interval)
+                                .unwrap_or(chrono::Duration::seconds(3600));
+                        let now_utc = Utc::now();
+                        if next_utc <= now_utc {
+                            Instant::now()
+                        } else {
+                            let delay = (next_utc - now_utc)
+                                .to_std()
+                                .unwrap_or(Duration::ZERO);
+                            Instant::now() + delay
+                        }
+                    };
+
+                    tracing::info!(
+                        mirror = %status.name,
+                        next_run_secs = next_run.saturating_duration_since(Instant::now()).as_secs(),
+                        "scheduled (from last_update)"
+                    );
+                    self.schedule.push(status.name.clone(), next_run);
                 }
                 tracing::info!(mirrors = statuses.len(), "restored job states from manager");
             }
             Err(e) => {
-                warn!(error = %e, "failed to fetch job status from manager — all jobs will start fresh");
+                warn!(error = %e, "failed to fetch job status from manager — all jobs start immediately");
+                // Fall through: unseen still contains all job names, so they
+                // all get scheduled now below.
             }
+        }
+
+        // Mirrors not found in manager (brand new, never registered) — schedule
+        // for immediate run, matching Go's `w.schedule.AddJob(time.Now(), job)`.
+        for name in &unseen {
+            tracing::info!(mirror = %name, "new mirror (not in manager) — scheduling immediately");
+            self.schedule.push(name.clone(), Instant::now());
         }
     }
 
