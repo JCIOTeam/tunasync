@@ -19,9 +19,14 @@ tunasync-rs is **wire-compatible** with the Go implementation: a Rust manager ca
 ### Migration steps
 
 1. **Stop the Go services** — `systemctl stop tunasync-manager tunasync-worker`.
-2. **Install the Rust binaries** — download from [Releases](https://github.com/JCIOTeam/tunasync/releases) or build from source, then copy `tunasync` and `tunasynctl` to `/usr/bin/`.
+2. **Install the Rust binaries** — download from [Releases](https://github.com/JCIOTeam/tunasync/releases) or build from source, then copy `tunasync`, `tunasynctl`, and `tunasync-migrate` to `/usr/bin/`.
 3. **Keep the config files** — the Rust version reads the same TOML format. No changes needed.
-4. **Choose a DB backend** — if the Go version uses BoltDB (the default), switch to `sqlite` or `redb`. The Rust version does **not** read BoltDB files, so you need to let it create a fresh DB. Existing mirror states will be re-populated when workers register. If the Go version uses Redis, no migration is needed — both versions can share the same Redis instance.
+4. **Migrate data** — if the Go version uses BoltDB (the default), use the migration tool to preserve worker and mirror state:
+   ```bash
+   # While Go manager is still running:
+   tunasync-migrate http://localhost:14242 /path/to/tunasync.db
+   ```
+   Then set `db_type = "sqlite"` and `db_file = "/path/to/tunasync.db"` in the Rust manager config. If the Go version uses Redis, no migration is needed — both versions can share the same Redis instance.
 5. **Restart** — `systemctl start tunasync-manager tunasync-worker`.
 6. **Verify** — `tunasynctl list --all -p <port>` should show all mirrors.
 
@@ -323,10 +328,11 @@ cargo fmt --all
 crates/
 +-- protocol/    # Wire types -- JSON-compatible with Go's internal/msg.go
 +-- common/      # Logging, HTTP client helpers, config loader
-+-- manager/     # Manager HTTP server (axum), redb/sqlite storage
++-- manager/     # Manager HTTP server (axum), redb/sqlite/redis storage
 +-- worker/      # Worker runtime: scheduler, job state machine, providers, hooks
 +-- tunasync/    # Combined manager+worker dispatcher binary
 +-- tunasynctl/  # CLI control tool
++-- migrate/     # Go→Rust data migration tool
 ```
 
 ### Providers

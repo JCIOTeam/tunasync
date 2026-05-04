@@ -19,9 +19,14 @@ tunasync-rs 与 Go 实现**线路兼容**：Rust manager 可以驱动 Go worker�
 ### 迁移步骤
 
 1. **停止 Go 服务** — `systemctl stop tunasync-manager tunasync-worker`
-2. **安装 Rust 二进制** — 从 [Releases](https://github.com/JCIOTeam/tunasync/releases) 下载或从源码编译，将 `tunasync` 和 `tunasynctl` 复制到 `/usr/bin/`
+2. **安装 Rust 二进制** — 从 [Releases](https://github.com/JCIOTeam/tunasync/releases) 下载或从源码编译，将 `tunasync`、`tunasynctl` 和 `tunasync-migrate` 复制到 `/usr/bin/`
 3. **保留配置文件** — Rust 版本读取相同 TOML 格式，无需修改。
-4. **选择数据库后端** — 如果 Go 版本使用 BoltDB（默认），切换到 `sqlite` 或 `redb`。Rust 版本**不能**读取 BoltDB 文件，需要让其创建新数据库。现有镜像状态会在 worker 注册时自动恢复。如果 Go 版本使用 Redis，无需迁移 — 两个版本可以共享同一个 Redis 实例。
+4. **迁移数据** — 如果 Go 版本使用 BoltDB（默认），使用迁移工具保留 worker 和镜像状态：
+   ```bash
+   # Go manager 还在运行时执行：
+   tunasync-migrate http://localhost:14242 /path/to/tunasync.db
+   ```
+   然后在 Rust manager 配置中设置 `db_type = "sqlite"` 和 `db_file = "/path/to/tunasync.db"`。如果 Go 版本使用 Redis，无需迁移 — 两个版本可以共享同一个 Redis 实例。
 5. **重启** — `systemctl start tunasync-manager tunasync-worker`
 6. **验证** — `tunasynctl list --all -p <端口>` 应显示所有镜像
 
@@ -323,10 +328,11 @@ cargo fmt --all
 crates/
 +-- protocol/    # 线路类型 — JSON 格式与 Go 的 internal/msg.go 兼容
 +-- common/      # 日志、HTTP 客户端、配置加载
-+-- manager/     # Manager HTTP 服务 (axum)、redb/sqlite 存储
++-- manager/     # Manager HTTP 服务 (axum)、redb/sqlite/redis 存储
 +-- worker/      # Worker 运行时：调度器、任务状态机、provider、hook
 +-- tunasync/    # 合并 manager+worker 的二进制入口
 +-- tunasynctl/  # CLI 控制工具
++-- migrate/     # Go→Rust 数据迁移工具
 ```
 
 ### Provider（同步提供者）

@@ -1,0 +1,17 @@
+[package]
+name = "tunasync-migrate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Migrate data from a Go tunasync manager to a Rust SQLite database"
+
+[dependencies]
+reqwest = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tunasync-protocol = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
