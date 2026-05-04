@@ -376,7 +376,35 @@ crates/
 | Manager: heartbeat | Added `POST /workers/:id/heartbeat` | More robust than implicit refresh |
 | Manager: deleteWorker | 400 on invalid ID (Go: 500) | More useful error |
 | Manager: DB | Redis backend added | redb, sqlite, redis all supported |
-| Worker: GET /jobs | Additional introspection endpoint | Harmless addition |
+| Manager: GET /jobs/:name | Mirror detail with `error_msg` across all workers | New endpoint for frontend |
+
+## API Reference
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/ping` | Liveness check → `{ "message": "pong" }` |
+| GET | `/jobs` | List all mirrors (summary, no `error_msg`) |
+| GET | `/jobs/:name` | Mirror detail across all workers (includes `error_msg`, timestamps) |
+| DELETE | `/jobs/disabled` | Flush all disabled mirror rows |
+| GET | `/workers` | List registered workers (tokens redacted) |
+| POST | `/workers` | Register a new worker |
+| DELETE | `/workers/:id` | Delete a worker |
+| POST | `/workers/:id/heartbeat` | Worker heartbeat |
+| GET | `/workers/:id/jobs` | List mirrors of one worker |
+| POST | `/workers/:id/jobs/:job` | Update mirror status (worker → manager) |
+| POST | `/workers/:id/jobs/:job/size` | Update mirror size |
+| POST | `/workers/:id/schedules` | Update schedules |
+| POST | `/cmd` | Send control command (start/stop/disable/reload) |
+
+`GET /jobs/:name` returns `Vec<MirrorStatus>` — the full status object including `error_msg`. For example:
+
+```bash
+curl http://localhost:14242/jobs/ubuntu
+# → [ { "name": "ubuntu", "worker": "w1", "status": "failed", "error_msg": "rsync: timeout", ... } ]
+
+curl http://localhost:14242/jobs/nonexistent
+# → []
+```
 
 ## License
 

@@ -376,7 +376,35 @@ crates/
 | Manager: heartbeat | 新增 `POST /workers/:id/heartbeat` | 显式心跳比隐式刷新更可靠 |
 | Manager: deleteWorker | 无效 ID 返回 400（Go 返回 500） | 更有用的错误信息 |
 | Manager: DB | Redis 后端已实现 | 支持 redb、sqlite、redis |
-| Worker: GET /jobs | 额外的自省端点 | 无害的新增功能 |
+| Manager: GET /jobs/:name | 镜像详情，含 `error_msg`，跨所有 worker | 前端使用的新端点 |
+
+## API 参考
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/ping` | 存活检查 → `{ "message": "pong" }` |
+| GET | `/jobs` | 列出所有镜像（摘要，不含 `error_msg`） |
+| GET | `/jobs/:name` | 镜像详情，跨所有 worker（含 `error_msg`、时间戳） |
+| DELETE | `/jobs/disabled` | 清除所有已禁用的镜像行 |
+| GET | `/workers` | 列出已注册 worker（token 已脱敏） |
+| POST | `/workers` | 注册新 worker |
+| DELETE | `/workers/:id` | 删除 worker |
+| POST | `/workers/:id/heartbeat` | worker 心跳 |
+| GET | `/workers/:id/jobs` | 列出某个 worker 的镜像 |
+| POST | `/workers/:id/jobs/:job` | 更新镜像状态（worker → manager） |
+| POST | `/workers/:id/jobs/:job/size` | 更新镜像大小 |
+| POST | `/workers/:id/schedules` | 更新调度计划 |
+| POST | `/cmd` | 发送控制命令（start/stop/disable/reload） |
+
+`GET /jobs/:name` 返回 `Vec<MirrorStatus>` — 完整状态对象，包含 `error_msg`。示例：
+
+```bash
+curl http://localhost:14242/jobs/ubuntu
+# → [ { "name": "ubuntu", "worker": "w1", "status": "failed", "error_msg": "rsync: timeout", ... } ]
+
+curl http://localhost:14242/jobs/nonexistent
+# → []
+```
 
 ## 许可证
 
