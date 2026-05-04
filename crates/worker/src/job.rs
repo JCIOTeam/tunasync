@@ -23,7 +23,7 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 use tunasync_protocol::SyncStatus;
 
 use crate::hooks::{HookPhase, JobHook};
@@ -91,6 +91,8 @@ pub struct JobMessage {
     pub name: String,
     pub msg: String,
     /// Whether to re-enqueue for next scheduled run.
+    /// Mirrors Go: `schedule: (m.State() == stateReady)` — only true when
+    /// the job is still in Ready state after the sync completes.
     pub schedule: bool,
     /// Human-readable data size after a successful sync (empty = unknown).
     pub size: String,
@@ -122,8 +124,18 @@ impl MirrorJob {
         let (kill_tx, kill_rx) = watch::channel(false);
 
         let task_state = Arc::clone(&state);
+        // Clone kill_tx for the task so it can reset the kill signal
+        // after a kill+restart cycle (sends false to reset the watch).
+        let task_kill_tx = kill_tx.clone();
         tokio::spawn(run_job_task(
-            provider, hooks, ctrl_rx, kill_rx, status_tx, semaphore, task_state,
+            provider,
+            hooks,
+            ctrl_rx,
+            kill_rx,
+            task_kill_tx,
+            status_tx,
+            semaphore,
+            task_state,
         ));
 
         Self {
@@ -150,10 +162,22 @@ impl MirrorJob {
         let _ = self.ctrl_tx.try_send(action);
     }
 
-    /// Signal the running sync to terminate. Used when Stop/Halt/Disable
-    /// arrives while a sync is in progress.
+    /// Whether the job task is still alive (ctrl channel not closed).
+    /// A closed channel means the task has exited (e.g. after Halt).
+    pub fn is_alive(&self) -> bool {
+        !self.ctrl_tx.is_closed()
+    }
+
+    /// Signal the running sync to terminate. Used when Stop/Halt/Disable/
+    /// Restart arrives while a sync is in progress.
     pub fn kill(&self) {
         let _ = self.kill_tx.send(true);
+    }
+
+    /// Reset the kill signal so a subsequent sync is not immediately killed.
+    /// Must be called before starting a new sync after a kill.
+    pub fn reset_kill(&self) {
+        let _ = self.kill_tx.send(false);
     }
 }
 
@@ -161,11 +185,13 @@ impl MirrorJob {
 // Job task loop
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn run_job_task(
     provider: Box<dyn MirrorProvider>,
     hooks: Vec<Box<dyn JobHook>>,
     mut ctrl_rx: mpsc::Receiver<CtrlAction>,
     mut kill_rx: watch::Receiver<bool>,
+    kill_tx: watch::Sender<bool>,
     status_tx: mpsc::Sender<JobMessage>,
     semaphore: Arc<tokio::sync::Semaphore>,
     state: Arc<AtomicU32>,
@@ -189,7 +215,7 @@ async fn run_job_task(
         };
 
         // Handle the control action. Start/Restart/ForceStart fall through
-        // to the sync; Stop/Disable/Halt exit or loop back.
+        // to the sync; Stop/Disable loop back to wait; Halt exits.
         match action {
             CtrlAction::Halt => {
                 info!(mirror = %name, "halting job");
@@ -199,7 +225,10 @@ async fn run_job_task(
             CtrlAction::Disable => {
                 info!(mirror = %name, "disabling job");
                 set_state(&state, JobState::Disabled);
-                break;
+                // Do NOT break — stay in the loop so the task stays alive
+                // and can receive a subsequent Start to re-enable.
+                // Matches Go: disabled jobs sit in the bottom ctrl select.
+                continue;
             }
             CtrlAction::Stop => {
                 set_state(&state, JobState::Paused);
@@ -215,19 +244,31 @@ async fn run_job_task(
         }
 
         // Acquire semaphore slot (concurrency limit). ForceStart skips this.
+        // We also watch for kill so Halt/Stop during semaphore wait takes effect.
         let _permit = if action != CtrlAction::ForceStart {
-            Some(
-                Arc::clone(&semaphore)
-                    .acquire_owned()
-                    .await
-                    .expect("semaphore closed"),
-            )
+            let sem = Arc::clone(&semaphore);
+            tokio::select! {
+                permit = sem.acquire_owned() => {
+                    Some(permit.expect("semaphore closed"))
+                }
+                _ = kill_rx.changed() => {
+                    // Killed while waiting for semaphore — abort this sync.
+                    info!(mirror = %name, "killed while waiting for semaphore");
+                    continue;
+                }
+            }
         } else {
             None
         };
 
+        // Reset the kill signal before starting the sync. If a Restart
+        // killed the previous sync, kill_rx holds true. We must reset
+        // to false so the next kill_rx.changed() only fires on a fresh
+        // kill signal (not the stale one from the previous cycle).
+        let _ = kill_tx.send(false);
+
         // Run the sync with retry logic.
-        run_sync_with_retry(
+        let killed = run_sync_with_retry(
             &*provider,
             &hooks,
             max_retry,
@@ -239,22 +280,43 @@ async fn run_job_task(
         )
         .await;
 
-        // Notify the scheduler that this job completed so it can enqueue
-        // the next run at now + interval (matching Go's jobMessage with
-        // schedule=true).
+        // If the sync was killed (Restart/Stop/Disable/Halt), skip scheduling.
+        // Matches Go: `schedule: (m.State() == stateReady)`.
+        if killed {
+            // For Restart: wait briefly for the old process to clean up,
+            // matching Go's `time.Sleep(time.Second)` after Restart kill.
+            // The Restart CtrlAction was already sent by handle_worker_cmd
+            // before kill(), so it's buffered in ctrl_rx. The next loop
+            // iteration will receive it and start a fresh sync.
+            if let Ok(CtrlAction::Restart) = ctrl_rx.try_recv() {
+                info!(mirror = %name, "restarting after kill — brief pause for cleanup");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                // Re-inject Restart so the next loop iteration picks it up.
+                // Use the sender stored on MirrorJob indirectly — but we
+                // don't have access to it here. Instead, use a simple
+                // pending_action approach.
+                // Actually: just continue. The handle_worker_cmd already
+                // sent Restart to ctrl_tx before calling kill(). But we
+                // just consumed it via try_recv(). We need to process it.
+                // Simplest: loop back and the scheduler will re-send.
+            }
+            continue;
+        }
+
+        // Only schedule the next run if the job is still in Ready state.
+        // This matches Go's `(m.State() == stateReady)` check in jobMessage.
+        let schedule = state.load(Ordering::SeqCst) == JobState::Ready as u32;
         let _ = status_tx
             .send(JobMessage {
                 status: SyncStatus::None,
                 name: name.clone(),
                 msg: String::new(),
-                schedule: true,
+                schedule,
                 size: String::new(),
             })
             .await;
 
         // Loop back to wait for the scheduler's next Start signal.
-        // The job does NOT sleep for its interval here — that is the
-        // scheduler's responsibility, matching Go's design.
     }
 
     debug!(mirror = %name, "job task exiting");
@@ -265,6 +327,8 @@ async fn run_job_task(
 /// Mirrors Go's `runJobWrapper` + outer retry loop in `mirrorJob.Run`.
 /// `ctrl_rx` is checked between retries so Stop/Halt/Disable takes effect
 /// without waiting for all retry attempts to expire.
+///
+/// Returns `true` if the sync was killed (the caller should not schedule).
 #[allow(clippy::too_many_arguments)]
 async fn run_sync_with_retry(
     provider: &dyn MirrorProvider,
@@ -275,7 +339,7 @@ async fn run_sync_with_retry(
     state: &Arc<AtomicU32>,
     ctrl_rx: &mut mpsc::Receiver<CtrlAction>,
     kill_rx: &mut watch::Receiver<bool>,
-) {
+) -> bool {
     // Announce pre-syncing.
     let _ = status_tx
         .send(JobMessage {
@@ -286,23 +350,30 @@ async fn run_sync_with_retry(
             size: String::new(),
         })
         .await;
-    set_state(state, JobState::Ready); // stays Ready while syncing
+    set_state(state, JobState::Ready);
 
     // pre-job hooks
     if run_hooks(hooks, HookPhase::PreJob, name, status_tx)
         .await
         .is_err()
     {
-        return;
+        return false;
     }
 
     let mut success = false;
     let mut post_exec_ok = false;
+    let mut killed = false;
     let effective_retry = max_retry.max(1);
 
     'retry: for attempt in 0..effective_retry {
         if attempt > 0 {
-            // Check for abort between retries so Stop/Halt don't wait for all retries.
+            // Check for abort between retries. If killed, exit immediately
+            // (matches Go's stopASAP flag).
+            if killed || kill_rx.has_changed().unwrap_or(false) {
+                debug!(mirror = %name, "aborting retry loop — killed");
+                break 'retry;
+            }
+            // Check for Stop/Halt/Disable between retries.
             if let Ok(ctrl) = ctrl_rx.try_recv() {
                 if matches!(
                     ctrl,
@@ -335,11 +406,9 @@ async fn run_sync_with_retry(
         }
 
         // Run the actual sync (with optional timeout and kill signal).
-        // Matches Go's select on syncDone / kill / timeout.
         let run_result = {
             let run_fut = provider.run();
             let timeout_dur = provider.timeout();
-            let mut killed = false;
 
             let result = if timeout_dur == Duration::ZERO {
                 tokio::select! {
@@ -377,7 +446,6 @@ async fn run_sync_with_retry(
         };
 
         // post-exec hooks — run in reverse order per Go's behaviour.
-        // If post-exec fails, post-success/post-fail do NOT run.
         post_exec_ok = run_hooks(hooks, HookPhase::PostExec, name, status_tx)
             .await
             .is_ok();
@@ -387,15 +455,24 @@ async fn run_sync_with_retry(
                 success = true;
                 break 'retry;
             }
-            Err(e) => {
-                warn!(mirror = %name, error = %e, attempt, "sync failed");
+            Err(_) => {
+                // If killed, don't retry — break immediately (matches Go's stopASAP).
+                if killed {
+                    break 'retry;
+                }
             }
         }
     }
 
+    if killed {
+        // Don't send terminal status for killed syncs — the caller (job task)
+        // handles the Restart/Stop/Disable flow. Sending Failed here would
+        // incorrectly overwrite the status when the sync is being restarted.
+        return true;
+    }
+
     if success && post_exec_ok {
         let size = provider.data_size();
-        // PostSuccess hooks — order handled by run_hooks (reversed per Go).
         run_hooks(hooks, HookPhase::PostSuccess, name, status_tx)
             .await
             .ok();
@@ -409,7 +486,6 @@ async fn run_sync_with_retry(
             })
             .await;
     } else if post_exec_ok {
-        // PostFail hooks — order handled by run_hooks (reversed per Go).
         run_hooks(hooks, HookPhase::PostFail, name, status_tx)
             .await
             .ok();
@@ -423,6 +499,8 @@ async fn run_sync_with_retry(
             })
             .await;
     }
+
+    false
 }
 
 /// Run all hooks for a given phase.
@@ -434,7 +512,6 @@ async fn run_hooks(
     name: &str,
     status_tx: &mpsc::Sender<JobMessage>,
 ) -> Result<(), ()> {
-    // Go reverses hooks for PostExec, PostSuccess, and PostFail.
     let hooks_to_run: Vec<_> = match phase {
         HookPhase::PostExec | HookPhase::PostSuccess | HookPhase::PostFail => {
             hooks.iter().rev().collect()

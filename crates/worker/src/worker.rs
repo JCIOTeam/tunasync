@@ -37,7 +37,7 @@ use tunasync_protocol::{
 use crate::config::WorkerConfig;
 use crate::hooks::JobHook;
 use crate::http_server::{build_router, cmd_to_ctrl, WorkerHttpState};
-use crate::job::{CtrlAction, JobMessage, MirrorJob};
+use crate::job::{CtrlAction, JobMessage, JobState, MirrorJob};
 use crate::manager_client::ManagerClient;
 use crate::provider::MirrorProvider;
 use crate::schedule::ScheduleQueue;
@@ -527,8 +527,11 @@ impl Worker {
             }
         }
 
-        // Re-enqueue if this was a terminal status update.
-        if msg.schedule || matches!(msg.status, SyncStatus::Success | SyncStatus::Failed) {
+        // Re-enqueue if this was a terminal status update with schedule=true.
+        // Matches Go: `if jobMsg.schedule { schedTime := time.Now().Add(...) }`.
+        // The schedule flag is set by the job task only when state == Ready,
+        // so Stop/Disable during sync correctly prevents re-scheduling.
+        if msg.schedule {
             if let Some(job_cfg) = self.cfg.mirrors.iter().find(|m| m.name == msg.name) {
                 let interval = job_cfg.effective_interval(&self.cfg.global);
                 let next_run = Instant::now() + interval;
@@ -560,13 +563,18 @@ impl Worker {
                 }
             }
             _ => {
+                // Mirror Go: "No matter what command, the existing job
+                // schedule should be flushed" — always remove from schedule.
+                if !cmd.mirror_id.is_empty() {
+                    self.schedule.remove(&cmd.mirror_id);
+                }
+
                 if cmd.mirror_id.is_empty() {
                     for job in self.jobs.values() {
                         if let Some(action) = cmd_to_ctrl(&cmd) {
                             job.try_send(action);
                             // Kill running sync on Stop/Disable/Halt/Restart so
-                            // it terminates promptly. Restart then re-runs the
-                            // sync on the next loop iteration.
+                            // it terminates promptly.
                             if matches!(
                                 action,
                                 CtrlAction::Stop
@@ -580,10 +588,47 @@ impl Worker {
                     }
                 } else if let Some(job) = self.jobs.get(&cmd.mirror_id) {
                     if let Some(action) = cmd_to_ctrl(&cmd) {
+                        // If the job task is dead (Disabled earlier), re-spawn it.
+                        // Matches Go: `if job.State() == stateDisabled { go job.Run() }`.
+                        if !job.is_alive()
+                            && matches!(action, CtrlAction::Start | CtrlAction::Restart)
+                        {
+                            let name = &cmd.mirror_id;
+                            if let Some(job_cfg) = self.cfg.mirrors.iter().find(|m| m.name == *name)
+                            {
+                                match (self.build_one_provider)(job_cfg, &self.cfg) {
+                                    Ok((provider, hooks)) => {
+                                        let new_job = MirrorJob::spawn(
+                                            provider,
+                                            hooks,
+                                            self.status_tx.clone(),
+                                            Arc::clone(&self.semaphore),
+                                        );
+                                        self.jobs.insert(name.clone(), new_job);
+                                        // Fall through — send Start to the new job.
+                                        if let Some(new_job) = self.jobs.get(name) {
+                                            new_job.try_send(CtrlAction::Start);
+                                        }
+                                        // Schedule immediately.
+                                        self.schedule.push(name.clone(), Instant::now());
+                                        tracing::info!(
+                                            mirror = %name,
+                                            "re-enabled disabled job via Start/Restart"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            mirror = %name,
+                                            error = %e,
+                                            "failed to rebuild provider for re-enable"
+                                        );
+                                    }
+                                }
+                            }
+                            return;
+                        }
+
                         job.try_send(action);
-                        // Mirror Go's behaviour: Restart kills the running sync
-                        // immediately (the job task handles re-running after the
-                        // kill). Also matches the global-Restart path above.
                         if matches!(
                             action,
                             CtrlAction::Stop
@@ -648,6 +693,9 @@ impl Worker {
                     tracing::info!(mirror = %name, "hot-reload: deleted job");
                 }
                 DiffOp::Modify => {
+                    // Remember the old job's state so we can preserve it.
+                    let old_state = self.jobs.get(name).map(|j| j.state());
+
                     // Disable and remove the old job.
                     if let Some(job) = self.jobs.get(name) {
                         job.try_send(CtrlAction::Disable);
@@ -701,8 +749,27 @@ impl Worker {
                         }
                     }
 
-                    tracing::info!(mirror = %name, "hot-reload: modified job — re-scheduling");
-                    self.schedule.push(name.clone(), std::time::Instant::now());
+                    // Preserve the old job's state (matches Go's ReloadMirrorConfig
+                    // which checks the previous state when re-spawning a modified job).
+                    match old_state {
+                        Some(JobState::Paused) => {
+                            if let Some(job) = self.jobs.get(name) {
+                                job.try_send(CtrlAction::Stop);
+                            }
+                            tracing::info!(mirror = %name, "hot-reload: modified job — kept Paused");
+                        }
+                        Some(JobState::Disabled) => {
+                            if let Some(job) = self.jobs.get(name) {
+                                job.try_send(CtrlAction::Disable);
+                            }
+                            tracing::info!(mirror = %name, "hot-reload: modified job — kept Disabled");
+                        }
+                        _ => {
+                            // Ready/None — schedule for immediate sync.
+                            tracing::info!(mirror = %name, "hot-reload: modified job — scheduling");
+                            self.schedule.push(name.clone(), Instant::now());
+                        }
+                    }
                 }
                 DiffOp::Add => {
                     self.cfg.mirrors.push(trans.config.clone());
