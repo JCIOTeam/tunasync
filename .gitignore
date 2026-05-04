@@ -1,6 +1,7 @@
-target/
-*.swp
-*.swo
 *~
-.DS_Store
 .claude/
+CLAUDE.md
+.DS_Store
+*.swo
+*.swp
+target/
