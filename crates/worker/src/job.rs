@@ -363,6 +363,7 @@ async fn run_sync_with_retry(
     let mut success = false;
     let mut post_exec_ok = false;
     let mut killed = false;
+    let mut last_error = String::new();
     let effective_retry = max_retry.max(1);
 
     'retry: for attempt in 0..effective_retry {
@@ -455,11 +456,12 @@ async fn run_sync_with_retry(
                 success = true;
                 break 'retry;
             }
-            Err(_) => {
+            Err(e) => {
                 // If killed, don't retry — break immediately (matches Go's stopASAP).
                 if killed {
                     break 'retry;
                 }
+                last_error = e.to_string();
             }
         }
     }
@@ -493,7 +495,7 @@ async fn run_sync_with_retry(
             .send(JobMessage {
                 status: SyncStatus::Failed,
                 name: name.to_owned(),
-                msg: "sync failed after all retries".into(),
+                msg: last_error,
                 schedule: true,
                 size: String::new(),
             })
