@@ -179,7 +179,10 @@ mod redis_db {
 
     #[test]
     fn worker_crud() {
-        let Some(db) = open() else { return };
+        let Some(db) = open() else {
+            eprintln!("SKIP: TUNASYNC_TEST_REDIS_URL not set");
+            return;
+        };
         flush_test_db();
 
         let w = sample_worker("worker-1");
@@ -202,7 +205,10 @@ mod redis_db {
 
     #[test]
     fn mirror_status_crud() {
-        let Some(db) = open() else { return };
+        let Some(db) = open() else {
+            eprintln!("SKIP: TUNASYNC_TEST_REDIS_URL not set");
+            return;
+        };
         flush_test_db();
 
         db.create_worker(sample_worker("w1")).unwrap();
@@ -224,7 +230,10 @@ mod redis_db {
 
     #[test]
     fn flush_disabled() {
-        let Some(db) = open() else { return };
+        let Some(db) = open() else {
+            eprintln!("SKIP: TUNASYNC_TEST_REDIS_URL not set");
+            return;
+        };
         flush_test_db();
 
         db.create_worker(sample_worker("w1")).unwrap();
