@@ -177,16 +177,26 @@ async fn run_job_task(
     set_state(&state, JobState::Ready);
     debug!(mirror = %name, "job task started, state=Ready");
 
+    // When Some, skip waiting on ctrl_rx and immediately run a sync.
+    // Set when Start/Restart/ForceStart arrives during the interval wait.
+    let mut pending_action: Option<CtrlAction> = None;
+
     loop {
-        // Wait for a start signal or halt.
-        let action = match ctrl_rx.recv().await {
-            Some(a) => a,
-            None => {
-                info!(mirror = %name, "ctrl channel closed — exiting");
-                break;
+        // Wait for a start signal, unless a prior interval-wake gave us one.
+        let action = if let Some(a) = pending_action.take() {
+            a
+        } else {
+            match ctrl_rx.recv().await {
+                Some(a) => a,
+                None => {
+                    info!(mirror = %name, "ctrl channel closed — exiting");
+                    break;
+                }
             }
         };
 
+        // Handle the initial control action. Start/Restart/ForceStart fall
+        // through to the sync; Stop/Disable/Halt exit or loop back.
         match action {
             CtrlAction::Halt => {
                 info!(mirror = %name, "halting job");
@@ -200,14 +210,12 @@ async fn run_job_task(
             }
             CtrlAction::Stop => {
                 set_state(&state, JobState::Paused);
-                // Drain then wait for Start.
                 continue;
             }
             CtrlAction::Start | CtrlAction::Restart | CtrlAction::ForceStart => {
                 set_state(&state, JobState::Ready);
             }
             CtrlAction::Ping => {
-                // Reply implicitly — state stays Ready.
                 debug!(mirror = %name, "ping");
                 continue;
             }
@@ -252,7 +260,10 @@ async fn run_job_task(
         // Yield before waiting for next interval trigger.
         set_state(&state, JobState::Ready);
 
-        // Wait for interval or next control action.
+        // Wait for interval or next control action.  If Start/Restart/
+        // ForceStart arrives during the wait we re-enter the sync
+        // immediately (matching Go's behaviour where ctrlStart/ctrlRestart
+        // in the idle select causes a new run).
         tokio::select! {
             _ = sleep(interval) => {},
             Some(ctrl) = ctrl_rx.recv() => {
@@ -267,8 +278,15 @@ async fn run_job_task(
                     }
                     CtrlAction::Stop => {
                         set_state(&state, JobState::Paused);
+                        continue;
                     }
-                    _ => {} // Start/Restart/ForceStart — loop continues immediately
+                    CtrlAction::Start | CtrlAction::Restart | CtrlAction::ForceStart => {
+                        pending_action = Some(ctrl);
+                        continue;
+                    }
+                    CtrlAction::Ping => {
+                        continue;
+                    }
                 }
             }
         }
@@ -319,7 +337,7 @@ async fn run_sync_with_retry(
 
     'retry: for attempt in 0..effective_retry {
         if attempt > 0 {
-            // Check for abort between retries so Stop/Halt doesn't wait for all retries.
+            // Check for abort between retries so Stop/Halt don't wait for all retries.
             if let Ok(ctrl) = ctrl_rx.try_recv() {
                 if matches!(
                     ctrl,

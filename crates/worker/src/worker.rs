@@ -482,11 +482,15 @@ impl Worker {
                     for job in self.jobs.values() {
                         if let Some(action) = cmd_to_ctrl(&cmd) {
                             job.try_send(action);
-                            // Kill running sync on Stop/Disable/Halt so it
-                            // terminates promptly instead of waiting for completion.
+                            // Kill running sync on Stop/Disable/Halt/Restart so
+                            // it terminates promptly. Restart then re-runs the
+                            // sync on the next loop iteration.
                             if matches!(
                                 action,
-                                CtrlAction::Stop | CtrlAction::Disable | CtrlAction::Halt
+                                CtrlAction::Stop
+                                    | CtrlAction::Disable
+                                    | CtrlAction::Halt
+                                    | CtrlAction::Restart
                             ) {
                                 job.kill();
                             }
