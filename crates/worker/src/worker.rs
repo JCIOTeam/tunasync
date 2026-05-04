@@ -524,9 +524,10 @@ impl Worker {
             }
         };
 
-        // Merge include files.
+        // Merge include files and flatten nested mirror configs,
+        // matching the startup path in lib.rs exactly.
         crate::load_include_mirrors(&mut new_cfg);
-        new_cfg.mirrors = new_cfg.mirrors_conf.clone();
+        new_cfg.mirrors = crate::config::flatten_mirrors(&new_cfg.mirrors_conf);
 
         let diff = diff_mirror_config(&self.cfg.mirrors, &new_cfg.mirrors);
 
