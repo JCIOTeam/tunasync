@@ -1,7 +1,7 @@
 # tunasync-rs
 
 [![CI](https://github.com/JCIOTeam/tunasync/actions/workflows/ci.yml/badge.svg?branch=rs)](https://github.com/JCIOTeam/tunasync/actions?query=branch%3Ars)
-[![Release](https://github.com/JCIOTeam/tunasync/actions/workflows/release.yml/badge.svg?branch=rs)](https://github.com/JCIOTeam/tunasync/releases)
+[![Release](https://img.shields.io/github/v/release/JCIOTeam/tunasync?label=release)](https://github.com/JCIOTeam/tunasync/releases)
 [![License: GPL-3.0+](https://img.shields.io/badge/license-GPL--3.0%2B-blue.svg)](LICENSE)
 
 [`tuna/tunasync`](https://github.com/tuna/tunasync) 的 Rust 移植版。tunasync 是驱动 [TUNA](https://mirrors.tuna.tsinghua.edu.cn/) 及众多开源镜像站的镜像同步管理工具。
