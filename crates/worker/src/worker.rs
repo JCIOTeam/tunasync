@@ -587,9 +587,15 @@ impl Worker {
                 } else if let Some(job) = self.jobs.get(&cmd.mirror_id) {
                     if let Some(action) = cmd_to_ctrl(&cmd) {
                         job.try_send(action);
+                        // Mirror Go's behaviour: Restart kills the running sync
+                        // immediately (the job task handles re-running after the
+                        // kill). Also matches the global-Restart path above.
                         if matches!(
                             action,
-                            CtrlAction::Stop | CtrlAction::Disable | CtrlAction::Halt
+                            CtrlAction::Stop
+                                | CtrlAction::Disable
+                                | CtrlAction::Halt
+                                | CtrlAction::Restart
                         ) {
                             job.kill();
                         }
