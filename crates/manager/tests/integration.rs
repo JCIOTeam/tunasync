@@ -475,3 +475,46 @@ async fn flush_disabled() {
     let (_, jobs) = get_json(&app, "/jobs").await;
     assert_eq!(jobs.as_array().unwrap().len(), 0);
 }
+
+#[tokio::test]
+async fn get_mirror_by_name() {
+    let app = make_app();
+
+    let worker = serde_json::json!({
+        "id": "w1", "url": "http://w1:6000", "token": "",
+        "last_online": "0001-01-01T00:00:00Z",
+        "last_register": "0001-01-01T00:00:00Z"
+    });
+    post_json(&app, "/workers", &worker).await;
+
+    let zero = "0001-01-01T00:00:00Z";
+
+    // Post a failed job with error_msg.
+    let failed = serde_json::json!({
+        "name": "ubuntu", "worker": "w1", "is_master": true,
+        "status": "failed",
+        "last_update": zero, "last_started": zero,
+        "last_ended": zero, "next_schedule": zero,
+        "upstream": "rsync://archive.ubuntu.com/ubuntu/",
+        "size": "", "error_msg": "rsync error: timeout (30) waiting for data"
+    });
+    let (status, _) = post_json(&app, "/workers/w1/jobs/ubuntu", &failed).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // GET /jobs/ubuntu should return the mirror with error_msg.
+    let (status, jobs) = get_json(&app, "/jobs/ubuntu").await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = jobs.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["name"], "ubuntu");
+    assert_eq!(arr[0]["status"], "failed");
+    assert_eq!(
+        arr[0]["error_msg"],
+        "rsync error: timeout (30) waiting for data"
+    );
+
+    // GET /jobs/nonexistent should return empty array.
+    let (status, jobs) = get_json(&app, "/jobs/nonexistent").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(jobs.as_array().unwrap().len(), 0);
+}

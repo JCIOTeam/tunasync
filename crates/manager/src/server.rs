@@ -95,6 +95,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/ping", get(ping))
         .route("/jobs", get(list_all_jobs))
         .route("/jobs/disabled", delete(flush_disabled_jobs))
+        .route("/jobs/:name", get(list_mirror_by_name))
         .route("/workers", get(list_workers).post(register_worker))
         .route("/workers/:id", delete(delete_worker))
         .route("/workers/:id/heartbeat", post(heartbeat_worker))
@@ -125,6 +126,20 @@ async fn list_all_jobs(State(state): State<Arc<AppState>>) -> Response {
                 .map(WebMirrorStatus::from_mirror_status)
                 .collect();
             Json(web).into_response()
+        }
+    }
+}
+
+/// `GET /jobs/:name` — detailed mirror status (including `error_msg`) across all workers.
+async fn list_mirror_by_name(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    match state.db.list_all_mirror_status() {
+        Err(e) => db_err(e),
+        Ok(statuses) => {
+            let filtered: Vec<_> = statuses.into_iter().filter(|s| s.name == name).collect();
+            Json(filtered).into_response()
         }
     }
 }
