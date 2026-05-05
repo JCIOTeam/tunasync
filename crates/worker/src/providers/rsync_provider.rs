@@ -254,7 +254,7 @@ impl MirrorProvider for RsyncProvider {
             if let Some(pid) = *self.current_pid.lock().unwrap() {
                 use nix::sys::signal::{kill, Signal};
                 use nix::unistd::Pid;
-                let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+                let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGTERM);
             }
         }
         Ok(())

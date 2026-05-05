@@ -377,32 +377,41 @@ async fn run_sync_with_retry(
             let run_fut = provider.run();
             let timeout_dur = provider.timeout();
 
-            let result = if timeout_dur == Duration::ZERO {
-                tokio::select! {
-                    r = run_fut => r,
-                    _ = kill_rx.changed() => {
-                        killed = true;
-                        provider.terminate().await.ok();
-                        Err(anyhow::anyhow!("killed by manager"))
-                    }
-                }
+            // If no explicit timeout is configured (Duration::ZERO), use a
+            // 48-hour hard ceiling so a completely stalled sync (hung TCP
+            // connection, blocked I/O) is eventually reaped rather than
+            // running forever.  48 h is intentionally generous — rsync's own
+            // --timeout covers normal I/O stalls; this backstop catches cases
+            // that rsync itself cannot detect (DNS hang, SSL handshake freeze,
+            // kernel-level TCP send-buffer deadlock, etc.).
+            // Matches Go's `100000 * time.Hour` sentinel for "no timeout".
+            let effective_timeout = if timeout_dur == Duration::ZERO {
+                Duration::from_secs(48 * 3600)
             } else {
-                tokio::select! {
-                    r = timeout(timeout_dur, run_fut) => {
-                        match r {
-                            Ok(r) => r,
-                            Err(_) => {
-                                error!(mirror = %name, "sync timed out");
-                                provider.terminate().await.ok();
-                                Err(anyhow::anyhow!("sync timed out"))
+                timeout_dur
+            };
+
+            let result = tokio::select! {
+                r = timeout(effective_timeout, run_fut) => {
+                    match r {
+                        Ok(r) => r,
+                        Err(_) => {
+                            if timeout_dur == Duration::ZERO {
+                                error!(mirror = %name, hours = 48,
+                                    "sync exceeded hard ceiling — terminating stalled job");
+                            } else {
+                                error!(mirror = %name, secs = timeout_dur.as_secs(),
+                                    "sync timed out");
                             }
+                            provider.terminate().await.ok();
+                            Err(anyhow::anyhow!("sync timed out"))
                         }
                     }
-                    _ = kill_rx.changed() => {
-                        killed = true;
-                        provider.terminate().await.ok();
-                        Err(anyhow::anyhow!("killed by manager"))
-                    }
+                }
+                _ = kill_rx.changed() => {
+                    killed = true;
+                    provider.terminate().await.ok();
+                    Err(anyhow::anyhow!("killed by manager"))
                 }
             };
 
