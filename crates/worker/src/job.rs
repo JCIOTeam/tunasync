@@ -429,11 +429,14 @@ async fn run_sync_with_retry(
                 break 'retry;
             }
             Err(e) => {
-                // If killed or timed out, don't retry — break immediately.
+                // Always record the error message so the Failed status report
+                // includes a human-readable reason (e.g. "sync timed out").
+                last_error = e.to_string();
+                // If killed or timed out, don't retry — break immediately and
+                // wait for the next scheduled sync cycle.
                 if killed || timed_out {
                     break 'retry;
                 }
-                last_error = e.to_string();
             }
         }
     }
