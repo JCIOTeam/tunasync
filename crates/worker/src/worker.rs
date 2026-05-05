@@ -490,13 +490,16 @@ impl Worker {
                 error_msg: String::new(),
             });
 
-        // Update local status — but skip overwriting status when the message
-        // carries SyncStatus::None (used for scheduling-only updates after a
-        // sync completes, where the real terminal status was already reported).
+        // Update local status — but skip overwriting status and error_msg when
+        // the message carries SyncStatus::None. None messages are scheduling-only
+        // updates sent by run_job_task after a sync completes; the real terminal
+        // status (and error message) was already reported by the preceding
+        // Failed/Success message. Overwriting error_msg here would clear the
+        // "sync timed out" or hook-failure reason shown in the manager UI.
         if msg.status != SyncStatus::None {
             status_entry.status = msg.status;
+            status_entry.error_msg = msg.msg.clone();
         }
-        status_entry.error_msg = msg.msg.clone();
         if !msg.size.is_empty() {
             status_entry.size = msg.size.clone();
         }
