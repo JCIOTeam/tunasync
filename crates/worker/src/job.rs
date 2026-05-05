@@ -328,6 +328,7 @@ async fn run_sync_with_retry(
     let mut success = false;
     let mut post_exec_ok = false;
     let mut killed = false;
+    let mut timed_out = false;
     let mut last_error = String::new();
     let effective_retry = max_retry.max(1);
 
@@ -377,41 +378,37 @@ async fn run_sync_with_retry(
             let run_fut = provider.run();
             let timeout_dur = provider.timeout();
 
-            // If no explicit timeout is configured (Duration::ZERO), use a
-            // 48-hour hard ceiling so a completely stalled sync (hung TCP
-            // connection, blocked I/O) is eventually reaped rather than
-            // running forever.  48 h is intentionally generous — rsync's own
-            // --timeout covers normal I/O stalls; this backstop catches cases
-            // that rsync itself cannot detect (DNS hang, SSL handshake freeze,
-            // kernel-level TCP send-buffer deadlock, etc.).
-            // Matches Go's `100000 * time.Hour` sentinel for "no timeout".
-            let effective_timeout = if timeout_dur == Duration::ZERO {
-                Duration::from_secs(48 * 3600)
-            } else {
-                timeout_dur
-            };
-
-            let result = tokio::select! {
-                r = timeout(effective_timeout, run_fut) => {
-                    match r {
-                        Ok(r) => r,
-                        Err(_) => {
-                            if timeout_dur == Duration::ZERO {
-                                error!(mirror = %name, hours = 48,
-                                    "sync exceeded hard ceiling — terminating stalled job");
-                            } else {
-                                error!(mirror = %name, secs = timeout_dur.as_secs(),
-                                    "sync timed out");
-                            }
-                            provider.terminate().await.ok();
-                            Err(anyhow::anyhow!("sync timed out"))
-                        }
+            let result = if timeout_dur == Duration::ZERO {
+                // No timeout configured — rely on rsync's own --timeout for
+                // I/O-level stalls. A hard ceiling would be too aggressive for
+                // large mirrors (several TB) that legitimately take days.
+                tokio::select! {
+                    r = run_fut => r,
+                    _ = kill_rx.changed() => {
+                        killed = true;
+                        provider.terminate().await.ok();
+                        Err(anyhow::anyhow!("killed by manager"))
                     }
                 }
-                _ = kill_rx.changed() => {
-                    killed = true;
-                    provider.terminate().await.ok();
-                    Err(anyhow::anyhow!("killed by manager"))
+            } else {
+                tokio::select! {
+                    r = timeout(timeout_dur, run_fut) => {
+                        match r {
+                            Ok(r) => r,
+                            Err(_) => {
+                                error!(mirror = %name, secs = timeout_dur.as_secs(),
+                                    "sync timed out");
+                                provider.terminate().await.ok();
+                                timed_out = true;
+                                Err(anyhow::anyhow!("sync timed out"))
+                            }
+                        }
+                    }
+                    _ = kill_rx.changed() => {
+                        killed = true;
+                        provider.terminate().await.ok();
+                        Err(anyhow::anyhow!("killed by manager"))
+                    }
                 }
             };
 
@@ -432,8 +429,8 @@ async fn run_sync_with_retry(
                 break 'retry;
             }
             Err(e) => {
-                // If killed, don't retry — break immediately (matches Go's stopASAP).
-                if killed {
+                // If killed or timed out, don't retry — break immediately.
+                if killed || timed_out {
                     break 'retry;
                 }
                 last_error = e.to_string();

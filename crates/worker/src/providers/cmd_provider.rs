@@ -246,10 +246,10 @@ impl MirrorProvider for CmdProvider {
                     }
                 }
             }
-            if let Some(pid) = *self.current_pid.lock().unwrap() {
-                use nix::sys::signal::{kill, Signal};
-                use nix::unistd::Pid;
-                let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGTERM);
+            // Extract PID before awaiting so the MutexGuard is dropped (not Send).
+            let pid = *self.current_pid.lock().unwrap();
+            if let Some(pid) = pid {
+                runner::terminate_process_group(pid).await;
             }
         }
         Ok(())

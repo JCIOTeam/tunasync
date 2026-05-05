@@ -120,6 +120,30 @@ impl Drop for RunningProcess {
     }
 }
 
+/// SIGTERM the process group → 2 s grace period → SIGKILL the process group.
+/// Used by providers' `terminate()` to ensure the child tree is fully killed.
+///
+/// Unlike `RunningProcess::terminate()` which owns the `Child`, this operates
+/// on a raw PID — the `RunningProcess` is consumed by `wait()` inside
+/// `provider.run()`, so providers only have the PID to work with.
+#[cfg(unix)]
+pub async fn terminate_process_group(pid: u32) {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+
+    let pgid = Pid::from_raw(-(pid as i32));
+    if kill(pgid, Signal::SIGTERM).is_err() {
+        tracing::debug!(pid, "SIGTERM to process group failed (already dead?)");
+        return;
+    }
+    // Give the process a grace period to shut down gracefully.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // If still alive, SIGKILL the process group.
+    if kill(pgid, Signal::SIGKILL).is_err() {
+        tracing::debug!(pid, "SIGKILL to process group failed (already dead)");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // spawn()
 // ---------------------------------------------------------------------------
