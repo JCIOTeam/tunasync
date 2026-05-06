@@ -15,3 +15,13 @@ chrono = { workspace = true }
 tunasync-protocol = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
+# Read-only parser for existing bbolt/go-bolt database files.
+# Uses MAGIC=0xED0CDAED — the real bbolt wire format.
+bolt-lite = "0.1.0"
+
+[dev-dependencies]
+# bbolt-rs with compat feature writes real bbolt files (MAGIC=0xED0CDAED).
+# Used in the round-trip integration test to produce a test fixture without
+# needing a running Go process.
+bbolt-rs  = { version = "1.3", features = ["compat"] }
+tempfile  = "3"
