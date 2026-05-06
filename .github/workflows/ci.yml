@@ -34,7 +34,9 @@ jobs:
       - run: cargo test --workspace
 
   # Lightweight cross-compile check for every release target.
-  # cargo check (no link) is enough to catch type/API errors early.
+  # Uses `cargo check` (no link step) to catch type/API errors early without
+  # needing a full cross sysroot.  Build scripts (ring, sqlite3-sys) still run
+  # and need a C cross-compiler — the `cc` field is exported to CC_<triple>.
   cross-check:
     name: Cross-check ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
@@ -46,37 +48,53 @@ jobs:
             os: ubuntu-22.04
             apt: gcc-aarch64-linux-gnu
             linker: aarch64-linux-gnu-gcc
+            cc: aarch64-linux-gnu-gcc
 
           - target: armv7-unknown-linux-gnueabihf
             os: ubuntu-22.04
             apt: gcc-arm-linux-gnueabihf
             linker: arm-linux-gnueabihf-gcc
+            cc: arm-linux-gnueabihf-gcc
 
           - target: riscv64gc-unknown-linux-gnu
             os: ubuntu-22.04
             apt: gcc-riscv64-linux-gnu
             linker: riscv64-linux-gnu-gcc
+            cc: riscv64-linux-gnu-gcc
 
+          # ubuntu-24.04: first Ubuntu release with LoongArch in main apt repo.
           - target: loongarch64-unknown-linux-gnu
             os: ubuntu-24.04
             apt: gcc-14-loongarch64-linux-gnu
             linker: loongarch64-linux-gnu-gcc-14
+            cc: loongarch64-linux-gnu-gcc-14
 
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: cross-${{ matrix.target }}
+
       - name: Install cross-compiler
         run: |
           sudo apt-get update -q
           sudo apt-get install -y ${{ matrix.apt }}
-      - name: Configure linker
+
+      - name: Configure linker and C compiler
         run: |
+          # Linker for rustc link step (cargo config).
           mkdir -p .cargo
-          printf '[target.${{ matrix.target }}]\nlinker = "%s"\n' \
-            "${{ matrix.linker }}" >> .cargo/config.toml
+          printf '[target.%s]\nlinker = "%s"\n' \
+            "${{ matrix.target }}" "${{ matrix.linker }}" >> .cargo/config.toml
+
+          # CC_<triple> — used by ring and other C build scripts via cc-rs.
+          # Must be exported before cargo check so build scripts can find it.
+          TARGET="${{ matrix.target }}"
+          echo "CC_${TARGET//-/_}=${{ matrix.cc }}" >> "$GITHUB_ENV"
+
       - run: cargo check --workspace --target ${{ matrix.target }}

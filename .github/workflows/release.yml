@@ -16,17 +16,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ── native x86_64 ────────────────────────────────────────
+          # ── native x86_64 ────────────────────────────────────────────────────
           - target:   x86_64-unknown-linux-gnu
             os:       ubuntu-22.04
             artifact: tunasync-linux-amd64
 
+          # x86_64-musl: musl-gcc is a native wrapper (no cross-compilation).
+          # Produces a fully static binary with no glibc dependency.
           - target:   x86_64-unknown-linux-musl
             os:       ubuntu-22.04
             artifact: tunasync-linux-amd64-musl
             apt:      musl-tools
+            cc:       musl-gcc
 
-          # ── aarch64 ──────────────────────────────────────────────
+          # ── aarch64 glibc ───────────────────────────────────────────────────
           - target:   aarch64-unknown-linux-gnu
             os:       ubuntu-22.04
             artifact: tunasync-linux-aarch64
@@ -35,16 +38,19 @@ jobs:
             cc:       aarch64-linux-gnu-gcc
             cxx:      aarch64-linux-gnu-g++
 
+          # ── aarch64 musl (static) ────────────────────────────────────────────
+          # Cannot use gcc-aarch64-linux-gnu (glibc cross-compiler) as the C
+          # compiler here: it emits __memcpy_chk / open64 / __memset_chk via
+          # FORTIFY_SOURCE, which are glibc symbols absent in musl.
+          #
+          # cargo-zigbuild uses zig as the C cross-compiler, which provides its
+          # own musl headers and libc — no system cross-toolchain needed.
           - target:   aarch64-unknown-linux-musl
             os:       ubuntu-22.04
             artifact: tunasync-linux-aarch64-musl
-            apt:      gcc-aarch64-linux-gnu musl-tools
-            linker:   aarch64-linux-gnu-gcc
-            cc:       aarch64-linux-gnu-gcc
-            cxx:      aarch64-linux-gnu-g++
-            musl_target: aarch64
+            zigbuild: true
 
-          # ── armv7 ────────────────────────────────────────────────
+          # ── armv7 ────────────────────────────────────────────────────────────
           - target:   armv7-unknown-linux-gnueabihf
             os:       ubuntu-22.04
             artifact: tunasync-linux-armv7
@@ -53,7 +59,7 @@ jobs:
             cc:       arm-linux-gnueabihf-gcc
             cxx:      arm-linux-gnueabihf-g++
 
-          # ── riscv64 ──────────────────────────────────────────────
+          # ── riscv64 ──────────────────────────────────────────────────────────
           - target:   riscv64gc-unknown-linux-gnu
             os:       ubuntu-22.04
             artifact: tunasync-linux-riscv64
@@ -62,11 +68,9 @@ jobs:
             cc:       riscv64-linux-gnu-gcc
             cxx:      riscv64-linux-gnu-g++
 
-          # ── loongarch64 ──────────────────────────────────────────
-          # Requires ubuntu-24.04 (first Ubuntu release with LoongArch
-          # cross-compiler in the main apt repo).
-          # aws-lc-rs is NOT used (switched to ring backend) so no
-          # BoringSSL cmake cross-compilation is needed.
+          # ── loongarch64 ──────────────────────────────────────────────────────
+          # Requires ubuntu-24.04 (first Ubuntu with LoongArch cross-compiler in
+          # the main apt repo).  TLS backend is ring (no aws-lc-rs/BoringSSL).
           - target:   loongarch64-unknown-linux-gnu
             os:       ubuntu-24.04
             artifact: tunasync-linux-loongarch64
@@ -86,7 +90,7 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
-      - name: Install cross-compilation tools
+      - name: Install apt cross-compilation tools
         if: matrix.apt != ''
         run: |
           sudo apt-get update -q
@@ -96,26 +100,37 @@ jobs:
         if: matrix.linker != ''
         run: |
           mkdir -p .cargo
-          printf '[target.${{ matrix.target }}]\nlinker = "%s"\n' \
-            "${{ matrix.linker }}" >> .cargo/config.toml
+          printf '[target.%s]\nlinker = "%s"\n' \
+            "${{ matrix.target }}" "${{ matrix.linker }}" >> .cargo/config.toml
+
+      # Export CC_<triple> and CXX_<triple> so ring and sqlite3-sys build
+      # scripts (via cc-rs) find the right cross-compiler.
+      # Skipped for zigbuild targets — zig provides its own toolchain.
+      - name: Export C cross-compiler
+        if: matrix.cc != ''
+        run: |
+          TARGET="${{ matrix.target }}"
+          echo "CC_${TARGET//-/_}=${{ matrix.cc }}" >> "$GITHUB_ENV"
+          if [ -n "${{ matrix.cxx }}" ]; then
+            echo "CXX_${TARGET//-/_}=${{ matrix.cxx }}" >> "$GITHUB_ENV"
+          fi
+
+      # cargo-zigbuild: used for musl cross-compilation targets where the
+      # system glibc cross-compiler cannot produce musl-compatible object files.
+      # zig provides its own bundled musl headers and libc.
+      - name: Install cargo-zigbuild
+        if: matrix.zigbuild
+        run: |
+          pip3 install ziglang --quiet
+          cargo install cargo-zigbuild --locked
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
-        env:
-          # C/C++ compilers for ring's (and any other C dep's) cross build.
-          # Variable names use the target triple with hyphens → underscores.
-          CC_x86_64_unknown_linux_gnu:            gcc
-          CC_x86_64_unknown_linux_musl:           musl-gcc
-          CC_aarch64_unknown_linux_gnu:           ${{ matrix.cc }}
-          CC_aarch64_unknown_linux_musl:          ${{ matrix.cc }}
-          CC_armv7_unknown_linux_gnueabihf:       ${{ matrix.cc }}
-          CC_riscv64gc_unknown_linux_gnu:         ${{ matrix.cc }}
-          CC_loongarch64_unknown_linux_gnu:       ${{ matrix.cc }}
-          CXX_aarch64_unknown_linux_gnu:          ${{ matrix.cxx }}
-          CXX_aarch64_unknown_linux_musl:         ${{ matrix.cxx }}
-          CXX_armv7_unknown_linux_gnueabihf:      ${{ matrix.cxx }}
-          CXX_riscv64gc_unknown_linux_gnu:        ${{ matrix.cxx }}
-          CXX_loongarch64_unknown_linux_gnu:      ${{ matrix.cxx }}
+        run: |
+          if [ "${{ matrix.zigbuild }}" = "true" ]; then
+            cargo zigbuild --release --target "${{ matrix.target }}"
+          else
+            cargo build --release --target "${{ matrix.target }}"
+          fi
 
       - name: Package
         run: |
