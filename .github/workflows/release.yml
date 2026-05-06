@@ -121,8 +121,8 @@ jobs:
       - name: Install cargo-zigbuild
         if: matrix.zigbuild
         run: |
-          pip3 install ziglang --quiet
-          cargo install cargo-zigbuild --locked
+          pip3 install ziglang
+          cargo install cargo-zigbuild
 
       - name: Build
         run: |
