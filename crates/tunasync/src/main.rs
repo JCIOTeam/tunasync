@@ -31,7 +31,7 @@ struct Cli {
     verbose: bool,
 
     /// Adapt logging for systemd: suppress timestamps and ANSI colours
-    /// (systemd journal adds its own timestamps). Matches Go's --with-systemd.
+    /// (systemd journal adds its own timestamps).
     #[arg(long, global = true)]
     with_systemd: bool,
 }
@@ -44,39 +44,36 @@ enum Command {
         #[arg(short, long, default_value = "/etc/tunasync/manager.conf")]
         config: PathBuf,
 
-        // -----------------------------------------------------------------
-        // CLI overrides — match Go's `tunasync manager` flags exactly.
-        // When provided these take precedence over the config file values.
-        // -----------------------------------------------------------------
-        /// Override manager listen address (Go: --addr).
+        // CLI overrides — when provided these take precedence over the config file values.
+        /// Override manager listen address.
         #[arg(long)]
         addr: Option<String>,
 
-        /// Override manager listen port (Go: --port).
+        /// Override manager listen port.
         #[arg(long)]
         port: Option<u16>,
 
-        /// SSL certificate file (enables HTTPS, Go: --cert).
+        /// SSL certificate file (enables HTTPS).
         #[arg(long)]
         cert: Option<PathBuf>,
 
-        /// SSL key file (enables HTTPS, Go: --key).
+        /// SSL key file (enables HTTPS).
         #[arg(long)]
         key: Option<PathBuf>,
 
-        /// Override database file path (Go: --db-file).
+        /// Override database file path.
         #[arg(long)]
         db_file: Option<PathBuf>,
 
-        /// Override database type: redb, sqlite, redis (Go: --db-type).
+        /// Override database type: redb, sqlite, redis.
         #[arg(long)]
         db_type: Option<String>,
 
-        /// Enable debug-level logging (Go: --debug).
+        /// Enable debug-level logging.
         #[arg(long)]
         debug: bool,
 
-        /// PID file path (written on startup, matches Go's --pidfile).
+        /// PID file path.
         #[arg(long, default_value = "/run/tunasync/tunasync.manager.pid")]
         pidfile: Option<PathBuf>,
     },
@@ -86,7 +83,7 @@ enum Command {
         #[arg(short, long, default_value = "/etc/tunasync/worker.conf")]
         config: PathBuf,
 
-        /// PID file path (Go: --pidfile).
+        /// PID file path.
         #[arg(long, default_value = "/run/tunasync/tunasync.worker.pid")]
         pidfile: Option<PathBuf>,
     },

@@ -91,21 +91,18 @@ impl CtlConfig {
 )]
 struct Cli {
     /// Explicit config file (overrides system and user config files).
-    /// Matches Go's `--config / -c` flag.
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
 
-    /// Manager host or IP address (Go: `--manager / -m`).
-    /// Combined with --port to build the base URL unless it already
-    /// contains a scheme (http:// / https://).
+    /// Manager host or IP address.
     #[arg(short, long, env = "TUNASYNC_MANAGER", global = true)]
     manager: Option<String>,
 
-    /// Manager port (Go: `--port / -p`).
+    /// Manager port.
     #[arg(short, long, env = "TUNASYNC_MANAGER_PORT", global = true)]
     port: Option<u16>,
 
-    /// CA cert for pinning the manager's TLS certificate (Go: `--ca-cert`).
+    /// CA cert for pinning the manager's TLS certificate.
     /// When set the base URL scheme is upgraded to https.
     #[arg(long, global = true)]
     ca_cert: Option<PathBuf>,
@@ -120,10 +117,9 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// List all mirror jobs (WebMirrorStatus, same output as status page).
+    /// List all mirror jobs.
     List {
         /// List jobs of a specific worker; omit for all workers.
-        /// Short flag `-w` matches Go's tunasynctl CLI.
         #[arg(short, long)]
         worker: Option<String>,
         /// Filter by status (comma-separated: syncing,failed,success,…).
@@ -132,7 +128,7 @@ enum Command {
         /// Output format: `json` (default) or `table`.
         #[arg(long, default_value = "json")]
         format: String,
-        /// Show all workers' jobs (default behaviour, matches Go's `list --all`).
+        /// Show all workers' jobs.
         #[arg(long)]
         all: bool,
     },
@@ -162,7 +158,7 @@ enum Command {
         /// Restrict to a specific worker.
         #[arg(short, long)]
         worker: Option<String>,
-        /// Ignore concurrency limit (force-start). Short flag `-f` matches Go.
+        /// Ignore concurrency limit (force-start).
         #[arg(short, long)]
         force: bool,
     },
