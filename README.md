@@ -16,6 +16,8 @@ Pre-built binaries for Linux (x86_64, aarch64, armv7, riscv64, loongarch64, x86_
 
 tunasync-rs is **wire-compatible** with the Go implementation: a Rust manager can drive Go workers and vice versa. The config file format (TOML) uses the same keys, so existing Go config files work without modification.
 
+> **Note:** The Go version defaults to port **12345**, while the Rust version defaults to port **14242**. If you are migrating, either change the Rust config to match the Go port, or update the worker `api_base` and `tunasynctl` config accordingly.
+
 ### Migration steps
 
 1. **Install the Rust binaries** — download from [Releases](https://github.com/JCIOTeam/tunasync/releases) or build from source, then copy `tunasync`, `tunasynctl`, and `tunasync-migrate` to `/usr/bin/`.
@@ -34,7 +36,8 @@ tunasync-rs is **wire-compatible** with the Go implementation: a Rust manager ca
    **Option B — Online migration (Go manager still running):**
    Useful when you want to prepare the new DB while the Go version is still serving:
    ```bash
-   tunasync-migrate http://localhost:14242 /var/lib/tunasync/new.db
+   # Go manager defaults to port 12345
+   tunasync-migrate http://localhost:12345 /var/lib/tunasync/new.db
    ```
 
    After either option, update the Rust manager config:
@@ -63,6 +66,7 @@ tunasync-rs is **wire-compatible** with the Go implementation: a Rust manager ca
 | Cgroup hook | v1/v2 memory limit | ✅ Compatible |
 | Btrfs/ZFS hooks | Snapshot before/after | ✅ Compatible |
 | Wire protocol | JSON REST API | ✅ Fully compatible |
+| Default port | 12345 | 14242 |
 | `tunasynctl` CLI | Same commands | ✅ Compatible (`-p`, `-w` short flags) |
 
 ## Design
@@ -403,6 +407,111 @@ tunasynctl list --status syncing,pre-syncing
 | `cgroup` | Limit CPU/memory via cgroups |
 | `btrfs_snapshot` | Btrfs snapshot before/after sync |
 | `zfs_snapshot` | ZFS snapshot before/after sync |
+
+## CLI Reference
+
+### `tunasync`
+
+```
+tunasync — Mirror job management tool
+
+Usage: tunasync [OPTIONS] <COMMAND>
+
+Commands:
+  manager  Run as a manager server
+  worker   Run as a worker
+
+Options:
+  -v, --verbose       Verbose logging
+      --with-systemd  Suppress timestamps/ANSI for systemd journal
+  -h, --help          Print help
+  -V, --version       Print version
+
+tunasync manager [OPTIONS]
+  -c, --config <CONFIG>    Config file path [default: /etc/tunasync/manager.conf]
+      --addr <ADDR>        Override listen address
+      --port <PORT>        Override listen port (default: 14242)
+      --cert <CERT>        TLS certificate file (enables HTTPS)
+      --key <KEY>          TLS private key file (enables HTTPS)
+      --db-file <DB_FILE>  Override database file path
+      --db-type <DB_TYPE>  Override database type: redb, sqlite, redis
+      --debug              Enable debug-level logging
+      --pidfile <PIDFILE>  PID file [default: /run/tunasync/tunasync.manager.pid]
+      --with-systemd       Suppress timestamps/ANSI for systemd journal
+
+tunasync worker [OPTIONS]
+  -c, --config <CONFIG>    Config file path [default: /etc/tunasync/worker.conf]
+      --pidfile <PIDFILE>  PID file [default: /run/tunasync/tunasync.worker.pid]
+      --with-systemd       Suppress timestamps/ANSI for systemd journal
+```
+
+### `tunasynctl`
+
+```
+tunasynctl — Control a tunasync manager
+
+Usage: tunasynctl [OPTIONS] <COMMAND>
+
+Commands:
+  list       List all mirror jobs
+  workers    List all registered workers
+  flush      Flush disabled job rows from DB
+  rm-worker  Remove a worker from the manager
+  set-size   Update mirror size (operator override)
+  start      Start a mirror job
+  stop       Stop a running mirror job
+  disable    Disable a mirror job
+  restart    Restart a mirror job
+  reload     Tell a worker to reload config from disk
+
+Global options:
+  -c, --config <CONFIG>     Config file (overrides system/user config)
+  -m, --manager <MANAGER>   Manager host/IP [env: TUNASYNC_MANAGER]
+  -p, --port <PORT>         Manager port [env: TUNASYNC_MANAGER_PORT]
+      --ca-cert <CA_CERT>   CA cert (switches to HTTPS)
+  -v, --verbose             Verbose logging
+
+tunasynctl list [OPTIONS]
+  -w, --worker <WORKER>     Filter by worker
+      --status <STATUS>     Filter by status (comma-separated)
+      --format <FORMAT>     Output format: json (default) or table
+      --all                  Show all workers' jobs
+
+tunasynctl start <MIRROR> [-w <WORKER>] [-f]
+  MIRROR   Mirror name, or "all" to broadcast
+  -f       Force-start (ignore concurrency limit)
+
+tunasynctl stop <MIRROR> [-w <WORKER>]
+tunasynctl disable <MIRROR> [-w <WORKER>]
+tunasynctl restart <MIRROR> [-w <WORKER>]
+
+tunasynctl set-size <MIRROR> <SIZE> [-w <WORKER>]
+  SIZE   Human-readable size, e.g. "1.2T"
+
+tunasynctl rm-worker <WORKER>
+tunasynctl flush
+tunasynctl reload <WORKER>
+```
+
+Config file priority for `tunasynctl`:
+
+1. `/etc/tunasync/ctl.conf` (system-wide)
+2. `$HOME/.config/tunasync/ctl.conf` (user-specific)
+3. `--config FILE` (explicit override)
+4. CLI flags (`--manager`, `--port`, `--ca-cert`)
+
+### `tunasync-migrate`
+
+```
+Usage: tunasync-migrate <go-manager-url-or-bolt-file> <sqlite-output-file>
+
+Examples:
+  # Offline: read Go's bolt file directly (Go manager must be stopped)
+  tunasync-migrate /var/lib/tunasync/tunasync.db /var/lib/tunasync/new.db
+
+  # Online: pull data from running Go manager
+  tunasync-migrate http://localhost:12345 /var/lib/tunasync/new.db
+```
 
 ## Roadmap
 

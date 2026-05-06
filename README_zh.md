@@ -16,6 +16,8 @@ Linux（x86_64、aarch64、armv7、riscv64、loongarch64、x86_64-musl、aarch64
 
 tunasync-rs 与 Go 实现**线路兼容**：Rust manager 可以驱动 Go worker，反之亦然。配置文件格式（TOML）使用相同字段名，现有 Go 配置文件无需修改即可使用。
 
+> **注意：** Go 版本默认端口为 **12345**，而 Rust 版本默认端口为 **14242**。迁移时请将 Rust 配置中的端口改为 Go 使用的端口，或者相应更新 worker 的 `api_base` 和 `tunasynctl` 配置。
+
 ### 迁移步骤
 
 1. **安装 Rust 二进制** — 从 [Releases](https://github.com/JCIOTeam/tunasync/releases) 下载或从源码编译，将 `tunasync`、`tunasynctl` 和 `tunasync-migrate` 复制到 `/usr/bin/`
@@ -34,7 +36,8 @@ tunasync-rs 与 Go 实现**线路兼容**：Rust manager 可以驱动 Go worker�
    **方式 B — 在线迁移（Go manager 仍在运行）：**
    适合在 Go 版本继续提供服务的同时准备好新数据库：
    ```bash
-   tunasync-migrate http://localhost:14242 /var/lib/tunasync/new.db
+   # Go manager 默认端口为 12345
+   tunasync-migrate http://localhost:12345 /var/lib/tunasync/new.db
    ```
 
    两种方式完成后，修改 Rust manager 配置：
@@ -63,6 +66,7 @@ tunasync-rs 与 Go 实现**线路兼容**：Rust manager 可以驱动 Go worker�
 | Cgroup hook | v1/v2 内存限制 | 兼容 |
 | Btrfs/ZFS hook | 同步前后快照 | 兼容 |
 | 线路协议 | JSON REST API | 完全兼容 |
+| 默认端口 | 12345 | 14242 |
 | `tunasynctl` CLI | 相同命令 | 兼容（支持 `-p`、`-w` 短参数） |
 
 ## 设计
@@ -403,6 +407,111 @@ tunasynctl list --status syncing,pre-syncing
 | `cgroup` | 通过 cgroup 限制 CPU/内存 |
 | `btrfs_snapshot` | 同步前后创建 Btrfs 快照 |
 | `zfs_snapshot` | 同步前后创建 ZFS 快照 |
+
+## CLI 参考
+
+### `tunasync`
+
+```
+tunasync — 镜像同步管理工具
+
+Usage: tunasync [OPTIONS] <COMMAND>
+
+Commands:
+  manager  以 manager 模式运行
+  worker   以 worker 模式运行
+
+Options:
+  -v, --verbose       详细日志
+      --with-systemd  为 systemd 抑制时间戳和 ANSI 颜色
+  -h, --help          显示帮助
+  -V, --version       显示版本
+
+tunasync manager [OPTIONS]
+  -c, --config <CONFIG>    配置文件路径 [default: /etc/tunasync/manager.conf]
+      --addr <ADDR>        覆盖监听地址
+      --port <PORT>        覆盖监听端口（默认: 14242）
+      --cert <CERT>        TLS 证书文件（启用 HTTPS）
+      --key <KEY>          TLS 私钥文件（启用 HTTPS）
+      --db-file <DB_FILE>  覆盖数据库文件路径
+      --db-type <DB_TYPE>  覆盖数据库类型: redb, sqlite, redis
+      --debug              启用 debug 级别日志
+      --pidfile <PIDFILE>  PID 文件 [default: /run/tunasync/tunasync.manager.pid]
+      --with-systemd       为 systemd 抑制时间戳和 ANSI 颜色
+
+tunasync worker [OPTIONS]
+  -c, --config <CONFIG>    配置文件路径 [default: /etc/tunasync/worker.conf]
+      --pidfile <PIDFILE>  PID 文件 [default: /run/tunasync/tunasync.worker.pid]
+      --with-systemd       为 systemd 抑制时间戳和 ANSI 颜色
+```
+
+### `tunasynctl`
+
+```
+tunasynctl — tunasync manager 控制工具
+
+Usage: tunasynctl [OPTIONS] <COMMAND>
+
+Commands:
+  list       列出所有镜像任务
+  workers    列出所有已注册 worker
+  flush      清除数据库中已禁用的任务记录
+  rm-worker  从 manager 中移除 worker
+  set-size   更新镜像大小（手动覆盖）
+  start      启动镜像同步任务
+  stop       停止正在运行的镜像任务
+  disable    禁用镜像任务
+  restart    重启镜像任务
+  reload     通知 worker 从磁盘重新加载配置
+
+全局选项:
+  -c, --config <CONFIG>     配置文件（覆盖系统/用户配置）
+  -m, --manager <MANAGER>   Manager 主机/IP [env: TUNASYNC_MANAGER]
+  -p, --port <PORT>         Manager 端口 [env: TUNASYNC_MANAGER_PORT]
+      --ca-cert <CA_CERT>   CA 证书（启用 HTTPS）
+  -v, --verbose             详细日志
+
+tunasynctl list [OPTIONS]
+  -w, --worker <WORKER>     指定 worker
+      --status <STATUS>     按状态过滤（逗号分隔）
+      --format <FORMAT>     输出格式: json（默认）或 table
+      --all                  显示所有 worker 的任务
+
+tunasynctl start <MIRROR> [-w <WORKER>] [-f]
+  MIRROR   镜像名称，或 "all" 广播到所有 worker
+  -f       强制启动（忽略并发限制）
+
+tunasynctl stop <MIRROR> [-w <WORKER>]
+tunasynctl disable <MIRROR> [-w <WORKER>]
+tunasynctl restart <MIRROR> [-w <WORKER>]
+
+tunasynctl set-size <MIRROR> <SIZE> [-w <WORKER>]
+  SIZE   可读大小，如 "1.2T"
+
+tunasynctl rm-worker <WORKER>
+tunasynctl flush
+tunasynctl reload <WORKER>
+```
+
+`tunasynctl` 配置文件优先级：
+
+1. `/etc/tunasync/ctl.conf`（系统级）
+2. `$HOME/.config/tunasync/ctl.conf`（用户级）
+3. `--config FILE`（显式指定）
+4. CLI 参数（`--manager`、`--port`、`--ca-cert`）
+
+### `tunasync-migrate`
+
+```
+Usage: tunasync-migrate <go-manager-url-or-bolt-file> <sqlite-output-file>
+
+Examples:
+  # 离线：直接读取 Go 的 bolt 文件（Go manager 必须已停止）
+  tunasync-migrate /var/lib/tunasync/tunasync.db /var/lib/tunasync/new.db
+
+  # 在线：从运行中的 Go manager 拉取数据
+  tunasync-migrate http://localhost:12345 /var/lib/tunasync/new.db
+```
 
 ## 开发路线
 
