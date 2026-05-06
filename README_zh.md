@@ -10,7 +10,12 @@
 
 ## 下载
 
-Linux（x86_64、aarch64、armv7、riscv64、loongarch64、x86_64-musl、aarch64-musl）的预编译二进制文件可在 [GitHub Releases](https://github.com/JCIOTeam/tunasync/releases) 下载。
+Linux（x86_64、aarch64、armv7、riscv64、loongarch64、x86_64-musl、aarch64-musl）的预编译二进制文件可在 [GitHub Releases](https://github.com/JCIOTeam/tunasync/releases) 下载。每个压缩包仅包含 `tunasync` 和 `tunasynctl`。
+
+`tunasync-migrate` 不包含在发布包中 — 它是一次性迁移工具，大多数用户在切换到 Rust 版本后不再需要。获取方式：
+
+1. 从源码构建：`cargo build --release -p tunasync-migrate`
+2. 从任意成功的 release 构建 [CI artifacts](https://github.com/JCIOTeam/tunasync/actions/workflows/release.yml) 中下载
 
 ## 从 Go 版本迁移
 
@@ -20,7 +25,7 @@ tunasync-rs 与 Go 实现**线路兼容**：Rust manager 可以驱动 Go worker�
 
 ### 迁移步骤
 
-1. **安装 Rust 二进制** — 从 [Releases](https://github.com/JCIOTeam/tunasync/releases) 下载或从源码编译，将 `tunasync`、`tunasynctl` 和 `tunasync-migrate` 复制到 `/usr/bin/`
+1. **安装 Rust 二进制** — 从 [Releases](https://github.com/JCIOTeam/tunasync/releases) 下载 `tunasync` 和 `tunasynctl` 或从源码编译，复制到 `/usr/bin/`。如需 `tunasync-migrate`，单独构建：`cargo build --release -p tunasync-migrate`
 2. **保留配置文件** — Rust 版本读取相同 TOML 格式，无需修改
 3. **迁移数据** — Rust 版本默认使用 redb 作为数据库后端（Go 默认 BoltDB）。如果 Go 版本使用 BoltDB（默认），需要通过 `tunasync-migrate` 导出数据。支持两种方式：
 

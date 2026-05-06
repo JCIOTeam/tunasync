@@ -10,7 +10,12 @@ A Rust port of [`tuna/tunasync`](https://github.com/tuna/tunasync), the mirror j
 
 ## Download
 
-Pre-built binaries for Linux (x86_64, aarch64, armv7, riscv64, loongarch64, x86_64-musl, aarch64-musl) are available at [GitHub Releases](https://github.com/JCIOTeam/tunasync/releases).
+Pre-built binaries for Linux (x86_64, aarch64, armv7, riscv64, loongarch64, x86_64-musl, aarch64-musl) are available at [GitHub Releases](https://github.com/JCIOTeam/tunasync/releases). Each archive contains `tunasync` and `tunasynctl` only.
+
+`tunasync-migrate` is not included in the release archives — it is a one-time migration tool that most users won't need after switching to the Rust version. You can obtain it by:
+
+1. Building from source: `cargo build --release -p tunasync-migrate`
+2. Downloading from the [CI artifacts](https://github.com/JCIOTeam/tunasync/actions/workflows/release.yml) of any successful release build
 
 ## Migrating from the Go version
 
@@ -20,7 +25,7 @@ tunasync-rs is **wire-compatible** with the Go implementation: a Rust manager ca
 
 ### Migration steps
 
-1. **Install the Rust binaries** — download from [Releases](https://github.com/JCIOTeam/tunasync/releases) or build from source, then copy `tunasync`, `tunasynctl`, and `tunasync-migrate` to `/usr/bin/`.
+1. **Install the Rust binaries** — download `tunasync` and `tunasynctl` from [Releases](https://github.com/JCIOTeam/tunasync/releases) or build from source, then copy to `/usr/bin/`. If you need `tunasync-migrate`, build it separately: `cargo build --release -p tunasync-migrate`.
 2. **Keep the config files** — the Rust version reads the same TOML format. No changes needed.
 3. **Migrate data** — the Rust version uses a different default DB backend (redb instead of BoltDB). If the Go version uses BoltDB (the default), you need to export the data with `tunasync-migrate`. Two modes are available:
 
