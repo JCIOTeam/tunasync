@@ -43,7 +43,6 @@ tunasync-rs is **wire-compatible** with the Go implementation: a Rust manager ca
    db_type = "sqlite"
    db_file = "/var/lib/tunasync/new.db"
    ```
-   You can also use `db_type = "redb"` — `tunasync-migrate` produces SQLite, but you only need it as the initial import; subsequent runs write to whatever backend you configure.
 
    **If the Go version uses Redis**, no migration is needed — both versions can share the same Redis instance directly.
 

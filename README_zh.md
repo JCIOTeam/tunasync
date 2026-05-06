@@ -43,7 +43,6 @@ tunasync-rs 与 Go 实现**线路兼容**：Rust manager 可以驱动 Go worker�
    db_type = "sqlite"
    db_file = "/var/lib/tunasync/new.db"
    ```
-   也可以使用 `db_type = "redb"`。`tunasync-migrate` 生成的是 SQLite 格式，仅作为初始导入使用；后续运行会写入你配置的任何后端。
 
    **如果 Go 版本使用 Redis**，则无需迁移 — 两个版本可以直接共享同一个 Redis 实例。
 
