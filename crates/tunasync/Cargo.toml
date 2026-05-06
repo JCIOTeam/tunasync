@@ -18,5 +18,6 @@ tunasync-worker  = { workspace = true }
 
 anyhow  = { workspace = true }
 clap    = { workspace = true }
+rustls  = { workspace = true }
 tokio   = { workspace = true }
 tracing = { workspace = true }

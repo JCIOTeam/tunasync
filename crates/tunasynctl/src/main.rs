@@ -370,6 +370,10 @@ fn print_table_jobs(jobs: &[WebMirrorStatus]) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install ring crypto provider");
+
     let cli = Cli::parse();
     tunasync_common::logger::init(cli.verbose, false);
 

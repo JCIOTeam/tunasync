@@ -91,6 +91,13 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install ring as the rustls crypto provider.  Must happen before any TLS
+    // operation.  We use axum-server's `tls-rustls-no-provider` feature so
+    // aws-lc-rs is never compiled; ring is the sole backend.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install ring crypto provider");
+
     let cli = Cli::parse();
 
     match &cli.command {

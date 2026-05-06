@@ -3,177 +3,183 @@ name: Release
 on:
   push:
     tags: ['v*']
-  release:
-    types: [published]
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
-  # ── Linux targets ──────────────────────────────────────────
+  build:
+    name: Build ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── native x86_64 ────────────────────────────────────────
+          - target:   x86_64-unknown-linux-gnu
+            os:       ubuntu-22.04
+            artifact: tunasync-linux-amd64
 
-  linux-amd64:
-    name: Linux x86_64 (glibc)
-    runs-on: ubuntu-latest
+          - target:   x86_64-unknown-linux-musl
+            os:       ubuntu-22.04
+            artifact: tunasync-linux-amd64-musl
+            apt:      musl-tools
+
+          # ── aarch64 ──────────────────────────────────────────────
+          - target:   aarch64-unknown-linux-gnu
+            os:       ubuntu-22.04
+            artifact: tunasync-linux-aarch64
+            apt:      gcc-aarch64-linux-gnu
+            linker:   aarch64-linux-gnu-gcc
+            cc:       aarch64-linux-gnu-gcc
+            cxx:      aarch64-linux-gnu-g++
+
+          - target:   aarch64-unknown-linux-musl
+            os:       ubuntu-22.04
+            artifact: tunasync-linux-aarch64-musl
+            apt:      gcc-aarch64-linux-gnu musl-tools
+            linker:   aarch64-linux-gnu-gcc
+            cc:       aarch64-linux-gnu-gcc
+            cxx:      aarch64-linux-gnu-g++
+            musl_target: aarch64
+
+          # ── armv7 ────────────────────────────────────────────────
+          - target:   armv7-unknown-linux-gnueabihf
+            os:       ubuntu-22.04
+            artifact: tunasync-linux-armv7
+            apt:      gcc-arm-linux-gnueabihf
+            linker:   arm-linux-gnueabihf-gcc
+            cc:       arm-linux-gnueabihf-gcc
+            cxx:      arm-linux-gnueabihf-g++
+
+          # ── riscv64 ──────────────────────────────────────────────
+          - target:   riscv64gc-unknown-linux-gnu
+            os:       ubuntu-22.04
+            artifact: tunasync-linux-riscv64
+            apt:      gcc-riscv64-linux-gnu
+            linker:   riscv64-linux-gnu-gcc
+            cc:       riscv64-linux-gnu-gcc
+            cxx:      riscv64-linux-gnu-g++
+
+          # ── loongarch64 ──────────────────────────────────────────
+          # Requires ubuntu-24.04 (first Ubuntu release with LoongArch
+          # cross-compiler in the main apt repo).
+          # aws-lc-rs is NOT used (switched to ring backend) so no
+          # BoringSSL cmake cross-compilation is needed.
+          - target:   loongarch64-unknown-linux-gnu
+            os:       ubuntu-24.04
+            artifact: tunasync-linux-loongarch64
+            apt:      gcc-14-loongarch64-linux-gnu g++-14-loongarch64-linux-gnu
+            linker:   loongarch64-linux-gnu-gcc-14
+            cc:       loongarch64-linux-gnu-gcc-14
+            cxx:      loongarch64-linux-gnu-g++-14
+
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release
-      - run: cd target/release && tar czf tunasync-linux-amd64.tar.gz tunasync tunasynctl
-      - uses: actions/upload-artifact@v4
-        with:
-          name: tunasync-linux-amd64
-          path: target/release/tunasync-linux-amd64.tar.gz
 
-  linux-amd64-musl:
-    name: Linux x86_64 (musl, static)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo build --release --target x86_64-unknown-linux-musl
-      - run: cd target/x86_64-unknown-linux-musl/release && tar czf tunasync-linux-amd64-musl.tar.gz tunasync tunasynctl
-      - uses: actions/upload-artifact@v4
-        with:
-          name: tunasync-linux-amd64-musl
-          path: target/x86_64-unknown-linux-musl/release/tunasync-linux-amd64-musl.tar.gz
+          targets: ${{ matrix.target }}
 
-  linux-aarch64:
-    name: Linux aarch64
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-      - run: cargo build --release --target aarch64-unknown-linux-gnu
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: Configure cross linker
+        if: matrix.linker != ''
+        run: |
+          mkdir -p .cargo
+          printf '[target.${{ matrix.target }}]\nlinker = "%s"\n' \
+            "${{ matrix.linker }}" >> .cargo/config.toml
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-      - run: cd target/aarch64-unknown-linux-gnu/release && tar czf tunasync-linux-aarch64.tar.gz tunasync tunasynctl
+          # C/C++ compilers for ring's (and any other C dep's) cross build.
+          # Variable names use the target triple with hyphens → underscores.
+          CC_x86_64_unknown_linux_gnu:            gcc
+          CC_x86_64_unknown_linux_musl:           musl-gcc
+          CC_aarch64_unknown_linux_gnu:           ${{ matrix.cc }}
+          CC_aarch64_unknown_linux_musl:          ${{ matrix.cc }}
+          CC_armv7_unknown_linux_gnueabihf:       ${{ matrix.cc }}
+          CC_riscv64gc_unknown_linux_gnu:         ${{ matrix.cc }}
+          CC_loongarch64_unknown_linux_gnu:       ${{ matrix.cc }}
+          CXX_aarch64_unknown_linux_gnu:          ${{ matrix.cxx }}
+          CXX_aarch64_unknown_linux_musl:         ${{ matrix.cxx }}
+          CXX_armv7_unknown_linux_gnueabihf:      ${{ matrix.cxx }}
+          CXX_riscv64gc_unknown_linux_gnu:        ${{ matrix.cxx }}
+          CXX_loongarch64_unknown_linux_gnu:      ${{ matrix.cxx }}
+
+      - name: Package
+        run: |
+          DIR="target/${{ matrix.target }}/release"
+          tar -czf "${{ matrix.artifact }}.tar.gz" \
+            -C "$DIR" tunasync tunasynctl
+          sha256sum "${{ matrix.artifact }}.tar.gz" \
+            > "${{ matrix.artifact }}.tar.gz.sha256"
+
       - uses: actions/upload-artifact@v4
         with:
-          name: tunasync-linux-aarch64
-          path: target/aarch64-unknown-linux-gnu/release/tunasync-linux-aarch64.tar.gz
-
-  linux-armv7:
-    name: Linux armv7 (armhf)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: armv7-unknown-linux-gnueabihf
-      - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf
-      - run: cargo build --release --target armv7-unknown-linux-gnueabihf
-        env:
-          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
-      - run: cd target/armv7-unknown-linux-gnueabihf/release && tar czf tunasync-linux-armv7.tar.gz tunasync tunasynctl
-      - uses: actions/upload-artifact@v4
-        with:
-          name: tunasync-linux-armv7
-          path: target/armv7-unknown-linux-gnueabihf/release/tunasync-linux-armv7.tar.gz
-
-  linux-riscv64:
-    name: Linux riscv64
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: riscv64gc-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y gcc-riscv64-linux-gnu
-      - run: cargo build --release --target riscv64gc-unknown-linux-gnu
-        env:
-          CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
-      - run: cd target/riscv64gc-unknown-linux-gnu/release && tar czf tunasync-linux-riscv64.tar.gz tunasync tunasynctl
-      - uses: actions/upload-artifact@v4
-        with:
-          name: tunasync-linux-riscv64
-          path: target/riscv64gc-unknown-linux-gnu/release/tunasync-linux-riscv64.tar.gz
-
-  # ── Release ────────────────────────────────────────────────
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.tar.gz.sha256
 
   release:
-    name: Create GitHub Release
+    name: Publish GitHub Release
     runs-on: ubuntu-latest
-    needs:
-      - linux-amd64
-      - linux-amd64-musl
-      - linux-aarch64
-      - linux-armv7
-      - linux-riscv64
+    needs: build
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
       - name: Get previous tag
-        id: prev_tag
+        id: prev
         run: |
-          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
-          echo "prev_tag=${PREV_TAG}" >> $GITHUB_OUTPUT
-      - name: Generate changelog
-        id: changelog
+          prev=$(git tag --sort=-version:refname | grep -v "^${{ github.ref_name }}$" | head -1)
+          echo "tag=${prev}" >> $GITHUB_OUTPUT
+
+      - name: Build changelog
+        id: log
         run: |
-          if [ -n "${{ steps.prev_tag.outputs.prev_tag }}" ]; then
-            LOG=$(git log ${{ steps.prev_tag.outputs.prev_tag }}..HEAD --oneline --format="- %s")
+          if [ -n "${{ steps.prev.outputs.tag }}" ]; then
+            range="${{ steps.prev.outputs.tag }}..${{ github.ref_name }}"
           else
-            LOG=$(git log --oneline -50 --format="- %s")
+            range="HEAD~20..HEAD"
           fi
-          # Multiline output needs heredoc
           {
-            echo "changelog<<EOF"
-            echo "$LOG"
+            echo "body<<EOF"
+            echo "## What's changed"
+            echo ""
+            git log "$range" --pretty="format:- %s" --no-merges
+            echo ""
+            echo ""
+            echo "**Full diff**: [${{ steps.prev.outputs.tag }}...${{ github.ref_name }}](../../compare/${{ steps.prev.outputs.tag }}...${{ github.ref_name }})"
             echo "EOF"
           } >> $GITHUB_OUTPUT
-      - name: Get contributors
-        id: contributors
-        run: |
-          if [ -n "${{ steps.prev_tag.outputs.prev_tag }}" ]; then
-            CONTRIB=$(git log --format="%aN" ${{ steps.prev_tag.outputs.prev_tag }}..HEAD | sort -u | tr '\n' ', ' | sed 's/,$//')
-          else
-            CONTRIB=$(git log --format="%aN" | sort -u | tr '\n' ', ' | sed 's/,$//')
-          fi
-          echo "contributors=${CONTRIB}" >> $GITHUB_OUTPUT
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh artifacts/
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.tar.gz
-          body: |
-            ## tunasync-rs release
-
-            Wire-compatible Rust port of tuna/tunasync.
-
-            ### Changes since ${{ steps.prev_tag.outputs.prev_tag || 'initial release' }}
-
-            ${{ steps.changelog.outputs.changelog }}
-
-            ### Contributors
-
-            ${{ steps.contributors.outputs.contributors }}
-
-            ### Downloads
-
-            | File | Arch | Notes |
-            |------|------|-------|
-            | `tunasync-linux-amd64.tar.gz` | x86_64 | glibc, standard servers |
-            | `tunasync-linux-amd64-musl.tar.gz` | x86_64 | static, container-friendly |
-            | `tunasync-linux-aarch64.tar.gz` | aarch64 | ARM64 servers |
-            | `tunasync-linux-armv7.tar.gz` | armv7 | ARM32 (armhf) |
-            | `tunasync-linux-riscv64.tar.gz` | riscv64 | RISC-V |
-
-            Each tarball contains `tunasync` (manager/worker) and `tunasynctl` (CLI).
+          body: ${{ steps.log.outputs.body }}
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.sha256

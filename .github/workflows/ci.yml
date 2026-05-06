@@ -8,18 +8,20 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: short
 
 jobs:
-  check:
-    name: Check & Clippy
+  lint:
+    name: Lint (fmt + clippy)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace
+      - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace -- -D warnings
 
   test:
@@ -31,12 +33,50 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
-  fmt:
-    name: Formatting
-    runs-on: ubuntu-latest
+  # Lightweight cross-compile check for every release target.
+  # cargo check (no link) is enough to catch type/API errors early.
+  cross-check:
+    name: Cross-check ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            apt: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-22.04
+            apt: gcc-arm-linux-gnueabihf
+            linker: arm-linux-gnueabihf-gcc
+
+          - target: riscv64gc-unknown-linux-gnu
+            os: ubuntu-22.04
+            apt: gcc-riscv64-linux-gnu
+            linker: riscv64-linux-gnu-gcc
+
+          - target: loongarch64-unknown-linux-gnu
+            os: ubuntu-24.04
+            apt: gcc-14-loongarch64-linux-gnu
+            linker: loongarch64-linux-gnu-gcc-14
+
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cross-${{ matrix.target }}
+      - name: Install cross-compiler
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y ${{ matrix.apt }}
+      - name: Configure linker
+        run: |
+          mkdir -p .cargo
+          printf '[target.${{ matrix.target }}]\nlinker = "%s"\n' \
+            "${{ matrix.linker }}" >> .cargo/config.toml
+      - run: cargo check --workspace --target ${{ matrix.target }}
