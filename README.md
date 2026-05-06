@@ -10,7 +10,7 @@ A Rust port of [`tuna/tunasync`](https://github.com/tuna/tunasync), the mirror j
 
 ## Download
 
-Pre-built binaries for Linux (x86_64, aarch64, armv7, riscv64, loongarch64, musl) and macOS are available at [GitHub Releases](https://github.com/JCIOTeam/tunasync/releases).
+Pre-built binaries for Linux (x86_64, aarch64, armv7, riscv64, loongarch64, x86_64-musl, aarch64-musl) are available at [GitHub Releases](https://github.com/JCIOTeam/tunasync/releases).
 
 ## Migrating from the Go version
 
@@ -202,8 +202,12 @@ command = "wget -m -np -nd https://example.com/repo/ -P /path/to/mirror"
 # size_pattern = "Total size: ([\\d.]+[KMG])"  # Extract size from log
 # success_exit_codes = [0, 1, 2]         # Treat these exit codes as success
 # env = { "MY_VAR" = "value" }           # Extra environment variables
-# The command runs with TUNASYNC_WORKING_DIR, TUNASYNC_UPSTREAM_URL,
-# TUNASYNC_LOG_FILE etc. set as environment variables.
+# The following environment variables are always injected by tunasync:
+#   TUNASYNC_MIRROR_NAME    Mirror name (same as [[mirrors]] name field)
+#   TUNASYNC_WORKING_DIR    Effective mirror data directory
+#   TUNASYNC_UPSTREAM_URL   upstream field value
+#   TUNASYNC_LOG_DIR        Log directory (parent of the log file)
+#   TUNASYNC_LOG_FILE       Full path to the current log file
 
 # Two-stage rsync (for large repos like Debian)
 [[mirrors]]
@@ -288,7 +292,8 @@ tunasynctl stop elvish -p 14242
 tunasynctl disable elvish -p 14242
 
 # Reload worker config (hot-reload without restart)
-tunasynctl reload -p 14242
+# worker ID is required — use the name= value from [global] in worker.conf
+tunasynctl reload test_worker -p 14242
 ```
 
 ### Security
@@ -364,6 +369,29 @@ crates/
 | `command` | Arbitrary shell command |
 | `rsync` | Classic rsync mirror |
 | `two-stage-rsync` | Stage-1 (quick list) + Stage-2 (full sync) |
+
+### Mirror sync status
+
+Each mirror job has exactly one status at any point in time. The status is shown by `tunasynctl list` and exposed in the manager HTTP API.
+
+| Status | Wire value | Meaning |
+|--------|-----------|---------|
+| `None` | `"none"` | Job registered but never run (e.g. worker just started) |
+| `PreSyncing` | `"pre-syncing"` | Pre-sync hooks running (before the main sync command starts) |
+| `Syncing` | `"syncing"` | Main sync command running (includes post-exec hooks) |
+| `Success` | `"success"` | Last sync completed successfully |
+| `Failed` | `"failed"` | Last sync failed; `error_msg` contains the reason |
+| `Paused` | `"paused"` | Sync paused by operator (`tunasynctl stop`) |
+| `Disabled` | `"disabled"` | Job disabled (`tunasynctl disable`); will not run until re-enabled |
+
+Normal lifecycle: `None → PreSyncing → Syncing → Success / Failed → (next schedule) → PreSyncing → …`
+
+A `Failed` mirror keeps its `error_msg` until the next successful sync clears it. You can filter by status in `tunasynctl list`:
+
+```bash
+tunasynctl list --status failed
+tunasynctl list --status syncing,pre-syncing
+```
 
 ### Hooks
 

@@ -10,7 +10,7 @@
 
 ## 下载
 
-Linux（x86_64、aarch64、armv7、riscv64、loongarch64、musl 静态版）和 macOS 的预编译二进制文件可在 [GitHub Releases](https://github.com/JCIOTeam/tunasync/releases) 下载。
+Linux（x86_64、aarch64、armv7、riscv64、loongarch64、x86_64-musl、aarch64-musl）的预编译二进制文件可在 [GitHub Releases](https://github.com/JCIOTeam/tunasync/releases) 下载。
 
 ## 从 Go 版本迁移
 
@@ -202,8 +202,12 @@ command = "wget -m -np -nd https://example.com/repo/ -P /path/to/mirror"
 # size_pattern = "Total size: ([\\d.]+[KMG])"  # 从日志提取大小
 # success_exit_codes = [0, 1, 2]         # 将这些退出码视为成功
 # env = { "MY_VAR" = "value" }           # 附加环境变量
-# 命令执行时会注入 TUNASYNC_WORKING_DIR、TUNASYNC_UPSTREAM_URL、
-# TUNASYNC_LOG_FILE 等环境变量供脚本使用。
+# tunasync 始终注入以下环境变量供命令使用：
+#   TUNASYNC_MIRROR_NAME    镜像名称（即 [[mirrors]] 的 name 字段）
+#   TUNASYNC_WORKING_DIR    镜像数据目录（生效路径）
+#   TUNASYNC_UPSTREAM_URL   upstream 字段值
+#   TUNASYNC_LOG_DIR        日志目录（日志文件的父目录）
+#   TUNASYNC_LOG_FILE       当前日志文件的完整路径
 
 # 两阶段 rsync（适用于 Debian 等大型仓库）
 [[mirrors]]
@@ -288,7 +292,8 @@ tunasynctl stop elvish -p 14242
 tunasynctl disable elvish -p 14242
 
 # 热重载 Worker 配置（无需重启）
-tunasynctl reload -p 14242
+# 需要指定 worker ID，即 worker.conf 中 [global] name 字段的值
+tunasynctl reload test_worker -p 14242
 ```
 
 ### 安全
@@ -364,6 +369,29 @@ crates/
 | `command` | 执行任意 shell 命令 |
 | `rsync` | 经典 rsync 镜像同步 |
 | `two-stage-rsync` | 两阶段 rsync：第一阶段快速列表，第二阶段完整同步 |
+
+### 镜像同步状态
+
+每个镜像任务在任意时刻只有一种状态，通过 `tunasynctl list` 显示，也可通过 manager HTTP API 查询。
+
+| 状态 | 线路值 | 含义 |
+|------|--------|------|
+| `None` | `"none"` | 任务已注册但从未运行（如 worker 刚启动） |
+| `PreSyncing` | `"pre-syncing"` | 同步前钩子正在运行（主同步命令尚未启动） |
+| `Syncing` | `"syncing"` | 主同步命令正在执行（含 post-exec 钩子） |
+| `Success` | `"success"` | 上次同步成功完成 |
+| `Failed` | `"failed"` | 上次同步失败；`error_msg` 字段包含原因 |
+| `Paused` | `"paused"` | 被运维人员暂停（`tunasynctl stop`） |
+| `Disabled` | `"disabled"` | 任务被禁用（`tunasynctl disable`），重新启用前不会运行 |
+
+正常生命周期：`None → PreSyncing → Syncing → Success / Failed → （下次调度）→ PreSyncing → …`
+
+`Failed` 状态的镜像会保留 `error_msg`，直到下次同步成功才会清除。可通过 `--status` 过滤：
+
+```bash
+tunasynctl list --status failed
+tunasynctl list --status syncing,pre-syncing
+```
 
 ### Hook（钩子）
 
