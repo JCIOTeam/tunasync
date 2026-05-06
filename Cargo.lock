@@ -1926,7 +1926,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tunasync"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -1939,7 +1939,7 @@ dependencies = [
 
 [[package]]
 name = "tunasync-common"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1954,7 +1954,7 @@ dependencies = [
 
 [[package]]
 name = "tunasync-manager"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1977,7 +1977,7 @@ dependencies = [
 
 [[package]]
 name = "tunasync-migrate"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1991,7 +1991,7 @@ dependencies = [
 
 [[package]]
 name = "tunasync-protocol"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "chrono",
  "serde",
@@ -2001,7 +2001,7 @@ dependencies = [
 
 [[package]]
 name = "tunasync-worker"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2029,7 +2029,7 @@ dependencies = [
 
 [[package]]
 name = "tunasynctl"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "clap",
