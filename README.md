@@ -18,17 +18,38 @@ tunasync-rs is **wire-compatible** with the Go implementation: a Rust manager ca
 
 ### Migration steps
 
-1. **Stop the Go services** — `systemctl stop tunasync-manager tunasync-worker`.
-2. **Install the Rust binaries** — download from [Releases](https://github.com/JCIOTeam/tunasync/releases) or build from source, then copy `tunasync`, `tunasynctl`, and `tunasync-migrate` to `/usr/bin/`.
-3. **Keep the config files** — the Rust version reads the same TOML format. No changes needed.
-4. **Migrate data** — if the Go version uses BoltDB (the default), use the migration tool to preserve worker and mirror state:
+1. **Install the Rust binaries** — download from [Releases](https://github.com/JCIOTeam/tunasync/releases) or build from source, then copy `tunasync`, `tunasynctl`, and `tunasync-migrate` to `/usr/bin/`.
+2. **Keep the config files** — the Rust version reads the same TOML format. No changes needed.
+3. **Migrate data** — the Rust version uses a different default DB backend (redb instead of BoltDB). If the Go version uses BoltDB (the default), you need to export the data with `tunasync-migrate`. Two modes are available:
+
+   **Option A — Offline migration (recommended, no downtime constraint):**
+   Stop the Go manager first, then read the bolt file directly:
    ```bash
-   # While Go manager is still running:
-   tunasync-migrate http://localhost:14242 /path/to/tunasync.db
+   systemctl stop tunasync-manager tunasync-worker
+
+   # Point at the Go bolt file (default: /var/lib/tunasync/tunasync.db)
+   tunasync-migrate /var/lib/tunasync/tunasync.db /var/lib/tunasync/new.db
    ```
-   Then set `db_type = "sqlite"` and `db_file = "/path/to/tunasync.db"` in the Rust manager config. If the Go version uses Redis, no migration is needed — both versions can share the same Redis instance.
-5. **Restart** — `systemctl start tunasync-manager tunasync-worker`.
-6. **Verify** — `tunasynctl list --all -p <port>` should show all mirrors.
+
+   **Option B — Online migration (Go manager still running):**
+   Useful when you want to prepare the new DB while the Go version is still serving:
+   ```bash
+   tunasync-migrate http://localhost:14242 /var/lib/tunasync/new.db
+   ```
+
+   After either option, update the Rust manager config:
+   ```toml
+   [files]
+   db_type = "sqlite"
+   db_file = "/var/lib/tunasync/new.db"
+   ```
+   You can also use `db_type = "redb"` — `tunasync-migrate` produces SQLite, but you only need it as the initial import; subsequent runs write to whatever backend you configure.
+
+   **If the Go version uses Redis**, no migration is needed — both versions can share the same Redis instance directly.
+
+4. **Stop the Go services** (if you haven't already) — `systemctl stop tunasync-manager tunasync-worker`.
+5. **Start the Rust services** — `systemctl start tunasync-manager tunasync-worker`.
+6. **Verify** — `tunasynctl list` should show all mirrors with their last-sync timestamps preserved.
 
 ### Compatibility notes
 

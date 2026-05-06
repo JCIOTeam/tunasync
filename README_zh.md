@@ -18,17 +18,38 @@ tunasync-rs 与 Go 实现**线路兼容**：Rust manager 可以驱动 Go worker�
 
 ### 迁移步骤
 
-1. **停止 Go 服务** — `systemctl stop tunasync-manager tunasync-worker`
-2. **安装 Rust 二进制** — 从 [Releases](https://github.com/JCIOTeam/tunasync/releases) 下载或从源码编译，将 `tunasync`、`tunasynctl` 和 `tunasync-migrate` 复制到 `/usr/bin/`
-3. **保留配置文件** — Rust 版本读取相同 TOML 格式，无需修改。
-4. **迁移数据** — 如果 Go 版本使用 BoltDB（默认），使用迁移工具保留 worker 和镜像状态：
+1. **安装 Rust 二进制** — 从 [Releases](https://github.com/JCIOTeam/tunasync/releases) 下载或从源码编译，将 `tunasync`、`tunasynctl` 和 `tunasync-migrate` 复制到 `/usr/bin/`
+2. **保留配置文件** — Rust 版本读取相同 TOML 格式，无需修改
+3. **迁移数据** — Rust 版本默认使用 redb 作为数据库后端（Go 默认 BoltDB）。如果 Go 版本使用 BoltDB（默认），需要通过 `tunasync-migrate` 导出数据。支持两种方式：
+
+   **方式 A — 离线迁移（推荐，无停机时间要求）：**
+   先停止 Go manager，直接读取 bolt 数据库文件：
    ```bash
-   # Go manager 还在运行时执行：
-   tunasync-migrate http://localhost:14242 /path/to/tunasync.db
+   systemctl stop tunasync-manager tunasync-worker
+
+   # 指向 Go 的 bolt 文件（默认路径：/var/lib/tunasync/tunasync.db）
+   tunasync-migrate /var/lib/tunasync/tunasync.db /var/lib/tunasync/new.db
    ```
-   然后在 Rust manager 配置中设置 `db_type = "sqlite"` 和 `db_file = "/path/to/tunasync.db"`。如果 Go 版本使用 Redis，无需迁移 — 两个版本可以共享同一个 Redis 实例。
-5. **重启** — `systemctl start tunasync-manager tunasync-worker`
-6. **验证** — `tunasynctl list --all -p <端口>` 应显示所有镜像
+
+   **方式 B — 在线迁移（Go manager 仍在运行）：**
+   适合在 Go 版本继续提供服务的同时准备好新数据库：
+   ```bash
+   tunasync-migrate http://localhost:14242 /var/lib/tunasync/new.db
+   ```
+
+   两种方式完成后，修改 Rust manager 配置：
+   ```toml
+   [files]
+   db_type = "sqlite"
+   db_file = "/var/lib/tunasync/new.db"
+   ```
+   也可以使用 `db_type = "redb"`。`tunasync-migrate` 生成的是 SQLite 格式，仅作为初始导入使用；后续运行会写入你配置的任何后端。
+
+   **如果 Go 版本使用 Redis**，则无需迁移 — 两个版本可以直接共享同一个 Redis 实例。
+
+4. **停止 Go 服务**（如果尚未停止） — `systemctl stop tunasync-manager tunasync-worker`
+5. **启动 Rust 服务** — `systemctl start tunasync-manager tunasync-worker`
+6. **验证** — `tunasynctl list` 应显示所有镜像及其上次同步时间
 
 ### 兼容性对照
 

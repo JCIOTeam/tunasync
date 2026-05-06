@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Migrate data from a Go tunasync manager to a Rust SQLite database"
+description = "Migrate data from a Go tunasync manager (online via HTTP or offline via BoltDB file) to SQLite"
 
 [dependencies]
 reqwest = { workspace = true }
