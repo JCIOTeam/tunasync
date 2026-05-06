@@ -9,13 +9,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::status::SyncStatus;
 
-// ---------------------------------------------------------------------------
 // Status messages (worker → manager → client)
-// ---------------------------------------------------------------------------
 
 /// A sync status update reported by a worker for one of its mirrors.
 ///
-/// Wire-compatible with Go's `internal.MirrorStatus`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MirrorStatus {
     /// Mirror name (e.g. `"ubuntu"`).
@@ -49,7 +46,6 @@ pub struct MirrorStatus {
 
 /// A worker registered with the manager.
 ///
-/// Wire-compatible with Go's `internal.WorkerStatus`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerStatus {
     /// Worker ID (unique across the deployment).
@@ -64,9 +60,7 @@ pub struct WorkerStatus {
     pub last_register: DateTime<Utc>,
 }
 
-// ---------------------------------------------------------------------------
 // Schedules (worker → manager)
-// ---------------------------------------------------------------------------
 
 /// A batch of mirror schedules announced by a worker on startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,13 +82,10 @@ pub struct MirrorSchedule {
     pub next_schedule: DateTime<Utc>,
 }
 
-// ---------------------------------------------------------------------------
 // Commands (manager → worker, client → manager)
-// ---------------------------------------------------------------------------
 
 /// Action verb for a job/worker command.
-///
-/// Wire-compatible with Go's `internal.CmdVerb`. JSON encoding is the
+/// JSON encoding is the
 /// lower-case verb string. Note that Go uses `iota` for the in-memory
 /// representation (so `CmdStart == 0`), but the wire format is always the
 /// string — which is what we serialise here.

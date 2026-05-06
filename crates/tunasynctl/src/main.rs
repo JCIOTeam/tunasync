@@ -2,13 +2,81 @@
 //!
 //! Wire-compatible with Go's `cmd/tunasynctl/tunasynctl.go`.
 //! All subcommands use the same JSON API that the Go manager exposes.
+//!
+//! Config file priority (matches Go exactly):
+//!   1. `/etc/tunasync/ctl.conf`          (system-wide)
+//!   2. `$HOME/.config/tunasync/ctl.conf` (user-specific)
+//!   3. `--config FILE`                   (explicit override)
+//!   4. CLI flags (`--manager`, `--port`, `--ca-cert`)
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use serde::Deserialize;
 use tunasync_protocol::{ClientCmd, CmdVerb, MirrorStatus, WebMirrorStatus, WorkerStatus};
+
+// ---------------------------------------------------------------------------
+// tunasynctl config file  (TOML, matches Go's `config` struct)
+// ---------------------------------------------------------------------------
+
+/// Configuration loaded from `/etc/tunasync/ctl.conf` or
+/// `~/.config/tunasync/ctl.conf`.  Field names match Go's TOML tags exactly.
+#[derive(Debug, Default, Deserialize)]
+struct CtlConfig {
+    #[serde(default)]
+    manager_addr: String,
+    #[serde(default)]
+    manager_port: Option<u16>,
+    #[serde(default)]
+    ca_cert: String,
+}
+
+impl CtlConfig {
+    /// Load and merge config files in Go's priority order.
+    ///
+    /// Later sources override earlier ones:
+    ///   1. system (`/etc/tunasync/ctl.conf`)
+    ///   2. user   (`$HOME/.config/tunasync/ctl.conf`)
+    ///   3. explicit `--config FILE`
+    fn load(explicit: Option<&PathBuf>) -> Self {
+        let mut merged = Self::default();
+
+        let system_path = PathBuf::from("/etc/tunasync/ctl.conf");
+        let user_path = std::env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join(".config/tunasync/ctl.conf"))
+            .unwrap_or_default();
+
+        for path in [Some(system_path), Some(user_path), explicit.cloned()]
+            .into_iter()
+            .flatten()
+        {
+            if path.exists() {
+                match tunasync_common::config::load_toml::<CtlConfig>(&path) {
+                    Ok(cfg) => {
+                        tracing::debug!(path = %path.display(), "loaded ctl config");
+                        if !cfg.manager_addr.is_empty() {
+                            merged.manager_addr = cfg.manager_addr;
+                        }
+                        if cfg.manager_port.is_some() {
+                            merged.manager_port = cfg.manager_port;
+                        }
+                        if !cfg.ca_cert.is_empty() {
+                            merged.ca_cert = cfg.ca_cert;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), error = %e, "failed to load ctl config");
+                    }
+                }
+            }
+        }
+
+        merged
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CLI shape
@@ -22,22 +90,23 @@ use tunasync_protocol::{ClientCmd, CmdVerb, MirrorStatus, WebMirrorStatus, Worke
     long_about = None,
 )]
 struct Cli {
-    /// Manager HTTP(S) base URL, e.g. `https://manager.example.com:14242`.
-    #[arg(long, env = "TUNASYNC_MANAGER_URL", global = true)]
+    /// Explicit config file (overrides system and user config files).
+    /// Matches Go's `--config / -c` flag.
+    #[arg(short, long, global = true)]
+    config: Option<PathBuf>,
+
+    /// Manager host or IP address (Go: `--manager / -m`).
+    /// Combined with --port to build the base URL unless it already
+    /// contains a scheme (http:// / https://).
+    #[arg(short, long, env = "TUNASYNC_MANAGER", global = true)]
     manager: Option<String>,
 
-    /// Manager port (combined with --manager host when manager has no port).
-    /// Short flag `-p` matches Go's tunasynctl CLI.
-    #[arg(
-        short,
-        long,
-        env = "TUNASYNC_MANAGER_PORT",
-        global = true,
-        default_value = "14242"
-    )]
-    port: u16,
+    /// Manager port (Go: `--port / -p`).
+    #[arg(short, long, env = "TUNASYNC_MANAGER_PORT", global = true)]
+    port: Option<u16>,
 
-    /// CA cert for pinning the manager's TLS certificate.
+    /// CA cert for pinning the manager's TLS certificate (Go: `--ca-cert`).
+    /// When set the base URL scheme is upgraded to https.
     #[arg(long, global = true)]
     ca_cert: Option<PathBuf>,
 
@@ -237,15 +306,19 @@ impl Client {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn build_base_url(cli: &Cli) -> String {
-    if let Some(m) = &cli.manager {
-        // If manager already contains a port, use as-is.
-        if m.starts_with("http://") || m.starts_with("https://") {
-            return m.trim_end_matches('/').to_owned();
-        }
-        return format!("http://{}:{}", m, cli.port);
+/// Build the manager base URL from the resolved config + CLI flags.
+///
+/// Logic matches Go's tunasynctl `initialize()`:
+///   - If ca_cert is set → https scheme
+///   - Otherwise → http scheme
+///   - Host defaults to "localhost", port defaults to 14242
+fn build_base_url(addr: &str, port: u16, has_ca_cert: bool) -> String {
+    // If addr already contains a scheme, use it as-is.
+    if addr.starts_with("http://") || addr.starts_with("https://") {
+        return addr.trim_end_matches('/').to_owned();
     }
-    format!("http://127.0.0.1:{}", cli.port)
+    let scheme = if has_ca_cert { "https" } else { "http" };
+    format!("{scheme}://{addr}:{port}")
 }
 
 /// Resolve the worker ID for a per-mirror command.
@@ -304,8 +377,35 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     tunasync_common::logger::init(cli.verbose, false);
 
-    let base_url = build_base_url(&cli);
-    let client = Client::new(base_url, cli.ca_cert.as_ref())?;
+    // ── Config resolution (matches Go's `initialize`) ──────────────────────
+    // Load config files, then apply CLI overrides.
+    let file_cfg = CtlConfig::load(cli.config.as_ref());
+
+    // Effective manager address: CLI > config file > default "localhost".
+    let manager_addr = cli.manager.clone().unwrap_or_else(|| {
+        if !file_cfg.manager_addr.is_empty() {
+            file_cfg.manager_addr.clone()
+        } else {
+            "localhost".to_owned()
+        }
+    });
+
+    // Effective port: CLI > config file > default 14242.
+    let manager_port = cli.port.or(file_cfg.manager_port).unwrap_or(14242);
+
+    // Effective CA cert: CLI > config file > none.
+    let ca_cert_path: Option<PathBuf> = cli.ca_cert.clone().or_else(|| {
+        if !file_cfg.ca_cert.is_empty() {
+            Some(PathBuf::from(&file_cfg.ca_cert))
+        } else {
+            None
+        }
+    });
+
+    let base_url = build_base_url(&manager_addr, manager_port, ca_cert_path.is_some());
+    tracing::info!(%base_url, "connecting to manager");
+
+    let client = Client::new(base_url, ca_cert_path.as_ref())?;
 
     match &cli.command {
         // ── list ──────────────────────────────────────────────────────────

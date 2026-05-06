@@ -38,7 +38,7 @@ tunasync-rs is **wire-compatible** with the Go implementation: a Rust manager ca
 | `[include]` section | Glob-based mirror configs | ✅ Supported |
 | `{{.Name}}` in log_dir | Template expansion | ✅ Supported |
 | SIGHUP hot-reload | Reload mirror config | ✅ Supported |
-| DB backends | BoltDB, Redis, MySQL | redb, sqlite, redis (no MySQL yet) |
+| DB backends | BoltDB, LevelDB, Badger, Redis | redb, sqlite, redis |
 | Docker hook | Container wrapping | ✅ Compatible |
 | Cgroup hook | v1/v2 memory limit | ✅ Compatible |
 | Btrfs/ZFS hooks | Snapshot before/after | ✅ Compatible |
@@ -177,11 +177,13 @@ use_ipv4 = true
 name = "myrepo"
 provider = "command"
 upstream = "https://example.com/repo/"
-command = "wget -m -np -nd {{upstream}} -P {{working_dir}}"
+command = "wget -m -np -nd https://example.com/repo/ -P /path/to/mirror"
 # fail_on_match = "error|failed"         # Fail if regex matches log output
 # size_pattern = "Total size: ([\\d.]+[KMG])"  # Extract size from log
 # success_exit_codes = [0, 1, 2]         # Treat these exit codes as success
 # env = { "MY_VAR" = "value" }           # Extra environment variables
+# The command runs with TUNASYNC_WORKING_DIR, TUNASYNC_UPSTREAM_URL,
+# TUNASYNC_LOG_FILE etc. set as environment variables.
 
 # Two-stage rsync (for large repos like Debian)
 [[mirrors]]
@@ -197,7 +199,7 @@ use_ipv4 = true
 # name = "docker-mirror"
 # provider = "command"
 # upstream = "https://example.com/"
-# command = "sync-script {{upstream}}"
+# command = "sync-script $TUNASYNC_UPSTREAM_URL"
 # docker_image = "sync-runner:latest"    # Docker image (enables docker hook)
 # docker_volumes = ["/data:/data"]       # Per-mirror Docker volumes
 # docker_options = ["--network=host"]    # Per-mirror Docker options

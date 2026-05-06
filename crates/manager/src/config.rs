@@ -64,6 +64,14 @@ impl Default for ServerConfig {
 /// Filesystem paths owned by the manager.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilesConfig {
+    /// Path to the JSON status file written by the manager.
+    ///
+    /// Matches Go's `FileConfig.StatusFile` (`toml:"status_file"`).
+    /// Default: `/var/lib/tunasync/tunasync.json`.
+    /// External tools (e.g. status pages) may read this file.
+    #[serde(default = "FilesConfig::default_status_file")]
+    pub status_file: PathBuf,
+
     #[serde(default = "FilesConfig::default_db_file")]
     pub db_file: PathBuf,
     /// "redb" (default), "sqlite", or "redis".
@@ -78,6 +86,9 @@ pub struct FilesConfig {
 }
 
 impl FilesConfig {
+    fn default_status_file() -> PathBuf {
+        PathBuf::from("/var/lib/tunasync/tunasync.json")
+    }
     fn default_db_file() -> PathBuf {
         PathBuf::from("/var/lib/tunasync/tunasync.db")
     }
@@ -89,6 +100,7 @@ impl FilesConfig {
 impl Default for FilesConfig {
     fn default() -> Self {
         Self {
+            status_file: Self::default_status_file(),
             db_file: Self::default_db_file(),
             db_type: Self::default_db_type(),
             ca_cert: String::new(),

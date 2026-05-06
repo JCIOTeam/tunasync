@@ -35,9 +35,7 @@ use tunasync_protocol::{
 
 use crate::db::{DbAdapter, DbError};
 
-// ---------------------------------------------------------------------------
 // App state
-// ---------------------------------------------------------------------------
 
 /// Shared state injected into every axum handler via `State`.
 pub struct AppState {
@@ -82,9 +80,7 @@ fn bad_req(msg: impl Into<String>) -> Response {
     (StatusCode::BAD_REQUEST, Json(ErrBody { error: msg.into() })).into_response()
 }
 
-// ---------------------------------------------------------------------------
 // Router factory
-// ---------------------------------------------------------------------------
 
 /// Build the axum router for the manager service.
 ///
@@ -108,9 +104,7 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(shared)
 }
 
-// ---------------------------------------------------------------------------
 // Handlers
-// ---------------------------------------------------------------------------
 
 /// `GET /ping` — liveness check.
 async fn ping() -> impl IntoResponse {
@@ -480,9 +474,7 @@ async fn handle_client_cmd(
     }
 }
 
-// ---------------------------------------------------------------------------
 // Helper: zero-value MirrorStatus for a mirror that hasn't reported yet
-// ---------------------------------------------------------------------------
 
 fn zero_mirror_status(name: &str, worker: &str) -> MirrorStatus {
     use tunasync_protocol::zero_time;

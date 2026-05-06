@@ -38,7 +38,7 @@ tunasync-rs 与 Go 实现**线路兼容**：Rust manager 可以驱动 Go worker�
 | `[include]` 段 | Glob 匹配加载子配置 | 兼容 |
 | `{{.Name}}` 模板 | log_dir 中模板展开 | 兼容 |
 | SIGHUP 热重载 | 重新加载镜像配置 | 兼容 |
-| 数据库后端 | BoltDB, Redis, MySQL | redb / sqlite / redis（暂不支持 MySQL） |
+| 数据库后端 | BoltDB、LevelDB、Badger、Redis | redb / sqlite / redis |
 | Docker hook | 容器包装 | 兼容 |
 | Cgroup hook | v1/v2 内存限制 | 兼容 |
 | Btrfs/ZFS hook | 同步前后快照 | 兼容 |
@@ -177,11 +177,13 @@ use_ipv4 = true
 name = "myrepo"
 provider = "command"
 upstream = "https://example.com/repo/"
-command = "wget -m -np -nd {{upstream}} -P {{working_dir}}"
+command = "wget -m -np -nd https://example.com/repo/ -P /path/to/mirror"
 # fail_on_match = "error|failed"         # 正则匹配日志则判定失败
 # size_pattern = "Total size: ([\\d.]+[KMG])"  # 从日志提取大小
 # success_exit_codes = [0, 1, 2]         # 将这些退出码视为成功
 # env = { "MY_VAR" = "value" }           # 附加环境变量
+# 命令执行时会注入 TUNASYNC_WORKING_DIR、TUNASYNC_UPSTREAM_URL、
+# TUNASYNC_LOG_FILE 等环境变量供脚本使用。
 
 # 两阶段 rsync（适用于 Debian 等大型仓库）
 [[mirrors]]
@@ -197,7 +199,7 @@ use_ipv4 = true
 # name = "docker-mirror"
 # provider = "command"
 # upstream = "https://example.com/"
-# command = "sync-script {{upstream}}"
+# command = "sync-script $TUNASYNC_UPSTREAM_URL"
 # docker_image = "sync-runner:latest"    # Docker 镜像（启用 docker hook）
 # docker_volumes = ["/data:/data"]       # 每个镜像的 Docker 卷映射
 # docker_options = ["--network=host"]    # 每个镜像的 Docker 选项

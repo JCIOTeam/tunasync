@@ -1,6 +1,6 @@
 //! Mirror job state machine.
 //!
-//! Mirrors Go's `worker/job.go`. Each `MirrorJob` runs in its own tokio task
+//! Mirror job state machine. Each `MirrorJob` runs in its own tokio task
 //! and communicates with the worker scheduler via two channels:
 //!
 //! - `ctrl_tx` → job: control commands (start, stop, disable, restart, ping, halt)
@@ -29,9 +29,7 @@ use tunasync_protocol::SyncStatus;
 use crate::hooks::{HookPhase, JobHook};
 use crate::provider::MirrorProvider;
 
-// ---------------------------------------------------------------------------
 // Control actions (manager → job)
-// ---------------------------------------------------------------------------
 
 /// Control action sent from worker scheduler to a running job task.
 ///
@@ -49,9 +47,7 @@ pub enum CtrlAction {
     ForceStart,
 }
 
-// ---------------------------------------------------------------------------
 // Job state
-// ---------------------------------------------------------------------------
 
 /// Observable state of a `MirrorJob`.
 ///
@@ -78,13 +74,11 @@ impl JobState {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Status message (job → worker scheduler)
-// ---------------------------------------------------------------------------
 
 /// A status update pushed by a job to the worker scheduler.
 ///
-/// Mirrors Go's `jobMessage`.
+/// Status update pushed by a job to the worker scheduler.
 #[derive(Debug, Clone)]
 pub struct JobMessage {
     pub status: SyncStatus,
@@ -98,9 +92,7 @@ pub struct JobMessage {
     pub size: String,
 }
 
-// ---------------------------------------------------------------------------
 // MirrorJob
-// ---------------------------------------------------------------------------
 
 /// A mirror job: wraps a provider + its tokio task handle.
 pub struct MirrorJob {
@@ -165,9 +157,7 @@ impl MirrorJob {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Job task loop
-// ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
 async fn run_job_task(
@@ -289,7 +279,7 @@ async fn run_job_task(
 
 /// Run the sync body (pre-job → retry loop → post-exec → post-success/fail).
 ///
-/// Mirrors Go's `runJobWrapper` + outer retry loop in `mirrorJob.Run`.
+/// Run the sync body (pre-job → retry loop → post-exec → post-success/fail).
 /// `ctrl_rx` is checked between retries so Stop/Halt/Disable takes effect
 /// without waiting for all retry attempts to expire.
 ///

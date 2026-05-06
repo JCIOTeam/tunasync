@@ -14,7 +14,7 @@ static RSYNC_EXIT_VALUES: Lazy<HashMap<i32, &'static str>> = Lazy::new(|| {
     m.insert(1, "Syntax or usage error");
     m.insert(2, "Protocol incompatibility");
     m.insert(3, "Errors selecting input/output files, dirs");
-    m.insert(4, "Requested action not supported");
+    m.insert(4, "Requested action not supported: an attempt was made to manipulate 64-bit files on a platform that cannot support them; or an option was specified that is supported by the client and not by the server.");
     m.insert(5, "Error starting client-server protocol");
     m.insert(6, "Daemon unable to append to log-file");
     m.insert(10, "Error in socket I/O");
@@ -50,12 +50,19 @@ pub fn translate_rsync_error_code(exit_code: i32) -> (i32, String) {
 /// Extract total-file-size from an rsync log.
 ///
 /// Looks for `Total file size: <N>[KMGTP]? bytes` (rsync `--stats` output).
+/// Returns the **last** occurrence — matches Go's `ExtractSizeFromLog` which
+/// does `matches[len(matches)-1][1]` (last element of `FindAllSubmatch`).
+/// The last occurrence is correct because rsync can emit multiple stats
+/// blocks (e.g. in two-stage or incremental runs); only the final summary
+/// reflects the total mirror size.
+///
 /// Mirrors Go's `ExtractSizeFromRsyncLog` / `ExtractSizeFromLog`.
 pub fn extract_size_from_rsync_log(log_content: &str) -> String {
-    // (?m) multi-line; match rsync's "Total file size: NNN bytes" line.
     let re =
         regex::Regex::new(r"(?m)^Total file size: ([0-9.]+[KMGTP]?) bytes").expect("static regex");
-    re.captures(log_content)
+    // Collect all matches and return the last capture group of the last match.
+    re.captures_iter(log_content)
+        .last()
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_owned())
         .unwrap_or_default()
@@ -63,11 +70,13 @@ pub fn extract_size_from_rsync_log(log_content: &str) -> String {
 
 /// Extract a size string matching `pattern` from log content.
 ///
-/// Returns the first capture group (or the full match if no group).
-/// Mirrors Go's `ExtractSizeFromLog`.
+/// Returns the first capture group of the **last** match (or the full last
+/// match if no group), mirroring Go's `ExtractSizeFromLog`:
+/// `matches[len(matches)-1][1]`.
 pub fn extract_size_from_log(log_content: &str, pattern: &regex::Regex) -> String {
     pattern
-        .captures(log_content)
+        .captures_iter(log_content)
+        .last()
         .and_then(|c| c.get(1).or_else(|| c.get(0)))
         .map(|m| m.as_str().to_owned())
         .unwrap_or_default()
@@ -85,6 +94,13 @@ mod tests {
     }
 
     #[test]
+    fn rsync_exit_code_4_full_message() {
+        let (code, msg) = translate_rsync_error_code(4);
+        assert_eq!(code, 4);
+        assert!(msg.contains("64-bit"), "got: {msg}");
+    }
+
+    #[test]
     fn rsync_exit_code_unknown() {
         let (code, msg) = translate_rsync_error_code(99);
         assert_eq!(code, 99);
@@ -94,6 +110,13 @@ mod tests {
     #[test]
     fn extract_rsync_size() {
         let log = "some stuff\nTotal file size: 1.23G bytes (some suffix)\nmore\n";
+        assert_eq!(extract_size_from_rsync_log(log), "1.23G");
+    }
+
+    #[test]
+    fn extract_rsync_size_takes_last_occurrence() {
+        // rsync may emit multiple stats blocks; we want the last one.
+        let log = "Total file size: 100K bytes\nTotal file size: 1.23G bytes\n";
         assert_eq!(extract_size_from_rsync_log(log), "1.23G");
     }
 

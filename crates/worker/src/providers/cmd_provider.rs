@@ -84,6 +84,19 @@ impl CmdProvider {
         };
         let log_path_shared = Arc::new(Mutex::new(log_dir.join("latest.log")));
 
+        // Merge success exit codes exactly as Go's newMirrorProvider does:
+        // global codes first, then mirror-specific codes.
+        // Note: rsync_success_exit_codes are intentionally NOT included for
+        // command providers (Go warns and ignores them for non-rsync providers).
+        let mut success_exit_codes = mc.success_exit_codes.clone();
+        success_exit_codes.extend(global.dangerous_global_success_exit_codes.iter().copied());
+        if !mc.rsync_success_exit_codes.is_empty() {
+            tracing::warn!(
+                mirror = %mc.name,
+                "rsync_success_exit_codes is ignored for command provider"
+            );
+        }
+
         Ok(Self {
             name: mc.name.clone(),
             upstream: mc.upstream.clone(),
@@ -98,7 +111,7 @@ impl CmdProvider {
             command,
             fail_on_match,
             size_pattern,
-            success_exit_codes: mc.success_exit_codes.clone(),
+            success_exit_codes,
             data_size: Mutex::new(String::new()),
             current_pid: Arc::new(Mutex::new(None)),
             docker_container_name: None,

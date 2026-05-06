@@ -1,6 +1,7 @@
 //! tunasync manager server.
 //!
-//! Entry-point: [`run`].  Called by the `tunasync manager` subcommand.
+//! Entry-point: [`run`] (config file only) or [`run_with_config`] (pre-built
+//! config, used by the CLI when flags override config-file values).
 
 #![warn(rust_2018_idioms)]
 
@@ -15,7 +16,7 @@ use crate::config::ManagerConfig;
 use crate::db::open as open_db;
 use crate::server::{build_router, AppState};
 
-/// Start the manager and block until the server exits.
+/// Start the manager from a config file path, blocking until the server exits.
 pub async fn run(config_path: std::path::PathBuf) -> Result<()> {
     let cfg: ManagerConfig =
         tunasync_common::config::load_toml(&config_path).unwrap_or_else(|_| {
@@ -25,7 +26,15 @@ pub async fn run(config_path: std::path::PathBuf) -> Result<()> {
             );
             ManagerConfig::default()
         });
+    run_with_config(cfg).await
+}
 
+/// Start the manager from a fully-constructed [`ManagerConfig`].
+///
+/// Used by the CLI to apply command-line overrides after loading the config
+/// file, matching Go's `LoadConfig` which accepts a `*cli.Context` and
+/// patches the struct fields with CLI flag values.
+pub async fn run_with_config(cfg: ManagerConfig) -> Result<()> {
     tracing::info!(
         addr = %cfg.server.addr,
         port = cfg.server.port,

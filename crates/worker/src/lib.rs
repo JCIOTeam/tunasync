@@ -273,7 +273,7 @@ pub fn build_one_provider(
             mc.name.clone(),
             working_dir.to_owned(),
             &cfg.btrfs_snapshot.snapshot_path,
-            "", // mirror-level snapshot path override not yet in MirrorConfig
+            &mc.snapshot_path, // per-mirror override (Go: mirrorConfig.SnapshotPath)
         )));
     }
 

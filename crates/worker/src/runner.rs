@@ -25,9 +25,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
-// ---------------------------------------------------------------------------
 // RunningProcess
-// ---------------------------------------------------------------------------
 
 pub struct RunningProcess {
     pub(crate) child: Child,
@@ -59,7 +57,7 @@ impl RunningProcess {
     }
 
     /// SIGTERM the process group → 2 s → SIGKILL the process group.
-    /// Mirrors Go's `cmdJob.Terminate` which uses `kill(-pid, SIGTERM)`.
+    /// SIGTERM → 2 s grace period → SIGKILL the process group.
     pub async fn terminate(mut self) {
         #[cfg(unix)]
         {
@@ -144,9 +142,7 @@ pub async fn terminate_process_group(pid: u32) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // spawn()
-// ---------------------------------------------------------------------------
 
 /// Spawn a child process in its own process group (matches Go's Setpgid).
 pub async fn spawn(
@@ -191,9 +187,7 @@ pub async fn spawn(
     Ok(RunningProcess { child })
 }
 
-// ---------------------------------------------------------------------------
 // I/O helpers
-// ---------------------------------------------------------------------------
 
 /// Drain stdout and stderr concurrently into a log file via an mpsc channel.
 /// Two reader tasks send lines to a shared channel; a single writer task

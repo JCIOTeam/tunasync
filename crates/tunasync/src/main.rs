@@ -3,7 +3,9 @@
 //! Mirrors the subcommand structure of Go's `cmd/tunasync/tunasync.go`:
 //!
 //! ```text
-//! tunasync manager [--config FILE] [--with-systemd] ...
+//! tunasync manager [--config FILE] [--addr ADDR] [--port PORT] \
+//!                  [--cert FILE] [--key FILE] [--db-file FILE] \
+//!                  [--db-type TYPE] [--debug] [--with-systemd] ...
 //! tunasync worker  [--config FILE] [--with-systemd] ...
 //! ```
 
@@ -41,28 +43,134 @@ enum Command {
         /// Path to manager.conf (TOML).
         #[arg(short, long, default_value = "/etc/tunasync/manager.conf")]
         config: PathBuf,
+
+        // -----------------------------------------------------------------
+        // CLI overrides — match Go's `tunasync manager` flags exactly.
+        // When provided these take precedence over the config file values.
+        // -----------------------------------------------------------------
+        /// Override manager listen address (Go: --addr).
+        #[arg(long)]
+        addr: Option<String>,
+
+        /// Override manager listen port (Go: --port).
+        #[arg(long)]
+        port: Option<u16>,
+
+        /// SSL certificate file (enables HTTPS, Go: --cert).
+        #[arg(long)]
+        cert: Option<PathBuf>,
+
+        /// SSL key file (enables HTTPS, Go: --key).
+        #[arg(long)]
+        key: Option<PathBuf>,
+
+        /// Override database file path (Go: --db-file).
+        #[arg(long)]
+        db_file: Option<PathBuf>,
+
+        /// Override database type: redb, sqlite, redis (Go: --db-type).
+        #[arg(long)]
+        db_type: Option<String>,
+
+        /// Enable debug-level logging (Go: --debug).
+        #[arg(long)]
+        debug: bool,
+
+        /// PID file path (written on startup, matches Go's --pidfile).
+        #[arg(long, default_value = "/run/tunasync/tunasync.manager.pid")]
+        pidfile: Option<PathBuf>,
     },
     /// Run as a worker.
     Worker {
         /// Path to worker.conf (TOML).
         #[arg(short, long, default_value = "/etc/tunasync/worker.conf")]
         config: PathBuf,
+
+        /// PID file path (Go: --pidfile).
+        #[arg(long, default_value = "/run/tunasync/tunasync.worker.pid")]
+        pidfile: Option<PathBuf>,
     },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    tunasync_common::logger::init(cli.verbose, cli.with_systemd);
 
-    match cli.command {
-        Command::Manager { config } => {
+    match &cli.command {
+        Command::Manager {
+            config,
+            addr,
+            port,
+            cert,
+            key,
+            db_file,
+            db_type,
+            debug,
+            pidfile,
+        } => {
+            // debug flag elevates to trace-level; we pass it to the logger.
+            tunasync_common::logger::init(cli.verbose || *debug, cli.with_systemd);
             tracing::info!(?config, "starting tunasync manager");
-            tunasync_manager::run(config).await
+
+            // Load config file, then apply CLI overrides — mirrors Go's LoadConfig
+            // which patches the struct with cli.Context values after TOML decode.
+            let mut cfg: tunasync_manager::config::ManagerConfig =
+                tunasync_common::config::load_toml(config).unwrap_or_else(|_| {
+                    tracing::warn!(
+                        path = %config.display(),
+                        "config file not found or unreadable — using defaults"
+                    );
+                    Default::default()
+                });
+
+            if let Some(a) = addr {
+                cfg.server.addr = a.clone();
+            }
+            if let Some(p) = port {
+                cfg.server.port = *p;
+            }
+            if let (Some(c), Some(k)) = (cert, key) {
+                cfg.server.ssl_cert = c.to_string_lossy().into();
+                cfg.server.ssl_key = k.to_string_lossy().into();
+            }
+            if let Some(f) = db_file {
+                cfg.files.db_file = f.clone();
+            }
+            if let Some(t) = db_type {
+                cfg.files.db_type = t.clone();
+            }
+
+            // Write PID file if requested (best-effort, non-fatal).
+            if let Some(pf) = pidfile {
+                write_pidfile(pf);
+            }
+
+            tunasync_manager::run_with_config(cfg).await
         }
-        Command::Worker { config } => {
+
+        Command::Worker { config, pidfile } => {
+            tunasync_common::logger::init(cli.verbose, cli.with_systemd);
             tracing::info!(?config, "starting tunasync worker");
-            tunasync_worker::run(config).await
+
+            // Write PID file if requested (best-effort, non-fatal).
+            if let Some(pf) = pidfile {
+                write_pidfile(pf);
+            }
+
+            tunasync_worker::run(config.clone()).await
         }
+    }
+}
+
+/// Write the current PID to `path`, creating parent directories as needed.
+/// Logs a warning on failure but does not abort — matching Go's behaviour
+/// where a missing pidfile is not fatal.
+fn write_pidfile(path: &PathBuf) {
+    let pid = std::process::id().to_string();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(path, pid) {
+        tracing::warn!(path = %path.display(), error = %e, "failed to write pidfile");
     }
 }

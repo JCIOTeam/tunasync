@@ -17,16 +17,20 @@ use serde::{Deserialize, Serialize};
 /// Sync provider type for a mirror.
 ///
 /// Matches Go's `providerEnum` with identical TOML text representations.
+///
+/// **Default is `Rsync`** — matching Go's `iota` ordering where `provRsync == 0`
+/// is the zero value.  A mirror config that omits `provider` is treated as
+/// `rsync`, exactly as the Go implementation does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderKind {
-    /// Raw shell command. Default.
+    /// `rsync` provider. Default (matches Go's `provRsync = iota = 0`).
     #[default]
-    Command,
-    /// `rsync` provider.
     Rsync,
     /// Two-stage rsync (skeleton + full).
     TwoStageRsync,
+    /// Raw shell command.
+    Command,
 }
 
 impl FromStr for ProviderKind {
@@ -465,6 +469,14 @@ pub struct MirrorConfig {
     #[serde(default)]
     pub docker_options: Vec<String>,
 
+    /// Per-mirror btrfs snapshot path override.
+    ///
+    /// Matches Go's `mirrorConfig.SnapshotPath` (`toml:"snapshot_path"`).
+    /// When non-empty, overrides `[btrfs_snapshot] snapshot_path` for this
+    /// specific mirror.  Defaults to `{global_snapshot_dir}/{mirror_name}`.
+    #[serde(default)]
+    pub snapshot_path: String,
+
     /// Nested child mirrors — Go's `[[mirrors.mirrors]]` inheritance.
     /// After TOML parsing, `flatten_mirrors()` recursively merges children
     /// with parents (non-zero child fields override parent defaults) and
@@ -690,6 +702,11 @@ fn merge_mirror(parent: MirrorConfig, child: MirrorConfig) -> MirrorConfig {
         } else {
             child.docker_options
         },
+        snapshot_path: if child.snapshot_path.is_empty() {
+            parent.snapshot_path
+        } else {
+            child.snapshot_path
+        },
         child_mirrors: child.child_mirrors, // always take child's children
     }
 }
@@ -732,17 +749,17 @@ impl MirrorConfig {
     /// Matches Go: `Join(MirrorDir, MirrorSubDir, Name)`.
     pub fn effective_mirror_dir(&self, global: &GlobalConfig) -> PathBuf {
         if !self.mirror_dir.is_empty() {
-            let base = PathBuf::from(&self.mirror_dir);
-            if !self.mirror_subdir.is_empty() {
-                base.join(&self.mirror_subdir)
-            } else {
-                base
-            }
+            // Go: when mirror_dir is explicitly set, use it as-is.
+            // mirror_subdir and name are NOT appended (matches Go's provider.go
+            // `if mirrorDir == "" { … } else { use mirrorDir directly }`).
+            PathBuf::from(&self.mirror_dir)
         } else if !self.mirror_subdir.is_empty() {
+            // mirror_dir not set, but mirror_subdir is: join global/subdir/name.
             PathBuf::from(&global.mirror_dir)
                 .join(&self.mirror_subdir)
                 .join(&self.name)
         } else {
+            // Neither set: join global/name.
             PathBuf::from(&global.mirror_dir).join(&self.name)
         }
     }
@@ -829,6 +846,16 @@ upstream = "rsync://ftp.debian.org/debian-backports/"
     #[test]
     fn flatten_nested_mirrors_override() {
         // Child's non-default fields override parent.
+        //
+        // Note (issue 16): since `Rsync` is now the *default* variant (matching
+        // Go's `provRsync = iota = 0`), a child that explicitly writes
+        // `provider = "rsync"` is indistinguishable from "not set" in
+        // `merge_mirror`.  This means a child cannot override a parent's
+        // `provider = "command"` with `provider = "rsync"` — the parent value
+        // wins.  This is intentional and mirrors Go's zero-value semantics.
+        //
+        // To override a parent's provider a child must use a non-default variant
+        // such as `two-stage-rsync` or `command`.
         let toml = r#"
 [[mirrors]]
 name = "centos"
@@ -837,7 +864,7 @@ interval = 300
 
 [[mirrors.mirrors]]
 name = "centos-stream"
-provider = "rsync"
+provider = "two-stage-rsync"
 upstream = "rsync://mirror.centos.org/centos-stream/"
 interval = 120
 "#;
@@ -845,9 +872,33 @@ interval = 120
         let flat = flatten_mirrors(&cfg.mirrors_conf);
         assert_eq!(flat.len(), 1);
         assert_eq!(flat[0].name, "centos-stream");
-        assert_eq!(flat[0].provider, ProviderKind::Rsync);
+        assert_eq!(flat[0].provider, ProviderKind::TwoStageRsync);
         assert_eq!(flat[0].interval, 120);
         assert_eq!(flat[0].upstream, "rsync://mirror.centos.org/centos-stream/");
+    }
+
+    /// Verify that `provider = "rsync"` in a child (== default) does NOT
+    /// override a parent's `provider = "command"` (issue 16, intentional).
+    #[test]
+    fn flatten_rsync_child_does_not_override_command_parent() {
+        let toml = r#"
+[[mirrors]]
+name = "base"
+provider = "command"
+interval = 300
+
+[[mirrors.mirrors]]
+name = "child"
+provider = "rsync"
+upstream = "rsync://example.com/"
+interval = 60
+"#;
+        let cfg: WorkerConfig = tunasync_common::config::parse_toml(toml).unwrap();
+        let flat = flatten_mirrors(&cfg.mirrors_conf);
+        assert_eq!(flat.len(), 1);
+        // Child's `provider = "rsync"` == default → parent's `command` wins.
+        assert_eq!(flat[0].provider, ProviderKind::Command);
+        assert_eq!(flat[0].interval, 60); // non-default numeric field still overrides
     }
 
     #[test]
