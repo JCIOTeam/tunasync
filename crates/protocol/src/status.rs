@@ -125,6 +125,26 @@ mod tests {
     }
 
     #[test]
+    fn as_str_matches_wire_format() {
+        // as_str() must return exactly the same string as the JSON wire value
+        // (without quotes), since it's used for Prometheus label values.
+        let cases = [
+            (SyncStatus::None, "none"),
+            (SyncStatus::Failed, "failed"),
+            (SyncStatus::Success, "success"),
+            (SyncStatus::Syncing, "syncing"),
+            (SyncStatus::PreSyncing, "pre-syncing"),
+            (SyncStatus::Paused, "paused"),
+            (SyncStatus::Disabled, "disabled"),
+        ];
+        for (status, expected) in cases {
+            assert_eq!(status.as_str(), expected);
+            // Must also match Display output.
+            assert_eq!(status.to_string(), expected);
+        }
+    }
+
+    #[test]
     fn from_str_round_trip() {
         assert_eq!(
             SyncStatus::from_str("syncing").unwrap(),

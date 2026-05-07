@@ -139,6 +139,7 @@ impl WebMirrorStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{zero_time, MirrorStatus, SyncStatus};
 
     /// Verify the human-readable format matches Go's `textTime.MarshalJSON` output.
     #[test]
@@ -166,5 +167,70 @@ mod tests {
         assert_eq!(json["last_update"], "2024-06-15 10:30:45 +0000");
         // Unix timestamp
         assert_eq!(json["last_update_ts"], t.timestamp());
+    }
+
+    /// `stamp_time` must serialise as a JSON integer (Unix seconds), not a string.
+    #[test]
+    fn stamp_time_is_numeric_in_json() {
+        use chrono::TimeZone;
+        let t = chrono::Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let ws = WebMirrorStatus {
+            name: "test".into(),
+            is_master: true,
+            status: SyncStatus::Success,
+            last_update: t,
+            last_update_ts: t,
+            last_started: t,
+            last_started_ts: t,
+            last_ended: t,
+            last_ended_ts: t,
+            scheduled: t,
+            scheduled_ts: t,
+            upstream: String::new(),
+            size: String::new(),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
+        assert!(
+            json["last_update_ts"].is_number(),
+            "stamp_time should be a number, got: {}",
+            json["last_update_ts"]
+        );
+        assert_eq!(json["last_update_ts"].as_i64().unwrap(), t.timestamp());
+    }
+
+    /// `from_mirror_status` copies all fields correctly; `worker` and `error_msg`
+    /// are intentionally absent from `WebMirrorStatus` (matches Go).
+    #[test]
+    fn from_mirror_status_maps_all_fields() {
+        let now = chrono::Utc::now();
+        let m = MirrorStatus {
+            name: "ubuntu".into(),
+            worker: "w1".into(),
+            is_master: true,
+            status: SyncStatus::Failed,
+            last_update: now,
+            last_started: now,
+            last_ended: now,
+            scheduled: zero_time(),
+            upstream: "rsync://archive.ubuntu.com/ubuntu/".into(),
+            size: "100G".into(),
+            error_msg: "rsync: timeout".into(),
+        };
+
+        let ws = WebMirrorStatus::from_mirror_status(&m);
+
+        assert_eq!(ws.name, "ubuntu");
+        assert_eq!(ws.is_master, true);
+        assert_eq!(ws.status, SyncStatus::Failed);
+        assert_eq!(ws.upstream, "rsync://archive.ubuntu.com/ubuntu/");
+        assert_eq!(ws.size, "100G");
+        assert_eq!(ws.last_update, now);
+        // Verify timestamps match.
+        assert_eq!(ws.last_update_ts, now);
+        assert_eq!(ws.last_started_ts, now);
+        assert_eq!(ws.last_ended_ts, now);
+        // zero_time sentinel preserved.
+        assert_eq!(ws.scheduled, zero_time());
     }
 }

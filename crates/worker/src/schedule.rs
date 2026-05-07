@@ -101,3 +101,123 @@ impl ScheduleQueue {
         self.heap.len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn at(offset_secs: u64) -> Instant {
+        // Use a fixed base so tests are deterministic.
+        Instant::now() + Duration::from_secs(offset_secs)
+    }
+
+    #[test]
+    fn push_and_pop_in_order() {
+        let mut q = ScheduleQueue::new();
+        q.push("late".into(), at(100));
+        q.push("early".into(), at(10));
+        q.push("middle".into(), at(50));
+
+        assert_eq!(q.pop().unwrap().name, "early");
+        assert_eq!(q.pop().unwrap().name, "middle");
+        assert_eq!(q.pop().unwrap().name, "late");
+        assert!(q.pop().is_none());
+    }
+
+    #[test]
+    fn push_replaces_existing_entry() {
+        let mut q = ScheduleQueue::new();
+        let t_old = at(100);
+        let t_new = at(10);
+        q.push("ubuntu".into(), t_old);
+        // Re-schedule to an earlier time — the old entry must become stale.
+        q.push("ubuntu".into(), t_new);
+
+        let entry = q.pop().unwrap();
+        assert_eq!(entry.name, "ubuntu");
+        assert_eq!(entry.next_run, t_new);
+
+        // Only one logical entry — subsequent pop must return None.
+        assert!(q.pop().is_none());
+    }
+
+    #[test]
+    fn push_replaces_with_later_time() {
+        let mut q = ScheduleQueue::new();
+        let t_early = at(10);
+        let t_late = at(100);
+        q.push("ubuntu".into(), t_early);
+        // Re-schedule to a later time.
+        q.push("ubuntu".into(), t_late);
+
+        let entry = q.pop().unwrap();
+        assert_eq!(entry.next_run, t_late);
+        assert!(q.pop().is_none());
+    }
+
+    #[test]
+    fn remove_makes_entry_stale() {
+        let mut q = ScheduleQueue::new();
+        q.push("ubuntu".into(), at(10));
+        q.push("debian".into(), at(20));
+
+        q.remove("ubuntu");
+
+        // Popping should skip the removed entry.
+        let entry = q.pop().unwrap();
+        assert_eq!(entry.name, "debian");
+        assert!(q.pop().is_none());
+    }
+
+    #[test]
+    fn peek_does_not_consume_entry() {
+        let mut q = ScheduleQueue::new();
+        q.push("ubuntu".into(), at(10));
+
+        let peeked = q.peek().unwrap();
+        assert_eq!(peeked.name, "ubuntu");
+
+        // Entry still present after peek.
+        let popped = q.pop().unwrap();
+        assert_eq!(popped.name, "ubuntu");
+        assert!(q.pop().is_none());
+    }
+
+    #[test]
+    fn peek_skips_stale_and_returns_valid() {
+        let mut q = ScheduleQueue::new();
+        q.push("a".into(), at(10));
+        q.push("a".into(), at(50)); // makes at(10) stale
+        q.push("b".into(), at(20));
+
+        // Peek should return "b" (earliest non-stale), not stale "a@10".
+        let top = q.peek().unwrap();
+        assert_eq!(top.name, "b");
+    }
+
+    #[test]
+    fn is_empty_and_len() {
+        let mut q = ScheduleQueue::new();
+        assert!(q.is_empty());
+
+        q.push("a".into(), at(1));
+        q.push("b".into(), at(2));
+        assert!(!q.is_empty());
+        // Heap len counts raw entries (including stale), len() reflects heap size.
+        assert!(q.len() >= 2);
+
+        q.pop();
+        q.pop();
+        // After popping all valid entries the heap should drain stale ones too.
+        assert!(q.peek().is_none());
+    }
+
+    #[test]
+    fn remove_nonexistent_is_noop() {
+        let mut q = ScheduleQueue::new();
+        q.push("ubuntu".into(), at(10));
+        q.remove("nobody"); // should not panic
+        assert_eq!(q.pop().unwrap().name, "ubuntu");
+    }
+}

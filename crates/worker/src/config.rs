@@ -947,4 +947,98 @@ upstream = "rsync://archive.ubuntu.com/ubuntu/"
         assert_eq!(flat[0].name, "ubuntu");
         assert_eq!(flat[0].provider, ProviderKind::Rsync);
     }
+
+    // ── effective_mirror_dir ─────────────────────────────────────────────────
+
+    fn global_cfg() -> GlobalConfig {
+        tunasync_common::config::parse_toml::<WorkerConfig>(
+            r#"
+[global]
+name = "w"
+log_dir = "/log"
+mirror_dir = "/srv/mirrors"
+concurrent = 1
+"#,
+        )
+        .unwrap()
+        .global
+    }
+
+    /// When `mirror_dir` is explicitly set, it is used as-is —
+    /// `mirror_subdir` is NOT appended.  This matches Go's behaviour:
+    ///   `if mirrorDir == "" { ... } else { use mirrorDir directly }`
+    #[test]
+    fn effective_mirror_dir_explicit_mirror_dir_ignores_subdir() {
+        let global = global_cfg();
+        let mut mc = MirrorConfig::default();
+        mc.name = "ubuntu".into();
+        mc.mirror_dir = "/data/ubuntu".into();
+        mc.mirror_subdir = "should-be-ignored".into();
+
+        let got = mc.effective_mirror_dir(&global);
+        assert_eq!(got, std::path::PathBuf::from("/data/ubuntu"));
+    }
+
+    /// When neither `mirror_dir` nor `mirror_subdir` is set, the path is
+    /// `global.mirror_dir / name`.
+    #[test]
+    fn effective_mirror_dir_fallback_to_global() {
+        let global = global_cfg();
+        let mut mc = MirrorConfig::default();
+        mc.name = "debian".into();
+
+        let got = mc.effective_mirror_dir(&global);
+        assert_eq!(got, std::path::PathBuf::from("/srv/mirrors/debian"));
+    }
+
+    /// When `mirror_dir` is not set but `mirror_subdir` is, the path is
+    /// `global.mirror_dir / mirror_subdir / name`.
+    #[test]
+    fn effective_mirror_dir_with_subdir_only() {
+        let global = global_cfg();
+        let mut mc = MirrorConfig::default();
+        mc.name = "fedora-epel".into();
+        mc.mirror_subdir = "epel".into();
+
+        let got = mc.effective_mirror_dir(&global);
+        assert_eq!(
+            got,
+            std::path::PathBuf::from("/srv/mirrors/epel/fedora-epel")
+        );
+    }
+
+    /// `snapshot_path` propagates through `merge_mirror` inheritance.
+    #[test]
+    fn snapshot_path_inherited_and_overridden() {
+        let toml = r#"
+[[mirrors]]
+name = "base"
+provider = "rsync"
+snapshot_path = "/snapshots/base"
+
+[[mirrors.mirrors]]
+name = "child-inherit"
+upstream = "rsync://example.com/inherit/"
+
+[[mirrors.mirrors]]
+name = "child-override"
+upstream = "rsync://example.com/override/"
+snapshot_path = "/snapshots/override"
+"#;
+        let cfg: WorkerConfig = tunasync_common::config::parse_toml(toml).unwrap();
+        let flat = flatten_mirrors(&cfg.mirrors_conf);
+        assert_eq!(flat.len(), 2);
+
+        let inherit = flat.iter().find(|m| m.name == "child-inherit").unwrap();
+        assert_eq!(
+            inherit.snapshot_path, "/snapshots/base",
+            "child without snapshot_path should inherit parent's"
+        );
+
+        let overridden = flat.iter().find(|m| m.name == "child-override").unwrap();
+        assert_eq!(
+            overridden.snapshot_path, "/snapshots/override",
+            "child with explicit snapshot_path should override parent's"
+        );
+    }
 }

@@ -485,6 +485,375 @@ async fn flush_disabled() {
     assert_eq!(jobs.as_array().unwrap().len(), 0);
 }
 
+// ── helpers ────────────────────────────────────────────────────────────────
+
+async fn get_text(app: &axum::Router, path: &str) -> (StatusCode, String) {
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+async fn setup_worker_and_mirror(app: &axum::Router, worker_id: &str, mirror_name: &str) {
+    let zero = "0001-01-01T00:00:00Z";
+    let worker = serde_json::json!({
+        "id": worker_id,
+        "url": format!("http://{worker_id}:6000"),
+        "token": "",
+        "last_online": zero,
+        "last_register": zero,
+    });
+    post_json(app, "/workers", &worker).await;
+
+    let job = serde_json::json!({
+        "name": mirror_name, "worker": worker_id, "is_master": true,
+        "status": "success",
+        "last_update": zero, "last_started": zero,
+        "last_ended": zero, "next_schedule": zero,
+        "upstream": "rsync://example.com/", "size": "1.2T", "error_msg": ""
+    });
+    post_json(
+        app,
+        &format!("/workers/{worker_id}/jobs/{mirror_name}"),
+        &job,
+    )
+    .await;
+}
+
+// ── heartbeat ──────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn heartbeat_worker() {
+    let app = make_app();
+    let zero = "0001-01-01T00:00:00Z";
+    let worker = serde_json::json!({
+        "id": "w1", "url": "http://w1:6000", "token": "",
+        "last_online": zero, "last_register": zero,
+    });
+    post_json(&app, "/workers", &worker).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/workers/w1/heartbeat")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Unknown worker → 400.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/workers/nobody/heartbeat")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── update_mirror_size ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn update_mirror_size() {
+    let app = make_app();
+    setup_worker_and_mirror(&app, "w1", "ubuntu").await;
+
+    // Normal size update.
+    let (status, resp) = post_json(
+        &app,
+        "/workers/w1/jobs/ubuntu/size",
+        &serde_json::json!({ "name": "ubuntu", "size": "2T" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resp["size"], "2T");
+
+    // GET /jobs should reflect new size.
+    let (_, jobs) = get_json(&app, "/jobs").await;
+    assert_eq!(jobs[0]["size"], "2T");
+}
+
+#[tokio::test]
+async fn update_mirror_size_unknown_does_not_overwrite() {
+    let app = make_app();
+    setup_worker_and_mirror(&app, "w1", "ubuntu").await;
+
+    // Size update with "unknown" should not overwrite "1.2T".
+    let (status, resp) = post_json(
+        &app,
+        "/workers/w1/jobs/ubuntu/size",
+        &serde_json::json!({ "name": "ubuntu", "size": "unknown" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        resp["size"], "1.2T",
+        "unknown should not overwrite existing size"
+    );
+
+    // Empty size should not overwrite either.
+    let (_, resp) = post_json(
+        &app,
+        "/workers/w1/jobs/ubuntu/size",
+        &serde_json::json!({ "name": "ubuntu", "size": "" }),
+    )
+    .await;
+    assert_eq!(
+        resp["size"], "1.2T",
+        "empty should not overwrite existing size"
+    );
+}
+
+// ── size preservation on job status update ─────────────────────────────────
+
+#[tokio::test]
+async fn job_update_preserves_size_when_incoming_is_blank() {
+    let app = make_app();
+    setup_worker_and_mirror(&app, "w1", "ubuntu").await;
+
+    let zero = "0001-01-01T00:00:00Z";
+
+    // Post a new status with blank size — existing "1.2T" must be kept.
+    let (_, resp) = post_json(
+        &app,
+        "/workers/w1/jobs/ubuntu",
+        &serde_json::json!({
+            "name": "ubuntu", "worker": "w1", "is_master": true,
+            "status": "success",
+            "last_update": zero, "last_started": zero,
+            "last_ended": zero, "next_schedule": zero,
+            "upstream": "", "size": "", "error_msg": ""
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["size"], "1.2T",
+        "blank incoming size should not erase existing value"
+    );
+
+    // Same for "unknown".
+    let (_, resp) = post_json(
+        &app,
+        "/workers/w1/jobs/ubuntu",
+        &serde_json::json!({
+            "name": "ubuntu", "worker": "w1", "is_master": true,
+            "status": "success",
+            "last_update": zero, "last_started": zero,
+            "last_ended": zero, "next_schedule": zero,
+            "upstream": "", "size": "unknown", "error_msg": ""
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["size"], "1.2T",
+        "'unknown' incoming size should not erase existing value"
+    );
+}
+
+// ── update_schedules_of_worker ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn update_schedules() {
+    let app = make_app();
+    setup_worker_and_mirror(&app, "w1", "ubuntu").await;
+
+    let next = "2099-01-01T00:00:00Z";
+    let (status, resp) = post_json(
+        &app,
+        "/workers/w1/schedules",
+        &serde_json::json!({
+            "schedules": [{ "name": "ubuntu", "next_schedule": next }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Go returns `{}` on success.
+    assert!(resp.is_object());
+
+    // GET /jobs should reflect updated next_schedule.
+    let (_, jobs) = get_json(&app, "/jobs").await;
+    let job = &jobs[0];
+    // WebMirrorStatus exposes next_schedule as text_time string.
+    assert!(
+        job["next_schedule"].as_str().unwrap().starts_with("2099"),
+        "next_schedule should be updated: got {}",
+        job["next_schedule"]
+    );
+}
+
+// ── handle_client_cmd ─────────────────────────────────────────────────────
+// The manager pre-updates the DB (disable → Disabled, stop → Paused) before
+// forwarding to the worker. Since no real worker is listening in these tests
+// the forward will fail with 500, but the DB update has already happened and
+// is visible via GET /jobs.
+
+#[tokio::test]
+async fn cmd_disable_pre_updates_status() {
+    let app = make_app();
+    setup_worker_and_mirror(&app, "w1", "ubuntu").await;
+
+    post_json(
+        &app,
+        "/cmd",
+        &serde_json::json!({
+            "cmd": "disable",
+            "mirror_id": "ubuntu",
+            "worker_id": "w1",
+            "args": [],
+            "options": {}
+        }),
+    )
+    .await;
+    // Forward to worker fails (no real worker), but DB was pre-updated.
+    let (_, jobs) = get_json(&app, "/jobs").await;
+    assert_eq!(jobs[0]["status"], "disabled");
+}
+
+#[tokio::test]
+async fn cmd_stop_pre_updates_status() {
+    let app = make_app();
+    setup_worker_and_mirror(&app, "w1", "ubuntu").await;
+
+    post_json(
+        &app,
+        "/cmd",
+        &serde_json::json!({
+            "cmd": "stop",
+            "mirror_id": "ubuntu",
+            "worker_id": "w1",
+            "args": [],
+            "options": {}
+        }),
+    )
+    .await;
+    let (_, jobs) = get_json(&app, "/jobs").await;
+    assert_eq!(jobs[0]["status"], "paused");
+}
+
+#[tokio::test]
+async fn cmd_unknown_worker_returns_400() {
+    let app = make_app();
+
+    let (status, _) = post_json(
+        &app,
+        "/cmd",
+        &serde_json::json!({
+            "cmd": "start",
+            "mirror_id": "ubuntu",
+            "worker_id": "nobody",
+            "args": [],
+            "options": {}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ── /metrics endpoint ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn metrics_endpoint() {
+    let app = make_app();
+    setup_worker_and_mirror(&app, "w1", "ubuntu").await;
+    // Add a second failed mirror.
+    let zero = "0001-01-01T00:00:00Z";
+    post_json(
+        &app,
+        "/workers/w1/jobs/debian",
+        &serde_json::json!({
+            "name": "debian", "worker": "w1", "is_master": true,
+            "status": "failed",
+            "last_update": zero, "last_started": zero,
+            "last_ended": zero, "next_schedule": zero,
+            "upstream": "rsync://ftp.debian.org/debian/",
+            "size": "500G", "error_msg": "timeout"
+        }),
+    )
+    .await;
+
+    let (status, body) = get_text(&app, "/metrics").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Content-type should be Prometheus text format.
+    // (We check the body directly since get_text strips the header.)
+
+    // Workers total.
+    assert!(
+        body.contains("tunasync_workers_total 1"),
+        "workers_total: {body}"
+    );
+
+    // Mirror status codes: success=3, failed=4.
+    assert!(
+        body.contains("tunasync_mirror_status{mirror=\"ubuntu\",worker=\"w1\"} 3"),
+        "ubuntu status: {body}"
+    );
+    assert!(
+        body.contains("tunasync_mirror_status{mirror=\"debian\",worker=\"w1\"} 4"),
+        "debian status: {body}"
+    );
+
+    // Aggregate counts.
+    assert!(
+        body.contains("tunasync_mirrors_total{status=\"success\"} 1"),
+        "{body}"
+    );
+    assert!(
+        body.contains("tunasync_mirrors_total{status=\"failed\"} 1"),
+        "{body}"
+    );
+    assert!(
+        body.contains("tunasync_mirrors_total{status=\"syncing\"} 0"),
+        "{body}"
+    );
+
+    // Size bytes: 1.2T and 500G.
+    assert!(
+        body.contains("tunasync_mirror_size_bytes{mirror=\"ubuntu\",worker=\"w1\"}"),
+        "{body}"
+    );
+    assert!(
+        body.contains("tunasync_mirror_size_bytes{mirror=\"debian\",worker=\"w1\"}"),
+        "{body}"
+    );
+}
+
+// ── multi-worker same mirror ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn multi_worker_same_mirror_name() {
+    let app = make_app();
+    setup_worker_and_mirror(&app, "w1", "ubuntu").await;
+    setup_worker_and_mirror(&app, "w2", "ubuntu").await;
+
+    // GET /jobs should show both (as WebMirrorStatus — no worker field).
+    let (_, jobs) = get_json(&app, "/jobs").await;
+    assert_eq!(jobs.as_array().unwrap().len(), 2);
+
+    // GET /jobs/ubuntu should return both MirrorStatus (with worker field).
+    let (_, detail) = get_json(&app, "/jobs/ubuntu").await;
+    let arr = detail.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    let workers: Vec<&str> = arr.iter().map(|j| j["worker"].as_str().unwrap()).collect();
+    assert!(workers.contains(&"w1"));
+    assert!(workers.contains(&"w2"));
+}
+
 #[tokio::test]
 async fn get_mirror_by_name() {
     let app = make_app();
