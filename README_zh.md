@@ -313,7 +313,7 @@ Worker 与 Manager 之间使用 HTTP(S) 通信。如果两者运行在同一台�
 
 ### 以 systemd 服务运行
 
-示例服务文件在 `systemd/` 目录中提供。
+服务文件位于 `initscripts/` 目录。
 
 ```bash
 # 创建 tunasync 用户
@@ -325,8 +325,8 @@ sudo cp target/release/tunasynctl /usr/bin/
 
 # 安装配置和服务文件
 sudo mkdir -p /etc/tunasync /var/lib/tunasync
-sudo cp systemd/tunasync-manager.service /etc/systemd/system/
-sudo cp systemd/tunasync-worker.service /etc/systemd/system/
+sudo cp initscripts/tunasync-manager.service /etc/systemd/system/
+sudo cp initscripts/tunasync-worker.service /etc/systemd/system/
 sudo cp manager.conf /etc/tunasync/
 sudo cp worker.conf /etc/tunasync/
 
@@ -343,11 +343,11 @@ sudo systemctl reload tunasync-worker
 
 ### 使用 SysVinit (init.d) 运行
 
-Debian/Ubuntu 风格的 SysVinit 脚本位于 `init.d/` 目录。
+SysVinit 脚本位于 `initscripts/` 目录。
 
 ```bash
-sudo cp init.d/tunasync-manager /etc/init.d/
-sudo cp init.d/tunasync-worker /etc/init.d/
+sudo cp initscripts/tunasync-manager.initd /etc/init.d/tunasync-manager
+sudo cp initscripts/tunasync-worker.initd /etc/init.d/tunasync-worker
 sudo chmod +x /etc/init.d/tunasync-manager /etc/init.d/tunasync-worker
 
 # 启用并启动
@@ -362,11 +362,11 @@ sudo service tunasync-worker reload
 
 ### 使用 OpenRC (Alpine、Gentoo) 运行
 
-OpenRC 脚本位于 `openrc/` 目录。
+OpenRC 脚本位于 `initscripts/` 目录。
 
 ```bash
-sudo cp openrc/tunasync-manager /etc/init.d/
-sudo cp openrc/tunasync-worker /etc/init.d/
+sudo cp initscripts/tunasync-manager.openrc /etc/init.d/tunasync-manager
+sudo cp initscripts/tunasync-worker.openrc /etc/init.d/tunasync-worker
 sudo chmod +x /etc/init.d/tunasync-manager /etc/init.d/tunasync-worker
 
 # 启用并启动

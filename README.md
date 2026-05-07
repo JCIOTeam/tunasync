@@ -313,7 +313,7 @@ For encrypted communication, set `ssl_cert` and `ssl_key` on the manager, `ca_ce
 
 ### Running as a systemd service
 
-Example service files are provided in the `systemd/` directory.
+Service files are provided in the `initscripts/` directory.
 
 ```bash
 # Create tunasync user
@@ -325,8 +325,8 @@ sudo cp target/release/tunasynctl /usr/bin/
 
 # Install config and service files
 sudo mkdir -p /etc/tunasync /var/lib/tunasync
-sudo cp systemd/tunasync-manager.service /etc/systemd/system/
-sudo cp systemd/tunasync-worker.service /etc/systemd/system/
+sudo cp initscripts/tunasync-manager.service /etc/systemd/system/
+sudo cp initscripts/tunasync-worker.service /etc/systemd/system/
 sudo cp manager.conf /etc/tunasync/
 sudo cp worker.conf /etc/tunasync/
 
@@ -343,11 +343,11 @@ The `--with-systemd` flag in the service files suppresses timestamps and ANSI co
 
 ### Running with SysVinit (init.d)
 
-Scripts for Debian/Ubuntu-style SysVinit are provided in the `init.d/` directory.
+Scripts for Debian/Ubuntu-style SysVinit are provided in the `initscripts/` directory.
 
 ```bash
-sudo cp init.d/tunasync-manager /etc/init.d/
-sudo cp init.d/tunasync-worker /etc/init.d/
+sudo cp initscripts/tunasync-manager.initd /etc/init.d/tunasync-manager
+sudo cp initscripts/tunasync-worker.initd /etc/init.d/tunasync-worker
 sudo chmod +x /etc/init.d/tunasync-manager /etc/init.d/tunasync-worker
 
 # Enable and start
@@ -362,11 +362,11 @@ sudo service tunasync-worker reload
 
 ### Running with OpenRC (Alpine, Gentoo)
 
-Scripts for OpenRC are provided in the `openrc/` directory.
+Scripts for OpenRC are provided in the `initscripts/` directory.
 
 ```bash
-sudo cp openrc/tunasync-manager /etc/init.d/
-sudo cp openrc/tunasync-worker /etc/init.d/
+sudo cp initscripts/tunasync-manager.openrc /etc/init.d/tunasync-manager
+sudo cp initscripts/tunasync-worker.openrc /etc/init.d/tunasync-worker
 sudo chmod +x /etc/init.d/tunasync-manager /etc/init.d/tunasync-worker
 
 # Enable and start
