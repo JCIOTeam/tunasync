@@ -259,7 +259,7 @@ mod redis_db {
 fn make_app() -> axum::Router {
     let db = open_db("sqlite", &tmp_path("server")).unwrap();
     let http_client = reqwest::Client::new();
-    let state = AppState { db, http_client };
+    let state = std::sync::Arc::new(AppState { db, http_client });
     build_router(state)
 }
 

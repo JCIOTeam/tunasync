@@ -84,10 +84,10 @@ fn bad_req(msg: impl Into<String>) -> Response {
 
 /// Build the axum router for the manager service.
 ///
-/// `state` is wrapped in `Arc` so handlers can share it via `clone`.
-pub fn build_router(state: AppState) -> Router {
-    let shared = Arc::new(state);
-
+/// Takes a pre-built `Arc<AppState>` so the caller can retain a clone for
+/// background tasks (status-file writer, etc.) without needing to go through
+/// the router.
+pub fn build_router(shared: Arc<AppState>) -> Router {
     Router::new()
         .route("/ping", get(ping))
         .route("/jobs", get(list_all_jobs).head(list_all_jobs_head))
@@ -101,6 +101,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/workers/:id/jobs/:job/size", post(update_mirror_size))
         .route("/workers/:id/schedules", post(update_schedules_of_worker))
         .route("/cmd", post(handle_client_cmd))
+        .route("/metrics", get(metrics))
         .with_state(shared)
 }
 
@@ -490,5 +491,217 @@ fn zero_mirror_status(name: &str, worker: &str) -> MirrorStatus {
         upstream: String::new(),
         size: String::new(),
         error_msg: String::new(),
+    }
+}
+
+// Metrics
+
+/// `GET /metrics` — Prometheus text exposition (format version 0.0.4).
+///
+/// Exposes per-mirror and aggregate metrics readable by any Prometheus-
+/// compatible scraper (Prometheus, VictoriaMetrics, Grafana Agent, etc.).
+///
+/// Status codes for `tunasync_mirror_status`:
+///   0 none | 1 pre-syncing | 2 syncing | 3 success | 4 failed | 5 paused | 6 disabled
+async fn metrics(State(state): State<Arc<AppState>>) -> Response {
+    let mirrors = match state.db.list_all_mirror_status() {
+        Ok(m) => m,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("# ERROR {e}\n")).into_response()
+        }
+    };
+    let workers = match state.db.list_workers() {
+        Ok(w) => w,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("# ERROR {e}\n")).into_response()
+        }
+    };
+
+    let body = render_metrics(&mirrors, workers.len());
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
+        .into_response()
+}
+
+/// Render the Prometheus text payload from current mirror status.
+/// Extracted for testability.
+pub(crate) fn render_metrics(mirrors: &[MirrorStatus], worker_count: usize) -> String {
+    use std::collections::HashMap;
+
+    let mut out = String::with_capacity(mirrors.len() * 256);
+
+    // ── tunasync_workers_total ──────────────────────────────────────────────
+    out.push_str("# HELP tunasync_workers_total Number of registered workers.\n");
+    out.push_str("# TYPE tunasync_workers_total gauge\n");
+    out.push_str(&format!("tunasync_workers_total {worker_count}\n"));
+
+    // ── tunasync_mirrors_total ─────────────────────────────────────────────
+    let mut by_status: HashMap<&str, usize> = HashMap::new();
+    for m in mirrors {
+        *by_status.entry(m.status.as_str()).or_insert(0) += 1;
+    }
+    out.push_str("# HELP tunasync_mirrors_total Number of mirrors in each status.\n");
+    out.push_str("# TYPE tunasync_mirrors_total gauge\n");
+    for status_str in &[
+        "none",
+        "pre-syncing",
+        "syncing",
+        "success",
+        "failed",
+        "paused",
+        "disabled",
+    ] {
+        let n = by_status.get(*status_str).copied().unwrap_or(0);
+        out.push_str(&format!(
+            "tunasync_mirrors_total{{status=\"{status_str}\"}} {n}\n"
+        ));
+    }
+
+    // ── per-mirror metrics ──────────────────────────────────────────────────
+    out.push_str(concat!(
+        "# HELP tunasync_mirror_status Sync status code: ",
+        "0=none 1=pre-syncing 2=syncing 3=success 4=failed 5=paused 6=disabled.\n",
+        "# TYPE tunasync_mirror_status gauge\n",
+    ));
+    out.push_str(concat!(
+        "# HELP tunasync_mirror_size_bytes Mirror size in bytes ",
+        "(-1 if unknown or unparseable).\n",
+        "# TYPE tunasync_mirror_size_bytes gauge\n",
+    ));
+    out.push_str(concat!(
+        "# HELP tunasync_mirror_last_success_timestamp_seconds ",
+        "Unix timestamp of the last successful sync (0 if never succeeded).\n",
+        "# TYPE tunasync_mirror_last_success_timestamp_seconds gauge\n",
+    ));
+    out.push_str(concat!(
+        "# HELP tunasync_mirror_last_sync_duration_seconds ",
+        "Duration of the most recent completed sync in seconds (0 if never run).\n",
+        "# TYPE tunasync_mirror_last_sync_duration_seconds gauge\n",
+    ));
+
+    let epoch = tunasync_protocol::zero_time();
+    for m in mirrors {
+        let labels = format!("mirror=\"{}\",worker=\"{}\"", m.name, m.worker);
+        let code = status_code(m.status);
+
+        // status
+        out.push_str(&format!("tunasync_mirror_status{{{labels}}} {code}\n"));
+
+        // size
+        let size_bytes = parse_size_bytes(&m.size);
+        out.push_str(&format!(
+            "tunasync_mirror_size_bytes{{{labels}}} {size_bytes}\n"
+        ));
+
+        // last success timestamp
+        let ts = if m.last_update > epoch {
+            m.last_update.timestamp()
+        } else {
+            0
+        };
+        out.push_str(&format!(
+            "tunasync_mirror_last_success_timestamp_seconds{{{labels}}} {ts}\n"
+        ));
+
+        // last sync duration
+        let duration =
+            if m.last_ended > epoch && m.last_started > epoch && m.last_ended >= m.last_started {
+                (m.last_ended - m.last_started).num_seconds().max(0)
+            } else {
+                0
+            };
+        out.push_str(&format!(
+            "tunasync_mirror_last_sync_duration_seconds{{{labels}}} {duration}\n"
+        ));
+    }
+
+    out
+}
+
+/// Map `SyncStatus` to an integer code for Prometheus gauges.
+fn status_code(s: SyncStatus) -> u8 {
+    match s {
+        SyncStatus::None => 0,
+        SyncStatus::PreSyncing => 1,
+        SyncStatus::Syncing => 2,
+        SyncStatus::Success => 3,
+        SyncStatus::Failed => 4,
+        SyncStatus::Paused => 5,
+        SyncStatus::Disabled => 6,
+    }
+}
+
+/// Parse a human-readable size string produced by rsync `--stats` into bytes.
+///
+/// Handles formats produced by tunasync's `extract_size_from_rsync_log`:
+/// `"1.23G"`, `"500M"`, `"10.5T"`, `"100K"`, plain `"12345"`.
+/// Returns `-1` for empty, `"unknown"`, or unparseable input.
+fn parse_size_bytes(s: &str) -> i64 {
+    let s = s.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("unknown") {
+        return -1;
+    }
+    // Strip trailing 'B' if present (e.g. "1.5GB" → "1.5G")
+    let s = s.strip_suffix('B').unwrap_or(s);
+    let (num_str, multiplier) = match s.chars().last() {
+        Some('K') | Some('k') => (&s[..s.len() - 1], 1_024i64),
+        Some('M') | Some('m') => (&s[..s.len() - 1], 1_024 * 1_024),
+        Some('G') | Some('g') => (&s[..s.len() - 1], 1_024 * 1_024 * 1_024),
+        Some('T') | Some('t') => (&s[..s.len() - 1], 1_024 * 1_024 * 1_024 * 1_024),
+        Some('P') | Some('p') => (&s[..s.len() - 1], 1_024 * 1_024 * 1_024 * 1_024 * 1_024),
+        _ => (s, 1i64),
+    };
+    num_str
+        .parse::<f64>()
+        .map(|n| (n * multiplier as f64).round() as i64)
+        .unwrap_or(-1)
+}
+
+// Size parsing is also used by the status-file writer in lib.rs via render_metrics.
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+
+    #[test]
+    fn parse_size_bytes_variants() {
+        assert_eq!(parse_size_bytes("1K"), 1_024);
+        assert_eq!(
+            parse_size_bytes("1.5G"),
+            (1.5 * 1024.0 * 1024.0 * 1024.0) as i64
+        );
+        assert_eq!(parse_size_bytes("100M"), 100 * 1024 * 1024);
+        assert_eq!(parse_size_bytes("2T"), 2 * 1024 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size_bytes("1GB"), 1024 * 1024 * 1024);
+        assert_eq!(parse_size_bytes("12345"), 12345);
+        assert_eq!(parse_size_bytes("unknown"), -1);
+        assert_eq!(parse_size_bytes(""), -1);
+    }
+
+    #[test]
+    fn render_metrics_smoke() {
+        use tunasync_protocol::{zero_time, SyncStatus};
+        let mirrors = vec![MirrorStatus {
+            name: "ubuntu".into(),
+            worker: "w1".into(),
+            is_master: true,
+            status: SyncStatus::Success,
+            last_update: chrono::Utc::now(),
+            last_started: chrono::Utc::now() - chrono::Duration::seconds(3600),
+            last_ended: chrono::Utc::now(),
+            scheduled: zero_time(),
+            upstream: "rsync://example.com/".into(),
+            size: "1.5G".into(),
+            error_msg: String::new(),
+        }];
+        let out = render_metrics(&mirrors, 2);
+        assert!(out.contains("tunasync_workers_total 2"));
+        assert!(out.contains("tunasync_mirror_status{mirror=\"ubuntu\",worker=\"w1\"} 3"));
+        assert!(out.contains("tunasync_mirror_size_bytes{mirror=\"ubuntu\",worker=\"w1\"}"));
+        assert!(out.contains("tunasync_mirrors_total{status=\"success\"} 1"));
+        assert!(out.contains("tunasync_mirrors_total{status=\"failed\"} 0"));
     }
 }

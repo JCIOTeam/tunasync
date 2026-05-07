@@ -262,6 +262,10 @@ port = 14242                             # 监听端口（默认: 14242）
 db_type = "sqlite"                       # "redb"（默认）、"sqlite" 或 "redis"
 db_file = "/tmp/tunasync/manager-db/tunasync.db"  # 数据库文件路径
 # ca_cert = ""                           # Worker TLS 验证的 CA 证书
+# status_file = "/var/lib/tunasync/tunasync.json"
+                                         # 每 30 秒写一次的 JSON 状态快照文件。
+                                         # 父目录不存在时自动跳过。
+                                         # 设为 "" 可禁用。
 ```
 
 支持的 `db_type`：`redb`（默认）、`sqlite`、`redis`。使用 Redis 时，`db_file` 应设为 Redis URL（如 `redis://localhost:6379/0`）。数据与 Go 版完全兼容 — 两个版本可以共享同一个 Redis 实例。
@@ -590,7 +594,7 @@ Examples:
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/ping` | 存活检查 → `{ "message": "pong" }` |
+| GET | `/metrics` | Prometheus 指标（镜像状态、大小、时间戳、worker 数量） |
 | GET | `/jobs` | 列出所有镜像（摘要，不含 `error_msg`） |
 | HEAD | `/jobs` | 检查镜像可用性（同 GET，无响应体） |
 | GET | `/jobs/:name` | 镜像详情，跨所有 worker（含 `error_msg`、时间戳） |

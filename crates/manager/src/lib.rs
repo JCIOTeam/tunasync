@@ -10,6 +10,7 @@ pub mod db;
 pub mod server;
 
 use anyhow::{Context, Result};
+use std::sync::Arc;
 use tokio::net::TcpListener;
 
 use crate::config::ManagerConfig;
@@ -61,9 +62,26 @@ pub async fn run_with_config(cfg: ManagerConfig) -> Result<()> {
             .build()?
     };
 
-    let state = AppState { db, http_client };
-    let router = build_router(state);
+    // Wrap in Arc so both the router and background tasks share the same state.
+    let state = std::sync::Arc::new(AppState { db, http_client });
 
+    // Spawn status-file writer if the parent directory exists.
+    let status_file = cfg.files.status_file.clone();
+    if let Some(parent) = status_file.parent() {
+        if parent.exists() {
+            let state_clone = std::sync::Arc::clone(&state);
+            tokio::spawn(async move {
+                status_file_writer(state_clone, status_file).await;
+            });
+        } else {
+            tracing::warn!(
+                path = %status_file.display(),
+                "status_file parent directory does not exist — status file will not be written"
+            );
+        }
+    }
+
+    let router = build_router(state);
     let bind_addr = cfg.server.bind_addr();
 
     // Graceful shutdown signal (SIGTERM or SIGINT).
@@ -110,4 +128,70 @@ pub async fn run_with_config(cfg: ManagerConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Background task: write a JSON snapshot of all mirror statuses to
+/// `status_file` every 30 seconds.
+///
+/// Writes atomically via a `.tmp` file + rename so readers never see a
+/// partially-written file.  Errors are logged but never fatal — a transient
+/// write failure will retry on the next tick.
+async fn status_file_writer(state: std::sync::Arc<AppState>, path: std::path::PathBuf) {
+    use std::time::Duration;
+    use tokio::time;
+
+    tracing::info!(path = %path.display(), interval_s = 30, "status file writer started");
+
+    let mut interval = time::interval(Duration::from_secs(30));
+    // Skip the first tick (fires immediately) to avoid a write at t=0 before
+    // the manager has received any status updates.
+    interval.tick().await;
+
+    loop {
+        interval.tick().await;
+
+        let mirrors = match state.db.list_all_mirror_status() {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, "status_file: failed to read mirror status");
+                continue;
+            }
+        };
+
+        let web: Vec<tunasync_protocol::WebMirrorStatus> = mirrors
+            .iter()
+            .map(tunasync_protocol::WebMirrorStatus::from_mirror_status)
+            .collect();
+
+        let json = match serde_json::to_string_pretty(&web) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!(error = %e, "status_file: JSON serialization failed");
+                continue;
+            }
+        };
+
+        // Atomic write: write to <path>.tmp then rename.
+        let tmp_path = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp_path, &json) {
+            tracing::warn!(
+                path = %tmp_path.display(),
+                error = %e,
+                "status_file: failed to write tmp file"
+            );
+            continue;
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, &path) {
+            tracing::warn!(
+                src = %tmp_path.display(),
+                dst = %path.display(),
+                error = %e,
+                "status_file: rename failed"
+            );
+            let _ = std::fs::remove_file(&tmp_path);
+            continue;
+        }
+
+        tracing::debug!(path = %path.display(), mirrors = mirrors.len(), "status file updated");
+    }
 }

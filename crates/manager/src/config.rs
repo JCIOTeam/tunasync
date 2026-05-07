@@ -64,11 +64,14 @@ impl Default for ServerConfig {
 /// Filesystem paths owned by the manager.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilesConfig {
-    /// Path to the JSON status file written by the manager.
+    /// Path to the JSON status file written by the manager every 30 seconds.
     ///
     /// Matches Go's `FileConfig.StatusFile` (`toml:"status_file"`).
     /// Default: `/var/lib/tunasync/tunasync.json`.
-    /// External tools (e.g. status pages) may read this file.
+    ///
+    /// Written atomically (via a `.tmp` rename).  Skipped silently if the
+    /// parent directory does not exist (e.g. dev setups without
+    /// `/var/lib/tunasync/`).  Set to `""` to disable entirely.
     #[serde(default = "FilesConfig::default_status_file")]
     pub status_file: PathBuf,
 

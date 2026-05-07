@@ -262,6 +262,10 @@ port = 14242                             # Listen port (default: 14242)
 db_type = "sqlite"                       # "redb" (default), "sqlite", or "redis"
 db_file = "/tmp/tunasync/manager-db/tunasync.db"  # DB file path
 # ca_cert = ""                           # CA cert for worker TLS verification
+# status_file = "/var/lib/tunasync/tunasync.json"
+                                         # JSON status snapshot written every 30 s.
+                                         # Skipped if parent dir does not exist.
+                                         # Set to "" to disable.
 ```
 
 Supported `db_type` values: `redb` (default), `sqlite`, `redis`. When using Redis, set `db_file` to a Redis URL (e.g. `redis://localhost:6379/0`). Data is wire-compatible with Go — both versions can share the same Redis instance.
@@ -590,7 +594,7 @@ Examples:
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/ping` | Liveness check → `{ "message": "pong" }` |
+| GET | `/metrics` | Prometheus metrics (mirror status, size, timestamps, worker count) |
 | GET | `/jobs` | List all mirrors (summary, no `error_msg`) |
 | HEAD | `/jobs` | Check mirror availability (same as GET, no body) |
 | GET | `/jobs/:name` | Mirror detail across all workers (includes `error_msg`, timestamps) |
