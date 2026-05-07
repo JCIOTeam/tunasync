@@ -10,7 +10,6 @@ pub mod db;
 pub mod server;
 
 use anyhow::{Context, Result};
-use std::sync::Arc;
 use tokio::net::TcpListener;
 
 use crate::config::ManagerConfig;
