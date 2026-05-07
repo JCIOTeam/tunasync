@@ -1,0 +1,25 @@
+#!/sbin/openrc-run
+# tunasync-worker — OpenRC init script for the tunasync worker.
+
+name="tunasync-worker"
+description="TUNA mirrors sync worker"
+
+command="/usr/bin/tunasync"
+command_args="worker -c /etc/tunasync/worker.conf --pidfile ${pidfile}"
+command_user="tunasync:tunasync"
+
+pidfile="/run/tunasync/tunasync.worker.pid"
+
+depend() {
+    need net
+}
+
+reload() {
+    ebegin "Hot-reloading ${name} config"
+    kill -HUP "$(cat "${pidfile}")"
+    eend $?
+}
+
+start_pre() {
+    checkpath --directory --owner tunasync:tunasync --mode 0755 /run/tunasync
+}

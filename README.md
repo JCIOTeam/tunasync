@@ -341,6 +341,44 @@ sudo systemctl reload tunasync-worker
 
 The `--with-systemd` flag in the service files suppresses timestamps and ANSI colours in log output, since systemd journal already adds timestamps.
 
+### Running with SysVinit (init.d)
+
+Scripts for Debian/Ubuntu-style SysVinit are provided in the `init.d/` directory.
+
+```bash
+sudo cp init.d/tunasync-manager /etc/init.d/
+sudo cp init.d/tunasync-worker /etc/init.d/
+sudo chmod +x /etc/init.d/tunasync-manager /etc/init.d/tunasync-worker
+
+# Enable and start
+sudo update-rc.d tunasync-manager defaults
+sudo update-rc.d tunasync-worker defaults
+sudo service tunasync-manager start
+sudo service tunasync-worker start
+
+# Hot-reload worker config
+sudo service tunasync-worker reload
+```
+
+### Running with OpenRC (Alpine, Gentoo)
+
+Scripts for OpenRC are provided in the `openrc/` directory.
+
+```bash
+sudo cp openrc/tunasync-manager /etc/init.d/
+sudo cp openrc/tunasync-worker /etc/init.d/
+sudo chmod +x /etc/init.d/tunasync-manager /etc/init.d/tunasync-worker
+
+# Enable and start
+sudo rc-update add tunasync-manager default
+sudo rc-update add tunasync-worker default
+sudo rc-service tunasync-manager start
+sudo rc-service tunasync-worker start
+
+# Hot-reload worker config
+sudo rc-service tunasync-worker reload
+```
+
 ## Building
 
 Requires Rust stable (>= 1.80). See `rust-toolchain.toml`.

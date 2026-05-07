@@ -1,0 +1,19 @@
+#!/sbin/openrc-run
+# tunasync-manager — OpenRC init script for the tunasync manager.
+
+name="tunasync-manager"
+description="TUNA mirrors sync manager"
+
+command="/usr/bin/tunasync"
+command_args="manager -c /etc/tunasync/manager.conf --pidfile ${pidfile}"
+command_user="tunasync:tunasync"
+
+pidfile="/run/tunasync/tunasync.manager.pid"
+
+depend() {
+    need net
+}
+
+start_pre() {
+    checkpath --directory --owner tunasync:tunasync --mode 0755 /run/tunasync
+}

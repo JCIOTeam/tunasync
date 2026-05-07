@@ -341,6 +341,44 @@ sudo systemctl reload tunasync-worker
 
 服务文件中的 `--with-systemd` 参数会抑制日志中的时间戳和 ANSI 颜色，因为 systemd journal 已经自带时间戳。
 
+### 使用 SysVinit (init.d) 运行
+
+Debian/Ubuntu 风格的 SysVinit 脚本位于 `init.d/` 目录。
+
+```bash
+sudo cp init.d/tunasync-manager /etc/init.d/
+sudo cp init.d/tunasync-worker /etc/init.d/
+sudo chmod +x /etc/init.d/tunasync-manager /etc/init.d/tunasync-worker
+
+# 启用并启动
+sudo update-rc.d tunasync-manager defaults
+sudo update-rc.d tunasync-worker defaults
+sudo service tunasync-manager start
+sudo service tunasync-worker start
+
+# 热重载 Worker 配置
+sudo service tunasync-worker reload
+```
+
+### 使用 OpenRC (Alpine、Gentoo) 运行
+
+OpenRC 脚本位于 `openrc/` 目录。
+
+```bash
+sudo cp openrc/tunasync-manager /etc/init.d/
+sudo cp openrc/tunasync-worker /etc/init.d/
+sudo chmod +x /etc/init.d/tunasync-manager /etc/init.d/tunasync-worker
+
+# 启用并启动
+sudo rc-update add tunasync-manager default
+sudo rc-update add tunasync-worker default
+sudo rc-service tunasync-manager start
+sudo rc-service tunasync-worker start
+
+# 热重载 Worker 配置
+sudo rc-service tunasync-worker reload
+```
+
 ## 编译
 
 需要 Rust stable（>= 1.80），参见 `rust-toolchain.toml`。

@@ -1,0 +1,51 @@
+#!/bin/sh
+# tunasync-worker — SysVinit / LSB init script for the tunasync worker.
+#
+# chkconfig: 35 80 20
+# description: TUNA mirrors sync worker
+
+NAME="tunasync-worker"
+DAEMON=/usr/bin/tunasync
+CONF=/etc/tunasync/worker.conf
+PIDFILE=/run/tunasync/tunasync.worker.pid
+USER=tunasync
+
+. /lib/lsb/init-functions
+
+start() {
+    log_begin_msg "Starting $NAME"
+    mkdir -p /run/tunasync
+    start-stop-daemon --start --quiet --pidfile "$PIDFILE" \
+        --chuid "$USER" --exec "$DAEMON" \
+        -- background worker -c "$CONF" --pidfile "$PIDFILE"
+    log_end_msg $?
+}
+
+stop() {
+    log_begin_msg "Stopping $NAME"
+    start-stop-daemon --stop --quiet --pidfile "$PIDFILE" --retry 5
+    log_end_msg $?
+}
+
+reload() {
+    log_begin_msg "Reloading $NAME (hot-reload config)"
+    if [ -f "$PIDFILE" ]; then
+        kill -HUP "$(cat "$PIDFILE")"
+        log_end_msg 0
+    else
+        log_end_msg 1
+    fi
+}
+
+status() {
+    status_of_proc -p "$PIDFILE" "$DAEMON" "$NAME"
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    reload)  reload ;;
+    restart) stop && start ;;
+    status)  status ;;
+    *)       log_failure_msg "Usage: $0 {start|stop|reload|restart|status}" && exit 2 ;;
+esac
