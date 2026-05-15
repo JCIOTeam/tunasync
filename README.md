@@ -309,6 +309,33 @@ tunasynctl disable elvish -p 14242
 tunasynctl reload test_worker -p 14242
 ```
 
+### Shell completion
+
+Pre-generated completion scripts for bash, zsh, and fish are in the `completions/` directory. They support static flag completion and — when `jq` is available and the manager is reachable — dynamic completion of mirror names and worker IDs.
+
+```bash
+# bash (system-wide)
+sudo cp completions/tunasynctl.bash /etc/bash_completion.d/tunasynctl
+
+# bash (per user)
+tunasynctl completion bash >> ~/.bashrc && source ~/.bashrc
+
+# zsh
+tunasynctl completion zsh >> ~/.zshrc && source ~/.zshrc
+
+# fish
+tunasynctl completion fish > ~/.config/fish/completions/tunasynctl.fish
+```
+
+### Language / 语言
+
+`tunasynctl` detects the system locale and outputs Chinese when `LANG` (or `LANGUAGE`, `LC_ALL`, `LC_MESSAGES`) starts with `zh`. Use `TUNASYNCTL_LANG` to override explicitly:
+
+```bash
+TUNASYNCTL_LANG=zh tunasynctl list --format table   # Force Chinese
+TUNASYNCTL_LANG=en tunasynctl list --format table   # Force English
+```
+
 ### Security
 
 Worker-manager communication uses HTTP(S). If both run on the same machine, plain HTTP is sufficient — leave `ssl_cert` / `ssl_key` empty on the manager and `ca_cert` empty on the worker, with `api_base` using `http://`.

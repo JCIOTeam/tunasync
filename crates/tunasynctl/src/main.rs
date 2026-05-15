@@ -1,28 +1,59 @@
 //! `tunasynctl` — CLI control tool for a tunasync manager.
 //!
-//! Wire-compatible with Go's `cmd/tunasynctl/tunasynctl.go`.
-//! All subcommands use the same JSON API that the Go manager exposes.
-//!
 //! Config file priority (matches Go exactly):
 //!   1. `/etc/tunasync/ctl.conf`          (system-wide)
 //!   2. `$HOME/.config/tunasync/ctl.conf` (user-specific)
 //!   3. `--config FILE`                   (explicit override)
 //!   4. CLI flags (`--manager`, `--port`, `--ca-cert`)
+//!
+//! Language detection order (first match wins):
+//!   1. `TUNASYNCTL_LANG=zh` (or any value starting with "zh")
+//!   2. `LANG`, `LANGUAGE`, `LC_ALL`, `LC_MESSAGES` starting with "zh"
+//!   3. Default: English
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap_complete::Shell;
 use serde::Deserialize;
 use tunasync_protocol::{ClientCmd, CmdVerb, MirrorStatus, WebMirrorStatus, WorkerStatus};
 
-// ---------------------------------------------------------------------------
-// tunasynctl config file  (TOML, matches Go's `config` struct)
-// ---------------------------------------------------------------------------
+// ── i18n ─────────────────────────────────────────────────────────────────────
 
-/// Configuration loaded from `/etc/tunasync/ctl.conf` or
-/// `~/.config/tunasync/ctl.conf`.  Field names match Go's TOML tags exactly.
+/// Returns true when the effective locale is Chinese.
+///
+/// Checks (in order):
+///   1. `TUNASYNCTL_LANG` — explicit override (`zh` → Chinese, anything else → English)
+///   2. `LANG`, `LANGUAGE`, `LC_ALL`, `LC_MESSAGES` — standard POSIX locale vars
+fn is_zh() -> bool {
+    if let Ok(v) = std::env::var("TUNASYNCTL_LANG") {
+        return v.to_ascii_lowercase().starts_with("zh");
+    }
+    for var in &["LANG", "LANGUAGE", "LC_ALL", "LC_MESSAGES"] {
+        if let Ok(v) = std::env::var(var) {
+            if v.to_ascii_lowercase().starts_with("zh") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Pick between an English and a Chinese string based on the current locale.
+macro_rules! t {
+    ($en:expr, $zh:expr) => {
+        if is_zh() {
+            $zh
+        } else {
+            $en
+        }
+    };
+}
+
+// ── Config file ───────────────────────────────────────────────────────────────
+
 #[derive(Debug, Default, Deserialize)]
 struct CtlConfig {
     #[serde(default)]
@@ -34,15 +65,8 @@ struct CtlConfig {
 }
 
 impl CtlConfig {
-    /// Load and merge config files in Go's priority order.
-    ///
-    /// Later sources override earlier ones:
-    ///   1. system (`/etc/tunasync/ctl.conf`)
-    ///   2. user   (`$HOME/.config/tunasync/ctl.conf`)
-    ///   3. explicit `--config FILE`
     fn load(explicit: Option<&PathBuf>) -> Self {
         let mut merged = Self::default();
-
         let system_path = PathBuf::from("/etc/tunasync/ctl.conf");
         let user_path = std::env::var("HOME")
             .ok()
@@ -73,14 +97,11 @@ impl CtlConfig {
                 }
             }
         }
-
         merged
     }
 }
 
-// ---------------------------------------------------------------------------
-// CLI shape
-// ---------------------------------------------------------------------------
+// ── CLI definition ────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
 #[command(
@@ -102,8 +123,7 @@ struct Cli {
     #[arg(short, long, env = "TUNASYNC_MANAGER_PORT", global = true)]
     port: Option<u16>,
 
-    /// CA cert for pinning the manager's TLS certificate.
-    /// When set the base URL scheme is upgraded to https.
+    /// CA cert for TLS verification (enables HTTPS).
     #[arg(long, global = true)]
     ca_cert: Option<PathBuf>,
 
@@ -185,11 +205,97 @@ enum Command {
         /// Worker ID.
         worker: String,
     },
+    /// Generate shell completion script.
+    ///
+    /// Usage:
+    ///   tunasynctl completion bash >> ~/.bashrc
+    ///   tunasynctl completion zsh  >> ~/.zshrc
+    Completion {
+        /// Shell type.
+        shell: Shell,
+    },
 }
 
-// ---------------------------------------------------------------------------
-// Manager API client
-// ---------------------------------------------------------------------------
+/// Build the clap Command with help text in the current locale.
+///
+/// The derive macro generates help strings from `///` doc comments (English).
+/// This function patches them with Chinese equivalents when the locale calls for it.
+fn build_command() -> clap::Command {
+    let mut cmd = Cli::command();
+
+    if !is_zh() {
+        return cmd;
+    }
+
+    cmd = cmd
+        .about("tunasync manager 控制工具")
+        .mut_arg("config", |a| {
+            a.help("配置文件路径（覆盖系统和用户配置文件）")
+        })
+        .mut_arg("manager", |a| a.help("Manager 主机地址或 IP"))
+        .mut_arg("port", |a| a.help("Manager 端口"))
+        .mut_arg("ca-cert", |a| a.help("TLS CA 证书（启用 HTTPS）"))
+        .mut_arg("verbose", |a| a.help("详细日志输出"));
+
+    cmd = cmd
+        .mut_subcommand("list", |s| {
+            s.about("列出镜像任务")
+                .mut_arg("worker", |a| a.help("指定 Worker；省略则列出所有"))
+                .mut_arg("status", |a| {
+                    a.help("按状态过滤（逗号分隔）：syncing、failed、success 等")
+                })
+                .mut_arg("format", |a| a.help("输出格式：json（默认）或 table"))
+                .mut_arg("all", |a| a.help("显示所有 Worker 的任务"))
+        })
+        .mut_subcommand("workers", |s| s.about("列出所有已注册的 Worker"))
+        .mut_subcommand("flush", |s| s.about("从 manager 数据库中清除所有 disabled 任务记录"))
+        .mut_subcommand("rm-worker", |s| {
+            s.about("从 manager 中移除一个 Worker")
+                .mut_arg("worker", |a| a.help("Worker ID"))
+        })
+        .mut_subcommand("set-size", |s| {
+            s.about("手动设置镜像大小（运维覆盖）")
+                .mut_arg("mirror", |a| a.help("镜像名称"))
+                .mut_arg("size", |a| a.help("大小字符串，如 1.2T"))
+                .mut_arg("worker", |a| a.help("限定到指定 Worker"))
+        })
+        .mut_subcommand("start", |s| {
+            s.about("启动镜像同步任务")
+                .mut_arg("mirror", |a| a.help("镜像名称，或 `all` 广播给所有"))
+                .mut_arg("worker", |a| a.help("限定到指定 Worker"))
+                .mut_arg("force", |a| a.help("忽略并发限制强制启动"))
+        })
+        .mut_subcommand("stop", |s| {
+            s.about("停止正在运行的镜像任务")
+                .mut_arg("mirror", |a| a.help("镜像名称"))
+                .mut_arg("worker", |a| a.help("限定到指定 Worker"))
+        })
+        .mut_subcommand("disable", |s| {
+            s.about("禁用镜像任务（重新启用前不会运行）")
+                .mut_arg("mirror", |a| a.help("镜像名称"))
+                .mut_arg("worker", |a| a.help("限定到指定 Worker"))
+        })
+        .mut_subcommand("restart", |s| {
+            s.about("重启镜像任务")
+                .mut_arg("mirror", |a| a.help("镜像名称"))
+                .mut_arg("worker", |a| a.help("限定到指定 Worker"))
+        })
+        .mut_subcommand("reload", |s| {
+            s.about("通知 Worker 从磁盘热重载配置文件")
+                .mut_arg("worker", |a| a.help("Worker ID"))
+        })
+        .mut_subcommand("completion", |s| {
+            s.about("生成 Shell 自动补全脚本")
+                .after_help(
+                    "用法示例：\n  tunasynctl completion bash >> ~/.bashrc\n  tunasynctl completion zsh  >> ~/.zshrc",
+                )
+                .mut_arg("shell", |a| a.help("Shell 类型"))
+        });
+
+    cmd
+}
+
+// ── HTTP client ───────────────────────────────────────────────────────────────
 
 struct Client {
     base_url: String,
@@ -256,10 +362,6 @@ impl Client {
             .context("decode response JSON")
     }
 
-    // ------------------------------------------------------------------
-    // Manager API calls
-    // ------------------------------------------------------------------
-
     async fn list_all_jobs(&self) -> Result<Vec<WebMirrorStatus>> {
         self.get("/jobs").await
     }
@@ -298,18 +400,9 @@ impl Client {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Build the manager base URL from the resolved config + CLI flags.
-///
-/// Logic matches Go's tunasynctl `initialize()`:
-///   - If ca_cert is set → https scheme
-///   - Otherwise → http scheme
-///   - Host defaults to "localhost", port defaults to 14242
 fn build_base_url(addr: &str, port: u16, has_ca_cert: bool) -> String {
-    // If addr already contains a scheme, use it as-is.
     if addr.starts_with("http://") || addr.starts_with("https://") {
         return addr.trim_end_matches('/').to_owned();
     }
@@ -317,10 +410,6 @@ fn build_base_url(addr: &str, port: u16, has_ca_cert: bool) -> String {
     format!("{scheme}://{addr}:{port}")
 }
 
-/// Resolve the worker ID for a per-mirror command.
-///
-/// If `--worker` is specified → use it directly.
-/// Otherwise, look up the mirror across all workers and return the first match.
 async fn resolve_worker(
     client: &Client,
     mirror: &str,
@@ -329,7 +418,6 @@ async fn resolve_worker(
     if let Some(w) = explicit_worker {
         return Ok(w.to_owned());
     }
-    // Auto-discover which worker owns this mirror.
     let workers = client.list_workers().await?;
     for w in &workers {
         let jobs = client.list_jobs_of_worker(&w.id).await.unwrap_or_default();
@@ -337,9 +425,7 @@ async fn resolve_worker(
             return Ok(w.id.clone());
         }
     }
-    anyhow::bail!(
-        "mirror {mirror:?} not found on any worker; use --worker to specify one explicitly"
-    )
+    anyhow::bail!("mirror {mirror:?} not found on any worker; use --worker / --worker 指定")
 }
 
 fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
@@ -351,22 +437,28 @@ fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
 }
 
 fn print_table_jobs(jobs: &[WebMirrorStatus]) {
-    println!("{:<30} {:<12} {:<20} Size", "Name", "Status", "Last Update");
+    let (h_name, h_status, h_update, h_size) = if is_zh() {
+        ("名称", "状态", "最后更新", "大小")
+    } else {
+        ("Name", "Status", "Last Update", "Size")
+    };
+    println!(
+        "{:<30} {:<12} {:<20} {}",
+        h_name, h_status, h_update, h_size
+    );
     println!("{}", "-".repeat(80));
     for j in jobs {
         println!(
             "{:<30} {:<12} {:<20} {}",
             j.name,
             j.status.to_string(),
-            j.last_update.format("%Y-%m-%d %H:%M:%S").to_string(),
+            j.last_update.format("%Y-%m-%d %H:%M:%S"),
             j.size,
         );
     }
 }
 
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
+// ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -374,14 +466,23 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("failed to install ring crypto provider");
 
-    let cli = Cli::parse();
+    // Build locale-aware command, parse args.
+    let matches = build_command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+
     tunasync_common::logger::init(cli.verbose, false);
 
-    // ── Config resolution (matches Go's `initialize`) ──────────────────────
-    // Load config files, then apply CLI overrides.
+    // Handle completion before any network activity.
+    if let Command::Completion { shell } = &cli.command {
+        let mut cmd = build_command();
+        let name = cmd.get_name().to_string();
+        clap_complete::generate(*shell, &mut cmd, name, &mut std::io::stdout());
+        return Ok(());
+    }
+
+    // ── Config resolution ─────────────────────────────────────────────────────
     let file_cfg = CtlConfig::load(cli.config.as_ref());
 
-    // Effective manager address: CLI > config file > default "localhost".
     let manager_addr = cli.manager.clone().unwrap_or_else(|| {
         if !file_cfg.manager_addr.is_empty() {
             file_cfg.manager_addr.clone()
@@ -389,11 +490,7 @@ async fn main() -> Result<()> {
             "localhost".to_owned()
         }
     });
-
-    // Effective port: CLI > config file > default 14242.
     let manager_port = cli.port.or(file_cfg.manager_port).unwrap_or(14242);
-
-    // Effective CA cert: CLI > config file > none.
     let ca_cert_path: Option<PathBuf> = cli.ca_cert.clone().or_else(|| {
         if !file_cfg.ca_cert.is_empty() {
             Some(PathBuf::from(&file_cfg.ca_cert))
@@ -404,19 +501,18 @@ async fn main() -> Result<()> {
 
     let base_url = build_base_url(&manager_addr, manager_port, ca_cert_path.is_some());
     tracing::info!(%base_url, "connecting to manager");
-
     let client = Client::new(base_url, ca_cert_path.as_ref())?;
 
-    match &cli.command {
-        // ── list ──────────────────────────────────────────────────────────
+    match cli.command {
+        Command::Completion { .. } => unreachable!(),
+
         Command::List {
             worker,
             status,
             format,
             all: _,
         } => {
-            let jobs = if let Some(w) = worker {
-                // List jobs of one worker (MirrorStatus → convert to WebMirrorStatus).
+            let jobs = if let Some(ref w) = worker {
                 client
                     .list_jobs_of_worker(w)
                     .await?
@@ -427,7 +523,6 @@ async fn main() -> Result<()> {
                 client.list_all_jobs().await?
             };
 
-            // Optional status filter.
             let jobs = if let Some(status_filter) = status {
                 let allowed: Vec<tunasync_protocol::SyncStatus> = status_filter
                     .split(',')
@@ -448,48 +543,60 @@ async fn main() -> Result<()> {
             }
         }
 
-        // ── workers ───────────────────────────────────────────────────────
         Command::Workers => {
             let workers = client.list_workers().await?;
             print_json(&workers)?;
         }
 
-        // ── flush ─────────────────────────────────────────────────────────
         Command::Flush => {
-            let resp = client.flush_disabled().await?;
-            tracing::info!("flush response: {resp}");
-            println!("Flushed disabled jobs.");
+            client.flush_disabled().await?;
+            println!(
+                "{}",
+                t!("Flushed disabled jobs.", "已清除所有 disabled 任务。")
+            );
         }
 
-        // ── rm-worker ─────────────────────────────────────────────────────
         Command::RmWorker { worker } => {
-            client.remove_worker(worker).await?;
-            println!("Removed worker {worker}.");
+            client.remove_worker(&worker).await?;
+            println!(
+                "{}",
+                t!(
+                    format!("Removed worker {worker:?}."),
+                    format!("已移除 Worker {worker:?}。")
+                )
+            );
         }
 
-        // ── set-size ──────────────────────────────────────────────────────
         Command::SetSize {
             mirror,
             size,
             worker,
         } => {
-            let worker_id = resolve_worker(&client, mirror, worker.as_deref()).await?;
-            let updated = client.set_size(&worker_id, mirror, size).await?;
+            let worker_id = resolve_worker(&client, &mirror, worker.as_deref()).await?;
+            let updated = client.set_size(&worker_id, &mirror, &size).await?;
             println!(
-                "Updated size of mirror {:?} on worker {:?}: {}",
-                updated.name, updated.worker, updated.size
+                "{}",
+                t!(
+                    format!(
+                        "Updated size of mirror {:?} on worker {:?}: {}",
+                        updated.name, updated.worker, updated.size
+                    ),
+                    format!(
+                        "已更新镜像 {:?}（Worker {:?}）大小：{}",
+                        updated.name, updated.worker, updated.size
+                    )
+                )
             );
         }
 
-        // ── job control commands ───────────────────────────────────────────
         Command::Start {
             mirror,
             worker,
             force,
         } => {
-            let worker_id = resolve_worker(&client, mirror, worker.as_deref()).await?;
+            let worker_id = resolve_worker(&client, &mirror, worker.as_deref()).await?;
             let mut options = HashMap::new();
-            if *force {
+            if force {
                 options.insert("force".into(), true);
             }
             client
@@ -501,11 +608,17 @@ async fn main() -> Result<()> {
                     options,
                 })
                 .await?;
-            println!("Sent start command for mirror {mirror:?}.");
+            println!(
+                "{}",
+                t!(
+                    format!("Sent start command for mirror {mirror:?}."),
+                    format!("已发送启动命令：镜像 {mirror:?}。")
+                )
+            );
         }
 
         Command::Stop { mirror, worker } => {
-            let worker_id = resolve_worker(&client, mirror, worker.as_deref()).await?;
+            let worker_id = resolve_worker(&client, &mirror, worker.as_deref()).await?;
             client
                 .send_cmd(ClientCmd {
                     cmd: CmdVerb::Stop,
@@ -515,11 +628,17 @@ async fn main() -> Result<()> {
                     options: HashMap::new(),
                 })
                 .await?;
-            println!("Sent stop command for mirror {mirror:?}.");
+            println!(
+                "{}",
+                t!(
+                    format!("Sent stop command for mirror {mirror:?}."),
+                    format!("已发送停止命令：镜像 {mirror:?}。")
+                )
+            );
         }
 
         Command::Disable { mirror, worker } => {
-            let worker_id = resolve_worker(&client, mirror, worker.as_deref()).await?;
+            let worker_id = resolve_worker(&client, &mirror, worker.as_deref()).await?;
             client
                 .send_cmd(ClientCmd {
                     cmd: CmdVerb::Disable,
@@ -529,11 +648,17 @@ async fn main() -> Result<()> {
                     options: HashMap::new(),
                 })
                 .await?;
-            println!("Sent disable command for mirror {mirror:?}.");
+            println!(
+                "{}",
+                t!(
+                    format!("Sent disable command for mirror {mirror:?}."),
+                    format!("已发送禁用命令：镜像 {mirror:?}。")
+                )
+            );
         }
 
         Command::Restart { mirror, worker } => {
-            let worker_id = resolve_worker(&client, mirror, worker.as_deref()).await?;
+            let worker_id = resolve_worker(&client, &mirror, worker.as_deref()).await?;
             client
                 .send_cmd(ClientCmd {
                     cmd: CmdVerb::Restart,
@@ -543,7 +668,13 @@ async fn main() -> Result<()> {
                     options: HashMap::new(),
                 })
                 .await?;
-            println!("Sent restart command for mirror {mirror:?}.");
+            println!(
+                "{}",
+                t!(
+                    format!("Sent restart command for mirror {mirror:?}."),
+                    format!("已发送重启命令：镜像 {mirror:?}。")
+                )
+            );
         }
 
         Command::Reload { worker } => {
@@ -556,7 +687,13 @@ async fn main() -> Result<()> {
                     options: HashMap::new(),
                 })
                 .await?;
-            println!("Sent reload command to worker {worker:?}.");
+            println!(
+                "{}",
+                t!(
+                    format!("Sent reload command to worker {worker:?}."),
+                    format!("已发送热重载命令：Worker {worker:?}。")
+                )
+            );
         }
     }
 

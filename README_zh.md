@@ -309,6 +309,33 @@ tunasynctl disable elvish -p 14242
 tunasynctl reload test_worker -p 14242
 ```
 
+### Shell 自动补全
+
+`completions/` 目录中提供了预生成的 bash、zsh、fish 补全脚本。当 `jq` 可用且 manager 可访问时，支持动态补全镜像名称和 Worker ID。
+
+```bash
+# bash（系统级，推荐）
+sudo cp completions/tunasynctl.bash /etc/bash_completion.d/tunasynctl
+
+# bash（当前用户）
+tunasynctl completion bash >> ~/.bashrc && source ~/.bashrc
+
+# zsh
+tunasynctl completion zsh >> ~/.zshrc && source ~/.zshrc
+
+# fish
+tunasynctl completion fish > ~/.config/fish/completions/tunasynctl.fish
+```
+
+### 语言设置
+
+`tunasynctl` 会自动检测系统 locale。当 `LANG`、`LANGUAGE`、`LC_ALL` 或 `LC_MESSAGES` 以 `zh` 开头时，输出中文；否则默认英文。可通过 `TUNASYNCTL_LANG` 强制指定：
+
+```bash
+TUNASYNCTL_LANG=zh tunasynctl list --format table   # 强制中文
+TUNASYNCTL_LANG=en tunasynctl list --format table   # 强制英文
+```
+
 ### 安全
 
 Worker 与 Manager 之间使用 HTTP(S) 通信。如果两者运行在同一台机器上，使用普通 HTTP 即可——Manager 端留空 `ssl_cert` / `ssl_key`，Worker 端留空 `ca_cert`，`api_base` 使用 `http://`。
