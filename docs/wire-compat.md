@@ -99,25 +99,59 @@ field appears twice: a human-readable text form and a Unix-epoch integer.
 
 ## Manager HTTP API
 
-All endpoints match Go's `manager/server.go` route table exactly:
+All endpoints match Go's `manager/server.go` route table exactly unless
+marked **Rust addition**:
 
-| Path                        | Method | Purpose                                |
-|-----------------------------|--------|----------------------------------------|
-| `/ping`                     | GET    | Health check                           |
-| `/jobs`                     | GET    | List all mirror statuses (Web format)  |
-| `/jobs/disabled`            | DELETE | Flush disabled mirror statuses         |
-| `/workers`                  | GET    | List registered workers                |
-| `/workers`                  | POST   | Register a new worker                  |
-| `/workers/:id`              | DELETE | Delete a worker                        |
-| `/workers/:id/jobs`         | GET    | List mirror statuses for a worker      |
-| `/workers/:id/jobs/:job`    | POST   | Update a mirror's status               |
-| `/workers/:id/jobs/:job/size` | POST  | Update a mirror's size                |
-| `/workers/:id/schedules`    | POST   | Update scheduling info                 |
-| `/cmd`                      | POST   | Send command to a worker               |
-| `/workers/:id/heartbeat`    | POST   | **Rust addition** — explicit heartbeat |
+| Path                          | Method | Purpose                                          |
+|-------------------------------|--------|--------------------------------------------------|
+| `/ping`                       | GET    | Health check                                     |
+| `/jobs`                       | GET    | List all mirror statuses (Web format)            |
+| `/jobs`                       | HEAD   | **Rust addition** — same as GET, headers only    |
+| `/jobs/disabled`              | DELETE | Flush disabled mirror statuses                   |
+| `/jobs/:name`                 | GET    | **Rust addition** — `MirrorStatus[]` for one mirror across all workers (includes `error_msg`) |
+| `/workers`                    | GET    | List registered workers                          |
+| `/workers`                    | POST   | Register a new worker                            |
+| `/workers/:id`                | DELETE | Delete a worker                                  |
+| `/workers/:id/heartbeat`      | POST   | **Rust addition** — explicit heartbeat           |
+| `/workers/:id/jobs`           | GET    | List mirror statuses for a worker                |
+| `/workers/:id/jobs/:job`      | POST   | Update a mirror's status                         |
+| `/workers/:id/jobs/:job/size` | POST   | Update a mirror's size                           |
+| `/workers/:id/schedules`      | POST   | Update scheduling info                           |
+| `/cmd`                        | POST   | Send command to a worker                         |
+| `/metrics`                    | GET    | **Rust addition** — Prometheus metrics           |
 
 Response bodies use `{"message": "..."}` for info and `{"error": "..."}` for errors,
 matching Go's `_infoKey` / `_errorKey` convention.
+
+### `GET /jobs/:name` response
+
+Returns `MirrorStatus[]` (not `WebMirrorStatus[]`), so it includes `worker`
+and `error_msg` fields. Multiple entries are returned when the same mirror
+name runs on multiple workers.
+
+### `GET /metrics` — Prometheus exposition
+
+Format: text 0.0.4 (`Content-Type: text/plain; version=0.0.4; charset=utf-8`).
+
+| Metric name | Type | Labels | Description |
+|---|---|---|---|
+| `tunasync_workers_total` | gauge | — | Number of registered workers |
+| `tunasync_mirrors_total` | gauge | `status` | Mirror count per status (all 7 values always exported) |
+| `tunasync_mirror_status` | gauge | `mirror`, `worker` | Status code: 0=none 1=pre-syncing 2=syncing 3=success 4=failed 5=paused 6=disabled |
+| `tunasync_mirror_size_bytes` | gauge | `mirror`, `worker` | Mirror size in bytes; −1 if unknown or unparseable |
+| `tunasync_mirror_last_success_timestamp_seconds` | gauge | `mirror`, `worker` | Unix timestamp of last successful sync; 0 if never |
+| `tunasync_mirror_last_sync_duration_seconds` | gauge | `mirror`, `worker` | Duration of most recent completed sync in seconds; 0 if never run |
+
+Size string parsing accepts `K/M/G/T/P` suffixes (base-1024), with or
+without trailing `B` (e.g. `1.5G`, `500M`, `1GB`). Returns −1 for `""`
+or `"unknown"`.
+
+### `status_file`
+
+When `files.status_file` is set (default `/var/lib/tunasync/tunasync.json`)
+and the parent directory exists, the manager writes a `WebMirrorStatus[]`
+JSON snapshot to that path every 30 seconds via an atomic `.tmp` → rename.
+Skipped silently if the parent directory does not exist.
 
 ## Worker HTTP API
 
