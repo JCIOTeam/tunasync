@@ -15,7 +15,7 @@ use chrono::Utc;
 use rusqlite::{params, Connection};
 use tunasync_protocol::{MirrorStatus, SyncStatus, WorkerStatus};
 
-use super::{status_key, DbAdapter, DbError, DbResult};
+use super::{status_key, worker_id_from_key, DbAdapter, DbError, DbResult};
 
 // ---------------------------------------------------------------------------
 // Adapter
@@ -169,22 +169,34 @@ impl DbAdapter for SqliteAdapter {
     }
 
     fn list_mirror_status(&self, worker_id: &str) -> DbResult<Vec<MirrorStatus>> {
-        // Suffix-match: key schema is "{mirror}/{worker_id}".
-        // We use a LIKE pattern; exact match is guaranteed since worker_ids
-        // cannot contain '/'.
-        let suffix = format!("/{worker_id}");
+        // Key schema is "{mirror_id}/{worker_id}". An earlier version used
+        //
+        //   SELECT data FROM mirror_status WHERE key LIKE '%' || ?1
+        //
+        // with `?1 = "/{worker_id}"`, but LIKE treats `_` and `%` in the
+        // pattern as single-char and multi-char wildcards. Worker IDs come
+        // from hostnames and almost always contain underscores in real
+        // deployments (e.g. `db_node_1`), so that query would silently
+        // return mirrors belonging to other workers whose IDs differ only
+        // in characters covered by `_`.
+        //
+        // Match the redb/redis adapters: scan the whole table and filter
+        // by exact suffix in Rust using `worker_id_from_key`. This is also
+        // robust to any future change in key encoding.
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT data FROM mirror_status WHERE key LIKE '%' || ?1")?;
-        let rows: Vec<Vec<u8>> = stmt
-            .query_map(params![suffix], |row| row.get::<_, Vec<u8>>(0))?
+        let mut stmt = conn.prepare("SELECT key, data FROM mirror_status")?;
+        let rows: Vec<(String, Vec<u8>)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
             .filter_map(|r| r.ok())
             .collect();
-        // Drop stmt + conn before processing.
         drop(stmt);
         drop(conn);
         Ok(rows
             .into_iter()
-            .filter_map(|bytes| serde_json::from_slice::<MirrorStatus>(&bytes).ok())
+            .filter(|(k, _)| worker_id_from_key(k) == worker_id)
+            .filter_map(|(_, bytes)| serde_json::from_slice::<MirrorStatus>(&bytes).ok())
             .collect())
     }
 
@@ -260,5 +272,90 @@ impl<T> OptionalExt<T> for rusqlite::Result<T> {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tunasync_protocol::{zero_time, MirrorStatus, SyncStatus};
+
+    fn mk_status(name: &str, worker: &str) -> MirrorStatus {
+        MirrorStatus {
+            name: name.into(),
+            worker: worker.into(),
+            is_master: true,
+            status: SyncStatus::Success,
+            last_update: zero_time(),
+            last_started: zero_time(),
+            last_ended: zero_time(),
+            scheduled: zero_time(),
+            upstream: String::new(),
+            size: String::new(),
+            error_msg: String::new(),
+        }
+    }
+
+    /// Regression test for the SQL LIKE wildcard bug.
+    ///
+    /// Worker IDs that share a prefix and differ only in characters covered
+    /// by `_` (single-char wildcard) or `%` (multi-char wildcard) used to
+    /// leak into each other's `list_mirror_status` results.
+    #[test]
+    fn list_mirror_status_does_not_bleed_across_workers_with_underscores() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let adapter = SqliteAdapter::open(&db_path).unwrap();
+
+        // `db_1` and `dbX1` collide under the buggy `LIKE '%/' || ?1` query
+        // because `_` is a single-char wildcard in LIKE patterns.
+        adapter
+            .update_mirror_status("db_1", "ubuntu", mk_status("ubuntu", "db_1"))
+            .unwrap();
+        adapter
+            .update_mirror_status("dbX1", "debian", mk_status("debian", "dbX1"))
+            .unwrap();
+        adapter
+            .update_mirror_status("db01", "fedora", mk_status("fedora", "db01"))
+            .unwrap();
+
+        let for_db_1 = adapter.list_mirror_status("db_1").unwrap();
+        assert_eq!(
+            for_db_1.len(),
+            1,
+            "list_mirror_status('db_1') leaked rows belonging to other workers: {:?}",
+            for_db_1.iter().map(|m| (&m.name, &m.worker)).collect::<Vec<_>>()
+        );
+        assert_eq!(for_db_1[0].name, "ubuntu");
+        assert_eq!(for_db_1[0].worker, "db_1");
+
+        // Sanity: the other workers' rows are still individually retrievable.
+        assert_eq!(adapter.list_mirror_status("dbX1").unwrap().len(), 1);
+        assert_eq!(adapter.list_mirror_status("db01").unwrap().len(), 1);
+    }
+
+    /// The `%` wildcard variant of the same bug.
+    #[test]
+    fn list_mirror_status_treats_percent_in_worker_id_literally() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let adapter = SqliteAdapter::open(&db_path).unwrap();
+
+        // A worker_id literally containing '%' would, under the buggy query,
+        // be interpreted as a multi-char wildcard and match everything.
+        adapter
+            .update_mirror_status("weird%", "ubuntu", mk_status("ubuntu", "weird%"))
+            .unwrap();
+        adapter
+            .update_mirror_status("normal", "debian", mk_status("debian", "normal"))
+            .unwrap();
+
+        let for_weird = adapter.list_mirror_status("weird%").unwrap();
+        assert_eq!(for_weird.len(), 1);
+        assert_eq!(for_weird[0].worker, "weird%");
     }
 }
