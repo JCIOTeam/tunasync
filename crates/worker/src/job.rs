@@ -255,7 +255,20 @@ async fn run_job_task(
         // If the sync was killed (Restart/Stop/Disable/Halt), skip scheduling.
         // Matches Go: `schedule: (m.State() == stateReady)`.
         if killed {
+            // If state was set to Halting (either by the top-of-loop Halt branch
+            // or by the retry-loop try_recv handler), exit the task.
+            if state.load(Ordering::SeqCst) == JobState::Halting as u32 {
+                debug!(mirror = %name, "halt detected — exiting job task");
+                break;
+            }
             continue;
+        }
+
+        // If a Halt arrived during the retry loop (try_recv set state to Halting
+        // without going through the top-of-loop branch), exit cleanly.
+        if state.load(Ordering::SeqCst) == JobState::Halting as u32 {
+            debug!(mirror = %name, "halt detected — exiting job task");
+            break;
         }
 
         // Only schedule the next run if the job is still in Ready state.
@@ -326,19 +339,47 @@ async fn run_sync_with_retry(
         if attempt > 0 {
             // Check for abort between retries. If killed, exit immediately
             // (matches Go's stopASAP flag).
-            if killed || *kill_rx.borrow() {
+            //
+            // We use `has_changed()` instead of `borrow()` so we only react
+            // to kills that arrived *since the last check* — a stale `true`
+            // from a previous, already-handled kill (marked seen via
+            // `borrow_and_update` at the end of the previous sync) must not
+            // poison subsequent retry attempts.
+            let fresh_kill = kill_rx.has_changed().unwrap_or(false);
+            if killed || fresh_kill {
                 debug!(mirror = %name, "aborting retry loop — killed");
+                // Mark the new value as seen so the next sync isn't poisoned
+                // either.
+                let _ = kill_rx.borrow_and_update();
                 killed = true;
                 break 'retry;
             }
             // Check for Stop/Halt/Disable between retries.
+            //
+            // Consuming the ctrl message here without applying it would leave
+            // the job in `Ready` state and (via `schedule = state == Ready`
+            // in the outer loop) silently re-enqueue the job — the user's
+            // Stop click would be effectively ignored. Apply the state change
+            // here so the outer loop computes `schedule = false` and (for
+            // Halt) breaks out of the task.
             if let Ok(ctrl) = ctrl_rx.try_recv() {
-                if matches!(
-                    ctrl,
-                    CtrlAction::Halt | CtrlAction::Stop | CtrlAction::Disable
-                ) {
-                    debug!(mirror = %name, "aborting retry loop due to {:?}", ctrl);
-                    break 'retry;
+                match ctrl {
+                    CtrlAction::Halt => {
+                        debug!(mirror = %name, "aborting retry loop due to Halt");
+                        set_state(state, JobState::Halting);
+                        break 'retry;
+                    }
+                    CtrlAction::Stop => {
+                        debug!(mirror = %name, "aborting retry loop due to Stop");
+                        set_state(state, JobState::Paused);
+                        break 'retry;
+                    }
+                    CtrlAction::Disable => {
+                        debug!(mirror = %name, "aborting retry loop due to Disable");
+                        set_state(state, JobState::Disabled);
+                        break 'retry;
+                    }
+                    _ => {}
                 }
             }
             info!(mirror = %name, attempt, "retrying sync");
