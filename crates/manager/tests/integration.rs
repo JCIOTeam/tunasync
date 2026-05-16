@@ -4,8 +4,6 @@
 //! to ensure they behave identically. Redis tests auto-skip when
 //! `TUNASYNC_TEST_REDIS_URL` is not set.
 
-use std::sync::Arc;
-
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::Utc;
@@ -33,7 +31,7 @@ fn tmp_path(suffix: &str) -> std::path::PathBuf {
 fn sample_worker(id: &str) -> WorkerStatus {
     WorkerStatus {
         id: id.into(),
-        url: format!("http://localhost:6000"),
+        url: "http://localhost:6000".to_string(),
         token: "tok".into(),
         last_online: zero_time(),
         last_register: zero_time(),
@@ -173,7 +171,7 @@ mod redis_db {
         if let Some(url) = redis_url() {
             let client = redis::Client::open(url.as_str()).unwrap();
             let mut conn = client.get_connection().unwrap();
-            redis::cmd("FLUSHDB").execute(&mut conn);
+            redis::cmd("FLUSHDB").exec(&mut conn).unwrap();
         }
     }
 

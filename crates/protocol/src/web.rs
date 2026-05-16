@@ -221,7 +221,7 @@ mod tests {
         let ws = WebMirrorStatus::from_mirror_status(&m);
 
         assert_eq!(ws.name, "ubuntu");
-        assert_eq!(ws.is_master, true);
+        assert!(ws.is_master);
         assert_eq!(ws.status, SyncStatus::Failed);
         assert_eq!(ws.upstream, "rsync://archive.ubuntu.com/ubuntu/");
         assert_eq!(ws.size, "100G");

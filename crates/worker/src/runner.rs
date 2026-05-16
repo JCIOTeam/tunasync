@@ -2,11 +2,25 @@
 //!
 //! # cgroup PID race mitigation (Linux)
 //!
-//! Go uses a reexec + fd3-pipe handshake. In Rust/tokio we use a simpler
-//! approach: `SIGSTOP` the child immediately after spawn, write the PID to the
-//! cgroup, then `SIGCONT`. The window where the child can exec before the
-//! cgroup write is eliminated because the child is stopped.
-//! This requires Linux ≥ 3.5 (all supported distros).
+//! Go uses a re-exec + fd3-pipe handshake so the child is stopped at its
+//! very first instruction, before any user code runs. We don't replicate
+//! that. Instead the provider's `run()`:
+//!
+//! 1. `runner::spawn()` — child starts executing immediately
+//! 2. `cgroup_hook.add_pid_stopped(&proc)` — sends SIGSTOP to the child,
+//!    writes the PID into `cgroup.procs`, then SIGCONT
+//!
+//! This leaves a small window between (1) and (2) during which the child
+//! is already running outside the cgroup, so memory/cpu accounting can be
+//! slightly under-reported for the first millisecond or two and a child
+//! that exec's something else extremely fast in step (1) could even
+//! escape the cgroup entirely. For tunasync's actual workloads (rsync,
+//! external shell scripts that take seconds to minutes) the window is
+//! invisible in practice; if a stricter guarantee is ever needed, the
+//! fix is to spawn the child stopped (e.g. via posix_spawn with the
+//! POSIX_SPAWN_SETSIGMASK + a self-pipe pre-exec hook, or via clone3
+//! with CLONE_STOPPED on Linux ≥ 5.7), not to issue SIGSTOP after the
+//! fact.
 //!
 //! # Process groups
 //!

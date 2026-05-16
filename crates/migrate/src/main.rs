@@ -271,7 +271,7 @@ mod tests {
     /// checks every field survives intact.
     #[test]
     fn offline_bolt_round_trip() {
-        use bbolt_rs::{BoltOptions, BucketRwApi, DbRwAPI, TxRwApi, TxRwRefApi};
+        use bbolt_rs::{BoltOptions, BucketRwApi, DbRwAPI, TxRwRefApi};
         use tunasync_protocol::{MirrorStatus, SyncStatus, WorkerStatus};
 
         let dir = tempfile::tempdir().unwrap();
