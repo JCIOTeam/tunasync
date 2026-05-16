@@ -54,7 +54,6 @@ pub struct Worker {
     status_rx: mpsc::Receiver<JobMessage>,
     cmd_tx: mpsc::Sender<WorkerCmd>,
     cmd_rx: mpsc::Receiver<WorkerCmd>,
-    #[allow(dead_code)] // permit count persists in Arc; field not read directly
     semaphore: Arc<Semaphore>,
     schedule: ScheduleQueue,
     mirror_statuses: HashMap<String, MirrorStatus>,
@@ -818,6 +817,42 @@ impl Worker {
                     self.schedule.push(name.clone(), std::time::Instant::now());
                 }
             }
+        }
+
+        // Apply global concurrency changes. tokio's Semaphore exposes
+        // `add_permits` for grow-only changes but no `remove_permits` (you
+        // can't take back permits that may be currently held by running
+        // syncs), so we can grow live but not shrink. Shrinks require a
+        // worker restart — warn so the operator isn't surprised.
+        let old_concurrent = self.cfg.global.concurrent.max(1);
+        let new_concurrent = new_cfg.global.concurrent.max(1);
+        if new_concurrent > old_concurrent {
+            let added = new_concurrent - old_concurrent;
+            self.semaphore.add_permits(added);
+            tracing::info!(
+                from = old_concurrent,
+                to = new_concurrent,
+                added,
+                "hot-reload: increased concurrency limit"
+            );
+        } else if new_concurrent < old_concurrent {
+            tracing::warn!(
+                from = old_concurrent,
+                to = new_concurrent,
+                "hot-reload: cannot shrink concurrency limit on a running worker — \
+                 keeping {old_concurrent} until restart"
+            );
+        }
+
+        // Detect manager-list changes. The ManagerClient was built at startup
+        // with a fixed list of base URLs (it does not currently support
+        // runtime swap), so we cannot honour this change without a restart.
+        // At least tell the operator instead of silently doing nothing.
+        if new_cfg.manager.api_base_list() != self.cfg.manager.api_base_list() {
+            tracing::warn!(
+                "hot-reload: manager URL list changed in config but the running \
+                 worker still uses the old list — restart the worker to apply"
+            );
         }
 
         // Update global config (interval/retry defaults etc.) from new file.
