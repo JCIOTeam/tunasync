@@ -881,25 +881,44 @@ async fn run_http_server(
 
     if server_cfg.tls_enabled() {
         info!(%bind_addr, "worker binding HTTPS listener");
-        if let Err(e) = axum_server::bind_rustls(
-            bind_addr,
-            axum_server::tls_rustls::RustlsConfig::from_pem_file(
-                &server_cfg.ssl_cert,
-                &server_cfg.ssl_key,
-            )
-            .await
-            .expect("load worker TLS cert/key"),
+        let tls_config = match axum_server::tls_rustls::RustlsConfig::from_pem_file(
+            &server_cfg.ssl_cert,
+            &server_cfg.ssl_key,
         )
-        .serve(router.into_make_service())
         .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                error!(
+                    cert = %server_cfg.ssl_cert,
+                    key = %server_cfg.ssl_key,
+                    error = %e,
+                    "failed to load worker TLS cert/key — HTTP server not started; \
+                     the worker will run blind to manager commands"
+                );
+                return;
+            }
+        };
+        if let Err(e) = axum_server::bind_rustls(bind_addr, tls_config)
+            .serve(router.into_make_service())
+            .await
         {
             error!(error = %e, "worker HTTPS server error");
         }
     } else {
         info!(%bind_addr, "worker binding HTTP listener");
-        let listener = TcpListener::bind(bind_addr)
-            .await
-            .expect("bind worker HTTP listener");
+        let listener = match TcpListener::bind(bind_addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                error!(
+                    %bind_addr,
+                    error = %e,
+                    "failed to bind worker HTTP listener — HTTP server not started; \
+                     the worker will run blind to manager commands"
+                );
+                return;
+            }
+        };
         if let Err(e) = axum::serve(listener, router).await {
             error!(error = %e, "worker HTTP server error");
         }
