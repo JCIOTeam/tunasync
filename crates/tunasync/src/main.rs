@@ -118,14 +118,20 @@ async fn main() -> Result<()> {
 
             // Load config file, then apply CLI overrides — mirrors Go's LoadConfig
             // which patches the struct with cli.Context values after TOML decode.
-            let mut cfg: tunasync_manager::config::ManagerConfig =
-                tunasync_common::config::load_toml(config).unwrap_or_else(|_| {
-                    tracing::warn!(
-                        path = %config.display(),
-                        "config file not found or unreadable — using defaults"
-                    );
-                    Default::default()
-                });
+            //
+            // Only fall back to defaults if the file does not exist. Any other
+            // error (parse, permission, etc.) is fatal — silently swallowing a
+            // typo in the config and starting with defaults is a much worse
+            // operator experience than a clear "fix your config" message.
+            let mut cfg: tunasync_manager::config::ManagerConfig = if config.exists() {
+                tunasync_common::config::load_toml(config)?
+            } else {
+                tracing::warn!(
+                    path = %config.display(),
+                    "config file not found — using defaults"
+                );
+                Default::default()
+            };
 
             if let Some(a) = addr {
                 cfg.server.addr = a.clone();

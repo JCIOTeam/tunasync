@@ -95,14 +95,18 @@ pub fn load_include_mirrors(cfg: &mut config::WorkerConfig) {
 
 /// Entry point invoked by `tunasync worker`.
 pub async fn run(config_path: std::path::PathBuf) -> Result<()> {
-    let mut cfg: config::WorkerConfig = tunasync_common::config::load_toml(&config_path)
-        .unwrap_or_else(|_| {
-            tracing::warn!(
-                path = %config_path.display(),
-                "config file not found or unreadable — using defaults"
-            );
-            config::WorkerConfig::default()
-        });
+    // Only fall back to defaults if the file does not exist. Any other
+    // error (parse, permission, etc.) is fatal — a typo in worker.conf
+    // must not silently start a worker with no mirrors configured.
+    let mut cfg: config::WorkerConfig = if config_path.exists() {
+        tunasync_common::config::load_toml(&config_path)?
+    } else {
+        tracing::warn!(
+            path = %config_path.display(),
+            "config file not found — using defaults"
+        );
+        config::WorkerConfig::default()
+    };
 
     if cfg.global.retry == 0 {
         cfg.global.retry = 3;
