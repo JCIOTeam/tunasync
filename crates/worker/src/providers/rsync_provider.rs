@@ -29,6 +29,7 @@ pub struct RsyncProvider {
     rsync_env: HashMap<String, String>,
     pub success_exit_codes: Vec<i32>,
     data_size: Mutex<String>,
+    transferred_bytes: Mutex<u64>,
     current_pid: Arc<Mutex<Option<u32>>>,
     /// Docker container name, set when DockerHook wraps the command.
     docker_container_name: Option<String>,
@@ -143,6 +144,7 @@ impl RsyncProvider {
             rsync_env,
             success_exit_codes,
             data_size: Mutex::new(String::new()),
+            transferred_bytes: Mutex::new(0),
             current_pid: Arc::new(Mutex::new(None)),
             docker_container_name: None,
             docker_config: None,
@@ -217,7 +219,7 @@ impl MirrorProvider for RsyncProvider {
         *self.current_pid.lock().unwrap() = None;
         wait_result?;
 
-        // Extract size from log after successful run.
+        // Extract size and transferred bytes from log after successful run.
         if log_file.exists() {
             let content = tokio::fs::read_to_string(&log_file)
                 .await
@@ -225,6 +227,10 @@ impl MirrorProvider for RsyncProvider {
             let size = tunasync_common::util::extract_size_from_rsync_log(&content);
             if !size.is_empty() {
                 *self.data_size.lock().unwrap() = size;
+            }
+            let transferred = tunasync_common::util::extract_transferred_bytes_from_rsync_log(&content);
+            if transferred > 0 {
+                *self.transferred_bytes.lock().unwrap() = transferred;
             }
         }
         Ok(())
@@ -262,6 +268,10 @@ impl MirrorProvider for RsyncProvider {
 
     fn data_size(&self) -> String {
         self.data_size.lock().unwrap().clone()
+    }
+
+    fn transferred_bytes(&self) -> u64 {
+        *self.transferred_bytes.lock().unwrap()
     }
 
     fn set_docker_config(&mut self, config: DockerConfig) {

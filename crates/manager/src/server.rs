@@ -41,6 +41,11 @@ use crate::db::{DbAdapter, DbError};
 pub struct AppState {
     pub db: Box<dyn DbAdapter>,
     pub http_client: reqwest::Client,
+    /// Read-only maintenance mode. When true, all mutating endpoints return
+    /// 503 Service Unavailable. Toggle via `POST /maintenance` / `DELETE /maintenance`.
+    pub maintenance: std::sync::atomic::AtomicBool,
+    /// Notify config (webhook URL, stale_after, alert thresholds).
+    pub notify: crate::config::NotifyConfig,
 }
 
 /// JSON error response matching Go's `{ "error": "..." }` shape.
@@ -102,6 +107,10 @@ pub fn build_router(shared: Arc<AppState>) -> Router {
         .route("/workers/:id/schedules", post(update_schedules_of_worker))
         .route("/cmd", post(handle_client_cmd))
         .route("/metrics", get(metrics))
+        .route(
+            "/maintenance",
+            post(enable_maintenance).delete(disable_maintenance).get(get_maintenance),
+        )
         .with_state(shared)
 }
 
@@ -195,6 +204,9 @@ async fn register_worker(
 
 /// `DELETE /workers/:id` — remove a worker.
 async fn delete_worker(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    if let Some(r) = check_maintenance(&state) {
+        return r;
+    }
     match state.db.delete_worker(&id) {
         Err(DbError::NotFound(_)) => bad_req(format!("invalid workerID {id}")),
         Err(e) => db_err(e),
@@ -244,6 +256,9 @@ async fn update_job_of_worker(
     Path((worker_id, _job)): Path<(String, String)>,
     Json(mut incoming): Json<MirrorStatus>,
 ) -> Response {
+    if let Some(r) = check_maintenance(&state) {
+        return r;
+    }
     if incoming.name.is_empty() {
         return bad_req("mirror Name should not be empty");
     }
@@ -290,7 +305,67 @@ async fn update_job_of_worker(
         && cur.size != "unknown"
         && (incoming.size.is_empty() || incoming.size == "unknown")
     {
-        incoming.size = cur.size;
+        incoming.size = cur.size.clone();
+    }
+
+    // ── Extension fields ──────────────────────────────────────────────
+
+    // Traffic stats: accumulate total when a new sync reported transferred bytes.
+    if incoming.last_transferred_bytes > 0 && incoming.last_started != cur.last_started {
+        incoming.total_transferred_bytes =
+            cur.total_transferred_bytes + incoming.last_transferred_bytes;
+    } else {
+        // Preserve running total from current record.
+        incoming.total_transferred_bytes = cur.total_transferred_bytes;
+        // Preserve last_transferred if worker didn't report a new one.
+        if incoming.last_transferred_bytes == 0 {
+            incoming.last_transferred_bytes = cur.last_transferred_bytes;
+        }
+    }
+
+    // Consecutive failures + stale tracking.
+    match incoming.status {
+        SyncStatus::Failed => {
+            incoming.consecutive_failures = cur.consecutive_failures + 1;
+            incoming.stale = cur.stale; // preserve stale flag
+
+            // Webhook: alert on consecutive failure threshold.
+            let threshold = state.notify.alert_after_failures;
+            if threshold > 0 && incoming.consecutive_failures == threshold {
+                let url = state.notify.webhook_url.clone();
+                let client = state.http_client.clone();
+                let text = format!(
+                    "⚠️ Mirror {} on worker {} has failed {} consecutive times. Last error: {}",
+                    incoming.name, worker_id, incoming.consecutive_failures, incoming.error_msg
+                );
+                tokio::spawn(async move {
+                    crate::webhook::send(&client, &url, &text).await;
+                });
+            }
+        }
+        SyncStatus::Success => {
+            // Recovery webhook: was previously failing or stale.
+            if cur.consecutive_failures > 0 || cur.stale {
+                let url = state.notify.webhook_url.clone();
+                if !url.is_empty() {
+                    let client = state.http_client.clone();
+                    let text = format!(
+                        "✅ Mirror {} on worker {} recovered (was: {} consecutive failures, stale: {})",
+                        incoming.name, worker_id, cur.consecutive_failures, cur.stale
+                    );
+                    tokio::spawn(async move {
+                        crate::webhook::send(&client, &url, &text).await;
+                    });
+                }
+            }
+            incoming.consecutive_failures = 0;
+            incoming.stale = false;
+        }
+        _ => {
+            // Preserve for transient states (Syncing, PreSyncing, etc.)
+            incoming.consecutive_failures = cur.consecutive_failures;
+            incoming.stale = cur.stale;
+        }
     }
 
     match incoming.status {
@@ -409,6 +484,9 @@ async fn handle_client_cmd(
     State(state): State<Arc<AppState>>,
     Json(client_cmd): Json<ClientCmd>,
 ) -> Response {
+    if let Some(r) = check_maintenance(&state) {
+        return r;
+    }
     let worker_id = &client_cmd.worker_id;
     if worker_id.is_empty() {
         // Go has a TODO here; we replicate the 500 response.
@@ -478,20 +556,58 @@ async fn handle_client_cmd(
 // Helper: zero-value MirrorStatus for a mirror that hasn't reported yet
 
 fn zero_mirror_status(name: &str, worker: &str) -> MirrorStatus {
-    use tunasync_protocol::zero_time;
     MirrorStatus {
         name: name.to_owned(),
         worker: worker.to_owned(),
         is_master: true,
-        status: SyncStatus::None,
-        last_update: zero_time(),
-        last_started: zero_time(),
-        last_ended: zero_time(),
-        scheduled: zero_time(),
-        upstream: String::new(),
-        size: String::new(),
-        error_msg: String::new(),
+        ..Default::default()
     }
+}
+
+// Read-only (maintenance) mode guard
+
+/// Check if the manager is in maintenance mode. Mutating endpoints call
+/// this at the top and return 503 if true.
+fn check_maintenance(state: &AppState) -> Option<Response> {
+    if state.maintenance.load(std::sync::atomic::Ordering::Relaxed) {
+        Some(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrBody {
+                    error: "manager is in maintenance (read-only) mode".into(),
+                }),
+            )
+                .into_response(),
+        )
+    } else {
+        None
+    }
+}
+
+/// `POST /maintenance` — enable read-only mode (rejects all mutating requests).
+async fn enable_maintenance(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    state
+        .maintenance
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!("maintenance mode ENABLED — all mutating endpoints will return 503");
+    ok_msg("maintenance mode enabled")
+}
+
+/// `DELETE /maintenance` — disable read-only mode (resume normal operations).
+async fn disable_maintenance(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    state
+        .maintenance
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!("maintenance mode DISABLED — normal operations resumed");
+    ok_msg("maintenance mode disabled")
+}
+
+/// `GET /maintenance` — check current maintenance mode status.
+async fn get_maintenance(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let enabled = state
+        .maintenance
+        .load(std::sync::atomic::Ordering::Relaxed);
+    Json(serde_json::json!({ "maintenance": enabled }))
 }
 
 // Metrics
@@ -683,7 +799,7 @@ mod metrics_tests {
 
     #[test]
     fn render_metrics_smoke() {
-        use tunasync_protocol::{zero_time, SyncStatus};
+        use tunasync_protocol::SyncStatus;
         let mirrors = vec![MirrorStatus {
             name: "ubuntu".into(),
             worker: "w1".into(),
@@ -692,10 +808,9 @@ mod metrics_tests {
             last_update: chrono::Utc::now(),
             last_started: chrono::Utc::now() - chrono::Duration::seconds(3600),
             last_ended: chrono::Utc::now(),
-            scheduled: zero_time(),
             upstream: "rsync://example.com/".into(),
             size: "1.5G".into(),
-            error_msg: String::new(),
+            ..Default::default()
         }];
         let out = render_metrics(&mirrors, 2);
         assert!(out.contains("tunasync_workers_total 2"));

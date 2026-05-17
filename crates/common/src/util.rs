@@ -52,20 +52,39 @@ pub fn translate_rsync_error_code(exit_code: i32) -> (i32, String) {
 /// Looks for `Total file size: <N>[KMGTP]? bytes` (rsync `--stats` output).
 /// Returns the **last** occurrence — matches Go's `ExtractSizeFromLog` which
 /// does `matches[len(matches)-1][1]` (last element of `FindAllSubmatch`).
-/// The last occurrence is correct because rsync can emit multiple stats
-/// blocks (e.g. in two-stage or incremental runs); only the final summary
-/// reflects the total mirror size.
-///
-/// Mirrors Go's `ExtractSizeFromRsyncLog` / `ExtractSizeFromLog`.
 pub fn extract_size_from_rsync_log(log_content: &str) -> String {
     let re =
         regex::Regex::new(r"(?m)^Total file size: ([0-9.]+[KMGTP]?) bytes").expect("static regex");
-    // Collect all matches and return the last capture group of the last match.
     re.captures_iter(log_content)
         .last()
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_owned())
         .unwrap_or_default()
+}
+
+/// Extract "Total transferred file size" from rsync `--stats` output.
+///
+/// This is the number of bytes actually transferred over the network during
+/// this sync (as opposed to `Total file size` which is the full mirror size).
+/// Returns 0 if not found.
+pub fn extract_transferred_bytes_from_rsync_log(log_content: &str) -> u64 {
+    static RE: Lazy<regex::Regex> = Lazy::new(|| {
+        // rsync outputs lines like:
+        //   Total transferred file size: 1,234,567 bytes
+        //   Total transferred file size: 1.23G bytes
+        // We grab the raw number (with commas or suffixes).
+        regex::Regex::new(
+            r"(?m)^Total transferred file size:\s+([0-9][0-9,.]*)\s+bytes"
+        ).expect("static regex")
+    });
+    RE.captures_iter(log_content)
+        .last()
+        .and_then(|c| c.get(1))
+        .map(|m| {
+            let s = m.as_str().replace(',', "");
+            s.parse::<u64>().unwrap_or(0)
+        })
+        .unwrap_or(0)
 }
 
 /// Extract a size string matching `pattern` from log content.
@@ -80,6 +99,74 @@ pub fn extract_size_from_log(log_content: &str, pattern: &regex::Regex) -> Strin
         .and_then(|c| c.get(1).or_else(|| c.get(0)))
         .map(|m| m.as_str().to_owned())
         .unwrap_or_default()
+}
+
+/// Parse a human-readable size string into bytes.
+///
+/// Supports: "100GB", "2TB", "500MB", "1.5T", "100G", etc.
+/// Case insensitive. Returns `None` on parse failure.
+pub fn parse_size_bytes(s: &str) -> Option<u64> {
+    static RE: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(r"(?i)^([0-9]+(?:\.[0-9]+)?)\s*(k|kb|m|mb|g|gb|t|tb|p|pb)?b?$")
+            .expect("static regex")
+    });
+    let caps = RE.captures(s.trim())?;
+    let num: f64 = caps.get(1)?.as_str().parse().ok()?;
+    let multiplier: f64 = match caps.get(2).map(|m| m.as_str().to_ascii_lowercase()).as_deref() {
+        Some("k") | Some("kb") => 1024.0,
+        Some("m") | Some("mb") => 1024.0 * 1024.0,
+        Some("g") | Some("gb") => 1024.0 * 1024.0 * 1024.0,
+        Some("t") | Some("tb") => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        Some("p") | Some("pb") => 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => 1.0,
+    };
+    Some((num * multiplier) as u64)
+}
+
+/// Parse a human-readable duration string into seconds.
+///
+/// Supports: "48h", "2d", "7d", "1d12h", "30m", "3600s".
+/// Returns `None` on parse failure.
+pub fn parse_duration_secs(s: &str) -> Option<u64> {
+    static RE: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(r"(?i)(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$")
+            .expect("static regex")
+    });
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let caps = RE.captures(s)?;
+    let d: u64 = caps.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+    let h: u64 = caps.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+    let m: u64 = caps.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+    let sec: u64 = caps.get(4).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+    let total = d * 86400 + h * 3600 + m * 60 + sec;
+    if total == 0 { None } else { Some(total) }
+}
+
+/// Check available disk space at `path`. Returns `(available_bytes, total_bytes)`.
+///
+/// Uses `statvfs` on Unix. Returns `None` on failure.
+#[cfg(unix)]
+pub fn disk_space(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if ret != 0 {
+        return None;
+    }
+    let avail = stat.f_bavail as u64 * stat.f_frsize as u64;
+    let total = stat.f_blocks as u64 * stat.f_frsize as u64;
+    Some((avail, total))
+}
+
+#[cfg(not(unix))]
+pub fn disk_space(_path: &std::path::Path) -> Option<(u64, u64)> {
+    None
 }
 
 #[cfg(test)]
@@ -115,7 +202,6 @@ mod tests {
 
     #[test]
     fn extract_rsync_size_takes_last_occurrence() {
-        // rsync may emit multiple stats blocks; we want the last one.
         let log = "Total file size: 100K bytes\nTotal file size: 1.23G bytes\n";
         assert_eq!(extract_size_from_rsync_log(log), "1.23G");
     }
@@ -123,5 +209,47 @@ mod tests {
     #[test]
     fn extract_rsync_size_empty() {
         assert_eq!(extract_size_from_rsync_log("no size here"), "");
+    }
+
+    #[test]
+    fn extract_transferred_bytes() {
+        let log = "Number of files: 100\nTotal transferred file size: 1,234,567 bytes\n";
+        assert_eq!(extract_transferred_bytes_from_rsync_log(log), 1234567);
+    }
+
+    #[test]
+    fn extract_transferred_bytes_empty() {
+        assert_eq!(extract_transferred_bytes_from_rsync_log("no data"), 0);
+    }
+
+    #[test]
+    fn parse_size_variants() {
+        assert_eq!(parse_size_bytes("100GB"), Some(100 * 1024 * 1024 * 1024));
+        assert_eq!(parse_size_bytes("2TB"), Some(2 * 1024 * 1024 * 1024 * 1024));
+        assert_eq!(parse_size_bytes("500MB"), Some(500 * 1024 * 1024));
+        assert_eq!(parse_size_bytes("1024"), Some(1024));
+        assert_eq!(parse_size_bytes("1G"), Some(1024 * 1024 * 1024));
+        assert!(parse_size_bytes("").is_none());
+        assert!(parse_size_bytes("abc").is_none());
+    }
+
+    #[test]
+    fn parse_duration_variants() {
+        assert_eq!(parse_duration_secs("48h"), Some(48 * 3600));
+        assert_eq!(parse_duration_secs("2d"), Some(2 * 86400));
+        assert_eq!(parse_duration_secs("1d12h"), Some(86400 + 12 * 3600));
+        assert_eq!(parse_duration_secs("30m"), Some(30 * 60));
+        assert_eq!(parse_duration_secs("3600s"), Some(3600));
+        assert!(parse_duration_secs("").is_none());
+    }
+
+    #[test]
+    fn disk_space_on_tmp() {
+        // Just verify it doesn't panic on a real path.
+        let result = disk_space(std::path::Path::new("/tmp"));
+        // On CI this might not work, so just test it returns Some on Linux.
+        #[cfg(target_os = "linux")]
+        assert!(result.is_some(), "expected Some on /tmp");
+        let _ = result;
     }
 }

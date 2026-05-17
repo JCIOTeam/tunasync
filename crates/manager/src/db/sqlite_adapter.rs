@@ -282,7 +282,7 @@ impl<T> OptionalExt<T> for rusqlite::Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tunasync_protocol::{zero_time, MirrorStatus, SyncStatus};
+    use tunasync_protocol::{MirrorStatus, SyncStatus};
 
     fn mk_status(name: &str, worker: &str) -> MirrorStatus {
         MirrorStatus {
@@ -290,13 +290,7 @@ mod tests {
             worker: worker.into(),
             is_master: true,
             status: SyncStatus::Success,
-            last_update: zero_time(),
-            last_started: zero_time(),
-            last_ended: zero_time(),
-            scheduled: zero_time(),
-            upstream: String::new(),
-            size: String::new(),
-            error_msg: String::new(),
+            ..Default::default()
         }
     }
 

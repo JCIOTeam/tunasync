@@ -8,6 +8,7 @@
 pub mod config;
 pub mod db;
 pub mod server;
+pub mod webhook;
 
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
@@ -62,7 +63,12 @@ pub async fn run_with_config(cfg: ManagerConfig) -> Result<()> {
     };
 
     // Wrap in Arc so both the router and background tasks share the same state.
-    let state = std::sync::Arc::new(AppState { db, http_client });
+    let state = std::sync::Arc::new(AppState {
+        db,
+        http_client,
+        maintenance: std::sync::atomic::AtomicBool::new(false),
+        notify: cfg.notify.clone(),
+    });
 
     // Spawn status-file writer if the parent directory exists.
     let status_file = cfg.files.status_file.clone();
@@ -76,6 +82,26 @@ pub async fn run_with_config(cfg: ManagerConfig) -> Result<()> {
             tracing::warn!(
                 path = %status_file.display(),
                 "status_file parent directory does not exist — status file will not be written"
+            );
+        }
+    }
+
+    // Spawn stale detector if configured.
+    if !cfg.notify.stale_after.is_empty() {
+        if let Some(stale_secs) = tunasync_common::util::parse_duration_secs(&cfg.notify.stale_after) {
+            let state_clone = std::sync::Arc::clone(&state);
+            tokio::spawn(async move {
+                stale_detector(state_clone, stale_secs).await;
+            });
+            tracing::info!(
+                stale_after = %cfg.notify.stale_after,
+                webhook = %if cfg.notify.webhook_url.is_empty() { "(disabled)" } else { &cfg.notify.webhook_url },
+                "stale detector started"
+            );
+        } else {
+            tracing::warn!(
+                stale_after = %cfg.notify.stale_after,
+                "invalid stale_after duration — stale detector not started"
             );
         }
     }
@@ -192,5 +218,92 @@ async fn status_file_writer(state: std::sync::Arc<AppState>, path: std::path::Pa
         }
 
         tracing::debug!(path = %path.display(), mirrors = mirrors.len(), "status file updated");
+    }
+}
+
+/// Background task: check all mirrors every 5 minutes and mark as stale
+/// any mirror whose `last_update` is older than `stale_secs` seconds ago.
+/// Fires a webhook when a mirror transitions into or out of stale state.
+async fn stale_detector(state: std::sync::Arc<AppState>, stale_secs: u64) {
+    use std::time::Duration;
+    use tokio::time;
+
+    let stale_duration = chrono::Duration::seconds(stale_secs as i64);
+
+    let mut interval = time::interval(Duration::from_secs(300)); // 5 minutes
+    interval.tick().await; // skip immediate first tick
+
+    loop {
+        interval.tick().await;
+
+        let mirrors = match state.db.list_all_mirror_status() {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, "stale_detector: failed to read mirror status");
+                continue;
+            }
+        };
+
+        let now = chrono::Utc::now();
+
+        for mut mirror in mirrors {
+            let age = now - mirror.last_update;
+            let was_stale = mirror.stale;
+            let is_stale = !tunasync_protocol::is_zero_time(&mirror.last_update)
+                && age > stale_duration
+                && !matches!(
+                    mirror.status,
+                    tunasync_protocol::SyncStatus::Disabled
+                        | tunasync_protocol::SyncStatus::Paused
+                );
+
+            if is_stale != was_stale {
+                mirror.stale = is_stale;
+
+                // Persist the stale flag change.
+                if let Err(e) =
+                    state
+                        .db
+                        .update_mirror_status(&mirror.worker, &mirror.name, mirror.clone())
+                {
+                    tracing::warn!(
+                        mirror = %mirror.name,
+                        error = %e,
+                        "stale_detector: failed to update stale flag"
+                    );
+                    continue;
+                }
+
+                // Webhook notification.
+                if !state.notify.webhook_url.is_empty() {
+                    let text = if is_stale {
+                        format!(
+                            "⏰ Mirror {} on worker {} is now STALE — last successful sync was {}",
+                            mirror.name,
+                            mirror.worker,
+                            mirror.last_update.format("%Y-%m-%d %H:%M UTC")
+                        )
+                    } else {
+                        format!(
+                            "✅ Mirror {} on worker {} is no longer stale",
+                            mirror.name, mirror.worker
+                        )
+                    };
+                    let client = state.http_client.clone();
+                    let url = state.notify.webhook_url.clone();
+                    tokio::spawn(async move {
+                        crate::webhook::send(&client, &url, &text).await;
+                    });
+                }
+
+                tracing::info!(
+                    mirror = %mirror.name,
+                    worker = %mirror.worker,
+                    stale = is_stale,
+                    last_update = %mirror.last_update,
+                    "stale_detector: stale state changed"
+                );
+            }
+        }
     }
 }

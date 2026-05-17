@@ -17,6 +17,33 @@ pub struct ManagerConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub files: FilesConfig,
+    /// Webhook and alerting configuration.
+    #[serde(default)]
+    pub notify: NotifyConfig,
+}
+
+/// Webhook notification and stale-detection configuration.
+///
+/// All fields default to disabled / empty, so existing configs without
+/// a `[notify]` section are unaffected.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NotifyConfig {
+    /// Webhook URL to POST events to (Slack, Discord, Feishu, WeChat Work,
+    /// or any service accepting `{ "text": "..." }` payloads).
+    /// Empty string disables webhook notifications.
+    #[serde(default)]
+    pub webhook_url: String,
+
+    /// Human-readable duration after which a mirror is considered stale if
+    /// it hasn't had a successful sync (e.g. "48h", "7d").
+    /// Empty string disables stale detection. Checked every 5 minutes.
+    #[serde(default)]
+    pub stale_after: String,
+
+    /// Fire a webhook alert after this many consecutive sync failures.
+    /// 0 = disabled (only stale triggers alerts).
+    #[serde(default)]
+    pub alert_after_failures: u32,
 }
 
 /// HTTP server bind settings.

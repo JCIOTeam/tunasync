@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 use tunasync_protocol::{
-    is_zero_time, zero_time, ClientCmd, CmdVerb, MirrorSchedules, MirrorStatus, SyncStatus,
+    is_zero_time, ClientCmd, CmdVerb, MirrorSchedules, MirrorStatus, SyncStatus,
     WorkerCmd, WorkerStatus,
 };
 
@@ -184,14 +184,7 @@ fn build_a_default_mirror_status_using_zero_time() {
         name: "fresh".into(),
         worker: "worker-1".into(),
         is_master: true,
-        status: SyncStatus::None,
-        last_update: zero_time(),
-        last_started: zero_time(),
-        last_ended: zero_time(),
-        scheduled: zero_time(),
-        upstream: String::new(),
-        size: String::new(),
-        error_msg: String::new(),
+        ..Default::default()
     };
     let json = serde_json::to_string(&status).unwrap();
     // last_ended must serialise as Go's zero time string.

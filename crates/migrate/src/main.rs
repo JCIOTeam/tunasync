@@ -305,7 +305,7 @@ mod tests {
                     scheduled: chrono::Utc::now(),
                     upstream: "rsync://ubuntu.example.com/".into(),
                     size: "10G".into(),
-                    error_msg: String::new(),
+                    ..Default::default()
                 };
                 // key = mirrorID/workerID  (matches Go's format exactly)
                 statuses.put(b"ubuntu/worker-a", serde_json::to_vec(&m).unwrap())?;

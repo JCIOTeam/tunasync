@@ -27,3 +27,12 @@ pub use msg::{
 pub use status::SyncStatus;
 pub use time::{is_zero_time, zero_time};
 pub use web::WebMirrorStatus;
+
+/// Helper used by `#[serde(skip_serializing_if = ...)]` on optional-extension
+/// fields. Lets us emit no JSON key at all when the value is its type's
+/// `Default` — preserving byte-for-byte wire compatibility with Go for old
+/// clients that never populate the field.
+#[doc(hidden)]
+pub fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
+}

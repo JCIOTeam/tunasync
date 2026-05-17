@@ -470,19 +470,55 @@ pub struct MirrorConfig {
     pub docker_options: Vec<String>,
 
     /// Per-mirror btrfs snapshot path override.
-    ///
-    /// Matches Go's `mirrorConfig.SnapshotPath` (`toml:"snapshot_path"`).
-    /// When non-empty, overrides `[btrfs_snapshot] snapshot_path` for this
-    /// specific mirror.  Defaults to `{global_snapshot_dir}/{mirror_name}`.
     #[serde(default)]
     pub snapshot_path: String,
 
+    // ── Extension fields (tunasync-rs only, opt-in, backwards compatible) ──
+
+    /// Disk quota for this mirror (e.g. "2TB", "500GB").
+    /// If set, the worker checks available space before syncing and skips
+    /// the sync if available space is below the threshold.
+    #[serde(default)]
+    pub disk_quota: String,
+
+    /// Cron expression for scheduling (e.g. "0 3 * * *").
+    /// When set, overrides `interval` and schedules syncs at the specified times.
+    #[serde(default)]
+    pub cron: String,
+
+    /// Blackout windows — list of time ranges during which no new syncs
+    /// are started (e.g. ["08:00-18:00 Mon-Fri"]).
+    #[serde(default)]
+    pub blackout: Vec<String>,
+
+    /// Job priority (higher = more important, default 50).
+    /// Higher-priority jobs get to run first when the semaphore is contended.
+    #[serde(default = "default_priority")]
+    pub priority: i32,
+
+    /// When true, sync to a staging directory first, then atomically
+    /// rename to the publish directory on success.
+    #[serde(default)]
+    pub atomic_publish: bool,
+
+    /// Fallback upstream URLs for health probing. Does NOT change the
+    /// actual sync data source — only used for pre-sync connectivity checks.
+    #[serde(default)]
+    pub upstream_fallback: Vec<String>,
+
+    /// Whether to probe upstream availability before syncing.
+    /// When true, does a quick `rsync --list-only --timeout=10` (or HTTP HEAD
+    /// for non-rsync) against `upstream` before starting the real sync.
+    #[serde(default)]
+    pub check_upstream: bool,
+
     /// Nested child mirrors — Go's `[[mirrors.mirrors]]` inheritance.
-    /// After TOML parsing, `flatten_mirrors()` recursively merges children
-    /// with parents (non-zero child fields override parent defaults) and
-    /// produces a flat `Vec<MirrorConfig>` without any `child_mirrors`.
     #[serde(default, rename = "mirrors")]
     pub child_mirrors: Vec<MirrorConfig>,
+}
+
+fn default_priority() -> i32 {
+    50
 }
 
 /// Recursively flatten nested mirror configs.
@@ -706,6 +742,41 @@ fn merge_mirror(parent: MirrorConfig, child: MirrorConfig) -> MirrorConfig {
             parent.snapshot_path
         } else {
             child.snapshot_path
+        },
+        disk_quota: if child.disk_quota.is_empty() {
+            parent.disk_quota
+        } else {
+            child.disk_quota
+        },
+        cron: if child.cron.is_empty() {
+            parent.cron
+        } else {
+            child.cron
+        },
+        blackout: if child.blackout.is_empty() {
+            parent.blackout
+        } else {
+            child.blackout
+        },
+        priority: if child.priority == default_priority() {
+            parent.priority
+        } else {
+            child.priority
+        },
+        atomic_publish: if !child.atomic_publish {
+            parent.atomic_publish
+        } else {
+            child.atomic_publish
+        },
+        upstream_fallback: if child.upstream_fallback.is_empty() {
+            parent.upstream_fallback
+        } else {
+            child.upstream_fallback
+        },
+        check_upstream: if !child.check_upstream {
+            parent.check_upstream
+        } else {
+            child.check_upstream
         },
         child_mirrors: child.child_mirrors, // always take child's children
     }

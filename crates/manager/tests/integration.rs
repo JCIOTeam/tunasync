@@ -47,10 +47,9 @@ fn sample_status(mirror: &str, worker: &str) -> MirrorStatus {
         last_update: Utc::now(),
         last_started: Utc::now(),
         last_ended: Utc::now(),
-        scheduled: zero_time(),
         upstream: "rsync://example.com/".into(),
         size: "1.2T".into(),
-        error_msg: String::new(),
+        ..Default::default()
     }
 }
 
@@ -257,7 +256,12 @@ mod redis_db {
 fn make_app() -> axum::Router {
     let db = open_db("sqlite", &tmp_path("server")).unwrap();
     let http_client = reqwest::Client::new();
-    let state = std::sync::Arc::new(AppState { db, http_client });
+    let state = std::sync::Arc::new(AppState {
+        db,
+        http_client,
+        maintenance: std::sync::atomic::AtomicBool::new(false),
+        notify: Default::default(),
+    });
     build_router(state)
 }
 

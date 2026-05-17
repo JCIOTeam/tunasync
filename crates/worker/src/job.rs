@@ -85,11 +85,11 @@ pub struct JobMessage {
     pub name: String,
     pub msg: String,
     /// Whether to re-enqueue for next scheduled run.
-    /// Mirrors Go: `schedule: (m.State() == stateReady)` — only true when
-    /// the job is still in Ready state after the sync completes.
     pub schedule: bool,
     /// Human-readable data size after a successful sync (empty = unknown).
     pub size: String,
+    /// Bytes transferred during this sync (0 = unknown).
+    pub transferred_bytes: u64,
 }
 
 // MirrorJob
@@ -281,6 +281,7 @@ async fn run_job_task(
                 msg: String::new(),
                 schedule,
                 size: String::new(),
+                transferred_bytes: 0,
             })
             .await;
 
@@ -316,6 +317,7 @@ async fn run_sync_with_retry(
             msg: String::new(),
             schedule: false,
             size: String::new(),
+                transferred_bytes: 0,
         })
         .await;
     set_state(state, JobState::Ready);
@@ -393,6 +395,7 @@ async fn run_sync_with_retry(
                 msg: String::new(),
                 schedule: false,
                 size: String::new(),
+                transferred_bytes: 0,
             })
             .await;
 
@@ -484,6 +487,7 @@ async fn run_sync_with_retry(
 
     if success && post_exec_ok {
         let size = provider.data_size();
+        let transferred = provider.transferred_bytes();
         run_hooks(hooks, HookPhase::PostSuccess, name, status_tx)
             .await
             .ok();
@@ -494,6 +498,7 @@ async fn run_sync_with_retry(
                 msg: String::new(),
                 schedule: false,
                 size,
+                transferred_bytes: transferred,
             })
             .await;
     } else if post_exec_ok {
@@ -507,6 +512,7 @@ async fn run_sync_with_retry(
                 msg: last_error,
                 schedule: true,
                 size: String::new(),
+                transferred_bytes: 0,
             })
             .await;
     }
@@ -545,6 +551,7 @@ async fn run_hooks(
                     msg: format!("hook {} {:?} failed: {e}", hook.name(), phase),
                     schedule: true,
                     size: String::new(),
+                transferred_bytes: 0,
                 })
                 .await;
             return Err(());

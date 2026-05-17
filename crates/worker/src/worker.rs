@@ -117,14 +117,8 @@ impl Worker {
                     name: name.clone(),
                     worker: cfg.global.name.clone(),
                     is_master,
-                    status: SyncStatus::None,
-                    last_update: zero_time(),
-                    last_started: zero_time(),
-                    last_ended: zero_time(),
-                    scheduled: zero_time(),
                     upstream,
-                    size: String::new(),
-                    error_msg: String::new(),
+                    ..Default::default()
                 },
             );
 
@@ -479,14 +473,7 @@ impl Worker {
                 name: msg.name.clone(),
                 worker: worker_id.to_owned(),
                 is_master: true,
-                status: SyncStatus::None,
-                last_update: zero_time(),
-                last_started: zero_time(),
-                last_ended: zero_time(),
-                scheduled: zero_time(),
-                upstream: String::new(),
-                size: String::new(),
-                error_msg: String::new(),
+                ..Default::default()
             });
 
         // Update local status — but skip overwriting status and error_msg when
@@ -501,6 +488,9 @@ impl Worker {
         }
         if !msg.size.is_empty() {
             status_entry.size = msg.size.clone();
+        }
+        if msg.transferred_bytes > 0 {
+            status_entry.last_transferred_bytes = msg.transferred_bytes;
         }
 
         // Report status to manager.
@@ -726,14 +716,8 @@ impl Worker {
                                     name: name.clone(),
                                     worker: self.cfg.global.name.clone(),
                                     is_master,
-                                    status: SyncStatus::None,
-                                    last_update: zero_time(),
-                                    last_started: zero_time(),
-                                    last_ended: zero_time(),
-                                    scheduled: zero_time(),
                                     upstream,
-                                    size: String::new(),
-                                    error_msg: String::new(),
+                                    ..Default::default()
                                 },
                             );
 
@@ -788,14 +772,8 @@ impl Worker {
                                     name: name.clone(),
                                     worker: self.cfg.global.name.clone(),
                                     is_master,
-                                    status: SyncStatus::None,
-                                    last_update: zero_time(),
-                                    last_started: zero_time(),
-                                    last_ended: zero_time(),
-                                    scheduled: zero_time(),
                                     upstream,
-                                    size: String::new(),
-                                    error_msg: String::new(),
+                                    ..Default::default()
                                 },
                             );
 

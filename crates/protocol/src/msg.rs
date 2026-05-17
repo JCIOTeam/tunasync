@@ -42,6 +42,62 @@ pub struct MirrorStatus {
     pub size: String,
     /// Last error message, or empty string if none.
     pub error_msg: String,
+
+    // ── Optional extension fields ─────────────────────────────────────────
+    //
+    // Each is `#[serde(default)]` (absent JSON → zero/false/empty) and
+    // `skip_serializing_if = is_default` (zero/false/empty → absent JSON),
+    // so a status reported or stored without these fields is byte-for-byte
+    // identical to the legacy Go-compatible shape. A Go worker reporting
+    // status to a tunasync-rs manager works unchanged.
+
+    /// Bytes transferred during the most recent sync.
+    /// Worker parses this from rsync output; 0 means unknown.
+    #[serde(default, skip_serializing_if = "crate::is_default")]
+    pub last_transferred_bytes: u64,
+
+    /// Running total of bytes transferred across all syncs of this mirror
+    /// on this worker. Accumulated by the manager when a worker reports a
+    /// new `last_started` value.
+    #[serde(default, skip_serializing_if = "crate::is_default")]
+    pub total_transferred_bytes: u64,
+
+    /// Number of consecutive sync failures since the last success.
+    /// Reset to 0 by manager on each Success. Used by stale-detection /
+    /// webhook alerting (`notify_url`) to fire alerts.
+    #[serde(default, skip_serializing_if = "crate::is_default")]
+    pub consecutive_failures: u32,
+
+    /// Whether the mirror is currently considered stale by the manager.
+    /// Set by the manager's stale detector when `last_update` is older than
+    /// the configured `stale_after`. Cleared automatically on next Success.
+    #[serde(default, skip_serializing_if = "crate::is_default")]
+    pub stale: bool,
+}
+
+impl Default for MirrorStatus {
+    /// Build a `MirrorStatus` with Go's zero-time semantics on all timestamps
+    /// (`0001-01-01T00:00:00Z`), empty strings, and zeroed extension fields.
+    /// Matches the `zero_mirror_status(name, worker)` helper in the manager.
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            worker: String::new(),
+            is_master: false,
+            status: SyncStatus::None,
+            last_update: crate::time::zero_time(),
+            last_started: crate::time::zero_time(),
+            last_ended: crate::time::zero_time(),
+            scheduled: crate::time::zero_time(),
+            upstream: String::new(),
+            size: String::new(),
+            error_msg: String::new(),
+            last_transferred_bytes: 0,
+            total_transferred_bytes: 0,
+            consecutive_failures: 0,
+            stale: false,
+        }
+    }
 }
 
 /// A worker registered with the manager.

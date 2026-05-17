@@ -26,6 +26,34 @@ pub trait MirrorProvider: Send + Sync {
     fn data_size(&self) -> String {
         String::new()
     }
+    /// Bytes transferred during the most recent sync. 0 = unknown.
+    /// Parsed from rsync `--stats` output or equivalent.
+    fn transferred_bytes(&self) -> u64 {
+        0
+    }
+    /// Working directory for this mirror — used for disk quota and atomic
+    /// publish staging directory checks. Empty = no working directory.
+    fn working_dir(&self) -> &std::path::Path {
+        std::path::Path::new("")
+    }
+    /// Disk quota threshold in bytes (minimum free space required before sync).
+    /// 0 = no quota check.
+    fn disk_quota_bytes(&self) -> u64 {
+        0
+    }
+    /// Whether this provider uses atomic-publish staging (staging dir → rename).
+    /// When true, the runtime should expect sync to write to `<working_dir>/.staging`
+    /// and rename to the final dir on success.
+    fn atomic_publish(&self) -> bool {
+        false
+    }
+    /// Pre-sync upstream connectivity check. Returns Err if upstream is unreachable
+    /// (rsync --list-only timeout, HTTP HEAD failure, etc).
+    /// Default no-op = no probe. Providers that opt in (`check_upstream = true`)
+    /// override this; failure causes the sync to be skipped, not retried.
+    async fn probe_upstream(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// Wire up Docker wrapping — called in `build_providers()` when Docker is
     /// active for this mirror. The provider uses the config to wrap its argv
     /// with `docker run …` inside `run()` and set the container name for

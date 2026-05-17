@@ -212,10 +212,10 @@ mod tests {
             last_update: now,
             last_started: now,
             last_ended: now,
-            scheduled: zero_time(),
             upstream: "rsync://archive.ubuntu.com/ubuntu/".into(),
             size: "100G".into(),
             error_msg: "rsync: timeout".into(),
+            ..Default::default()
         };
 
         let ws = WebMirrorStatus::from_mirror_status(&m);
