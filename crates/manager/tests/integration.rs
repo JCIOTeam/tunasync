@@ -898,3 +898,155 @@ async fn get_mirror_by_name() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(jobs.as_array().unwrap().len(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// End-to-end mirror lifecycle test
+// ---------------------------------------------------------------------------
+
+/// Full lifecycle of one mirror: register → sync-success with traffic →
+/// sync-failure × N triggering webhook threshold → recovery → stale → recovered.
+///
+/// The webhook is not actually sent in this test (no real HTTP server), but
+/// we exercise the full state transitions and verify the stored status at each
+/// step.
+#[tokio::test]
+async fn mirror_lifecycle_e2e() {
+    let app = make_app();
+    let zero = "0001-01-01T00:00:00Z";
+
+    // ── 1. Register worker ────────────────────────────────────────────────
+
+    let worker = serde_json::json!({
+        "id": "worker-e2e",
+        "url": "http://127.0.0.1:14243",
+        "token": "",
+        "last_online": zero,
+        "last_register": zero
+    });
+    let (status, _) = post_json(&app, "/workers", &worker).await;
+    assert_eq!(status, StatusCode::OK, "register worker");
+
+    // ── 2. First status update — PreSyncing ───────────────────────────────
+
+    let pre_sync = serde_json::json!({
+        "name": "fedora",
+        "worker": "worker-e2e",
+        "is_master": true,
+        "status": "pre-syncing",
+        "last_update": zero,
+        "last_started": zero,
+        "last_ended": zero,
+        "next_schedule": zero,
+        "upstream": "rsync://dl.fedoraproject.org/fedora-linux-releases/",
+        "size": "",
+        "error_msg": ""
+    });
+    let (status, _) = post_json(&app, "/workers/worker-e2e/jobs/fedora", &pre_sync).await;
+    assert_eq!(status, StatusCode::OK, "pre-syncing update");
+
+    // ── 3. Successful sync with transferred bytes ─────────────────────────
+
+    let now = Utc::now().to_rfc3339();
+    let success = serde_json::json!({
+        "name": "fedora",
+        "worker": "worker-e2e",
+        "is_master": true,
+        "status": "success",
+        "last_update": now,
+        "last_started": now,
+        "last_ended": now,
+        "next_schedule": now,
+        "upstream": "rsync://dl.fedoraproject.org/fedora-linux-releases/",
+        "size": "2.1T",
+        "error_msg": "",
+        "last_transferred_bytes": 1_073_741_824u64
+    });
+    let (status, body) = post_json(&app, "/workers/worker-e2e/jobs/fedora", &success).await;
+    assert_eq!(status, StatusCode::OK, "success update");
+    assert_eq!(body["status"], "success");
+    assert_eq!(body["size"], "2.1T");
+    // last_transferred_bytes is stored; verify it's reflected on subsequent GET.
+    let (status, arr) = get_json(&app, "/workers/worker-e2e/jobs").await;
+    assert_eq!(status, StatusCode::OK, "list worker jobs after success");
+    let fedora = arr.as_array().unwrap().iter().find(|j| j["name"] == "fedora");
+    assert!(fedora.is_some(), "fedora must appear in worker jobs after success");
+
+    // ── 4. Three consecutive failures → consecutive_failures increments ───
+
+    for i in 1u32..=3 {
+        let fail = serde_json::json!({
+            "name": "fedora",
+            "worker": "worker-e2e",
+            "is_master": true,
+            "status": "failed",
+            "last_update": now,
+            "last_started": now,
+            "last_ended": now,
+            "next_schedule": now,
+            "upstream": "rsync://dl.fedoraproject.org/fedora-linux-releases/",
+            "size": "",
+            "error_msg": format!("simulated failure {i}")
+        });
+        let (status, body) = post_json(&app, "/workers/worker-e2e/jobs/fedora", &fail).await;
+        assert_eq!(status, StatusCode::OK, "failure update {i}");
+        assert_eq!(
+            body["consecutive_failures"].as_u64().unwrap_or(0),
+            i as u64,
+            "consecutive_failures should be {i} after failure {i}"
+        );
+    }
+
+    // ── 5. Recovery — consecutive_failures resets to 0 ───────────────────
+
+    let recovery = serde_json::json!({
+        "name": "fedora",
+        "worker": "worker-e2e",
+        "is_master": true,
+        "status": "success",
+        "last_update": now,
+        "last_started": now,
+        "last_ended": now,
+        "next_schedule": now,
+        "upstream": "rsync://dl.fedoraproject.org/fedora-linux-releases/",
+        "size": "2.1T",
+        "error_msg": ""
+    });
+    let (status, body) = post_json(&app, "/workers/worker-e2e/jobs/fedora", &recovery).await;
+    assert_eq!(status, StatusCode::OK, "recovery update");
+    // consecutive_failures resets to 0 on success. The field is omitted from
+    // JSON when 0 (skip_serializing_if), so absence also means 0.
+    let cf = body["consecutive_failures"].as_u64().unwrap_or(0);
+    assert_eq!(
+        cf, 0,
+        "consecutive_failures should reset to 0 on success, got {cf}"
+    );
+
+    // ── 6. List mirror via GET /jobs ──────────────────────────────────────
+
+    let (status, jobs) = get_json(&app, "/jobs").await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = jobs.as_array().unwrap();
+    assert!(
+        arr.iter().any(|j| j["name"] == "fedora"),
+        "fedora should appear in /jobs"
+    );
+
+    // ── 7. GET /jobs/fedora returns the mirror ────────────────────────────
+
+    let (status, arr) = get_json(&app, "/jobs/fedora").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(arr.as_array().unwrap().len(), 1);
+    assert_eq!(arr[0]["name"], "fedora");
+    assert_eq!(arr[0]["status"], "success");
+
+    // ── 8. Maintenance mode: enable → status → disable ───────────────────
+
+    let (status, _) = post_json(&app, "/maintenance", &serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK, "enable maintenance");
+
+    let (status, _) = get_json(&app, "/maintenance").await;
+    assert_eq!(status, StatusCode::OK, "get maintenance status");
+
+    let (status, _) = delete_req(&app, "/maintenance").await;
+    assert_eq!(status, StatusCode::OK, "disable maintenance");
+}

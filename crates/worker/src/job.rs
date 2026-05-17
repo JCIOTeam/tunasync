@@ -763,9 +763,7 @@ mod per_upstream_semaphore_tests {
     use crate::provider::MirrorProvider;
 
     struct SlowProvider {
-        /// How long to sleep inside run().
-        delay: Duration,
-        /// Set to true when run() is executing.
+        /// Unblocks run() when set.
         running: Arc<tokio::sync::Notify>,
         /// Unblocks run() when set.
         unblock: Arc<tokio::sync::Notify>,
@@ -801,16 +799,14 @@ mod per_upstream_semaphore_tests {
         let running2 = Arc::new(tokio::sync::Notify::new());
         let unblock2 = Arc::new(tokio::sync::Notify::new());
 
-        let (tx1, mut rx1) = mpsc::channel::<JobMessage>(8);
-        let (tx2, mut rx2) = mpsc::channel::<JobMessage>(8);
+        let (tx1, rx1) = mpsc::channel::<JobMessage>(8);
+        let (tx2, rx2) = mpsc::channel::<JobMessage>(8);
 
         let p1 = SlowProvider {
-            delay: Duration::from_millis(50),
             running: Arc::clone(&running1),
             unblock: Arc::clone(&unblock1),
         };
         let p2 = SlowProvider {
-            delay: Duration::from_millis(50),
             running: Arc::clone(&running2),
             unblock: Arc::clone(&unblock2),
         };

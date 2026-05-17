@@ -179,6 +179,7 @@ impl RsyncProvider {
         })
     }
 
+    #[allow(dead_code)]
     fn build_argv(&self) -> Vec<String> {
         self.build_argv_for_dest(&self.working_dir)
     }
