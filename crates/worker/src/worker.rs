@@ -63,7 +63,10 @@ fn upstream_host(upstream: &str) -> Option<String> {
 }
 
 /// Compute the next `Instant` a mirror should run.
-fn next_run_for(mc: &crate::config::MirrorConfig, global: &crate::config::GlobalConfig) -> (Instant, chrono::DateTime<chrono::Utc>) {
+fn next_run_for(
+    mc: &crate::config::MirrorConfig,
+    global: &crate::config::GlobalConfig,
+) -> (Instant, chrono::DateTime<chrono::Utc>) {
     let now_instant = Instant::now();
     let now_utc = chrono::Utc::now();
     let interval = mc.effective_interval(global);
@@ -174,17 +177,23 @@ impl Worker {
             );
 
             // Look up the per-upstream semaphore for this provider's host.
-            let upstream_sem = upstream_host(&upstream)
-                .and_then(|h| per_upstream_semaphores.get(&h).cloned());
+            let upstream_sem =
+                upstream_host(&upstream).and_then(|h| per_upstream_semaphores.get(&h).cloned());
             // Look up configured priority for this mirror (default 50).
-            let priority = cfg.mirrors.iter()
+            let priority = cfg
+                .mirrors
+                .iter()
                 .find(|m| m.name == name)
                 .map(|m| m.priority)
                 .unwrap_or(50);
 
             let job = MirrorJob::spawn(
-                provider, hooks, status_tx.clone(),
-                Arc::clone(&semaphore), upstream_sem, priority,
+                provider,
+                hooks,
+                status_tx.clone(),
+                Arc::clone(&semaphore),
+                upstream_sem,
+                priority,
             );
             jobs.insert(name, job);
         }
@@ -357,11 +366,7 @@ impl Worker {
                     // `stime := m.LastUpdate.Add(job.provider.Interval())`.
                     // If last_update is zero (never synced) or next_run is in the
                     // past the job fires immediately.
-                    let job_cfg = self
-                        .cfg
-                        .mirrors
-                        .iter()
-                        .find(|m| m.name == status.name);
+                    let job_cfg = self.cfg.mirrors.iter().find(|m| m.name == status.name);
 
                     let next_run = if let Some(mc) = job_cfg {
                         if !mc.cron.is_empty() {
@@ -381,7 +386,8 @@ impl Worker {
                                 if next_utc <= now_utc {
                                     Instant::now()
                                 } else {
-                                    let delay = (next_utc - now_utc).to_std().unwrap_or(Duration::ZERO);
+                                    let delay =
+                                        (next_utc - now_utc).to_std().unwrap_or(Duration::ZERO);
                                     Instant::now() + delay
                                 }
                             }
@@ -685,7 +691,9 @@ impl Worker {
                                 match (self.build_one_provider)(job_cfg, &self.cfg) {
                                     Ok((provider, hooks)) => {
                                         let upstream_sem = upstream_host(provider.upstream())
-                                            .and_then(|h| self.per_upstream_semaphores.get(&h).cloned());
+                                            .and_then(|h| {
+                                                self.per_upstream_semaphores.get(&h).cloned()
+                                            });
                                         let new_job = MirrorJob::spawn(
                                             provider,
                                             hooks,

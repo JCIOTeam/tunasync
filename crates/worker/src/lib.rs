@@ -6,14 +6,14 @@
 
 #![warn(rust_2018_idioms)]
 
+pub mod blackout;
 pub mod config;
 pub mod diff_config;
-pub mod blackout;
-pub mod priority_semaphore;
 pub mod hooks;
 pub mod http_server;
 pub mod job;
 pub mod manager_client;
+pub mod priority_semaphore;
 pub mod provider;
 pub mod providers;
 pub mod runner;

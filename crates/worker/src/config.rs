@@ -488,7 +488,6 @@ pub struct MirrorConfig {
     pub snapshot_path: String,
 
     // ── Extension fields (tunasync-rs only, opt-in, backwards compatible) ──
-
     /// Disk quota for this mirror (e.g. "2TB", "500GB").
     /// If set, the worker checks available space before syncing and skips
     /// the sync if available space is below the threshold.

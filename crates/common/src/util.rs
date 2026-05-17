@@ -73,9 +73,8 @@ pub fn extract_transferred_bytes_from_rsync_log(log_content: &str) -> u64 {
         //   Total transferred file size: 1,234,567 bytes
         //   Total transferred file size: 1.23G bytes
         // We grab the raw number (with commas or suffixes).
-        regex::Regex::new(
-            r"(?m)^Total transferred file size:\s+([0-9][0-9,.]*)\s+bytes"
-        ).expect("static regex")
+        regex::Regex::new(r"(?m)^Total transferred file size:\s+([0-9][0-9,.]*)\s+bytes")
+            .expect("static regex")
     });
     RE.captures_iter(log_content)
         .last()
@@ -112,7 +111,11 @@ pub fn parse_size_bytes(s: &str) -> Option<u64> {
     });
     let caps = RE.captures(s.trim())?;
     let num: f64 = caps.get(1)?.as_str().parse().ok()?;
-    let multiplier: f64 = match caps.get(2).map(|m| m.as_str().to_ascii_lowercase()).as_deref() {
+    let multiplier: f64 = match caps
+        .get(2)
+        .map(|m| m.as_str().to_ascii_lowercase())
+        .as_deref()
+    {
         Some("k") | Some("kb") => 1024.0,
         Some("m") | Some("mb") => 1024.0 * 1024.0,
         Some("g") | Some("gb") => 1024.0 * 1024.0 * 1024.0,
@@ -137,12 +140,28 @@ pub fn parse_duration_secs(s: &str) -> Option<u64> {
         return None;
     }
     let caps = RE.captures(s)?;
-    let d: u64 = caps.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
-    let h: u64 = caps.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
-    let m: u64 = caps.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
-    let sec: u64 = caps.get(4).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+    let d: u64 = caps
+        .get(1)
+        .and_then(|m| m.as_str().parse().ok())
+        .unwrap_or(0);
+    let h: u64 = caps
+        .get(2)
+        .and_then(|m| m.as_str().parse().ok())
+        .unwrap_or(0);
+    let m: u64 = caps
+        .get(3)
+        .and_then(|m| m.as_str().parse().ok())
+        .unwrap_or(0);
+    let sec: u64 = caps
+        .get(4)
+        .and_then(|m| m.as_str().parse().ok())
+        .unwrap_or(0);
     let total = d * 86400 + h * 3600 + m * 60 + sec;
-    if total == 0 { None } else { Some(total) }
+    if total == 0 {
+        None
+    } else {
+        Some(total)
+    }
 }
 
 /// Check available disk space at `path`. Returns `(available_bytes, total_bytes)`.

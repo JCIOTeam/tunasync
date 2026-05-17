@@ -322,7 +322,10 @@ mod tests {
             for_db_1.len(),
             1,
             "list_mirror_status('db_1') leaked rows belonging to other workers: {:?}",
-            for_db_1.iter().map(|m| (&m.name, &m.worker)).collect::<Vec<_>>()
+            for_db_1
+                .iter()
+                .map(|m| (&m.name, &m.worker))
+                .collect::<Vec<_>>()
         );
         assert_eq!(for_db_1[0].name, "ubuntu");
         assert_eq!(for_db_1[0].worker, "db_1");

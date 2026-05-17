@@ -88,7 +88,9 @@ pub async fn run_with_config(cfg: ManagerConfig) -> Result<()> {
 
     // Spawn stale detector if configured.
     if !cfg.notify.stale_after.is_empty() {
-        if let Some(stale_secs) = tunasync_common::util::parse_duration_secs(&cfg.notify.stale_after) {
+        if let Some(stale_secs) =
+            tunasync_common::util::parse_duration_secs(&cfg.notify.stale_after)
+        {
             let state_clone = std::sync::Arc::clone(&state);
             tokio::spawn(async move {
                 stale_detector(state_clone, stale_secs).await;
@@ -253,8 +255,7 @@ async fn stale_detector(state: std::sync::Arc<AppState>, stale_secs: u64) {
                 && age > stale_duration
                 && !matches!(
                     mirror.status,
-                    tunasync_protocol::SyncStatus::Disabled
-                        | tunasync_protocol::SyncStatus::Paused
+                    tunasync_protocol::SyncStatus::Disabled | tunasync_protocol::SyncStatus::Paused
                 );
 
             if is_stale != was_stale {

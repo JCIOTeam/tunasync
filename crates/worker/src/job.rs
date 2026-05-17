@@ -120,8 +120,15 @@ impl MirrorJob {
 
         let task_state = Arc::clone(&state);
         tokio::spawn(run_job_task(
-            provider, hooks, ctrl_rx, kill_rx, status_tx, semaphore,
-            per_upstream_semaphore, priority, task_state,
+            provider,
+            hooks,
+            ctrl_rx,
+            kill_rx,
+            status_tx,
+            semaphore,
+            per_upstream_semaphore,
+            priority,
+            task_state,
         ));
 
         Self {
@@ -354,9 +361,7 @@ async fn run_sync_with_retry(
                     .send(JobMessage {
                         status: SyncStatus::Failed,
                         name: name.to_owned(),
-                        msg: format!(
-                            "disk quota: only {avail} bytes available, need {quota}"
-                        ),
+                        msg: format!("disk quota: only {avail} bytes available, need {quota}"),
                         schedule: true,
                         size: String::new(),
                         transferred_bytes: 0,
@@ -392,7 +397,7 @@ async fn run_sync_with_retry(
             msg: String::new(),
             schedule: false,
             size: String::new(),
-                transferred_bytes: 0,
+            transferred_bytes: 0,
         })
         .await;
     set_state(state, JobState::Ready);
@@ -626,7 +631,7 @@ async fn run_hooks(
                     msg: format!("hook {} {:?} failed: {e}", hook.name(), phase),
                     schedule: true,
                     size: String::new(),
-                transferred_bytes: 0,
+                    transferred_bytes: 0,
                 })
                 .await;
             return Err(());
@@ -644,8 +649,8 @@ mod disk_quota_tests {
     //! Tests for the disk-quota pre-sync check in `run_sync_with_retry`.
 
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex};
     use std::sync::atomic::AtomicU32;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -653,7 +658,7 @@ mod disk_quota_tests {
     use tunasync_protocol::SyncStatus;
 
     use crate::hooks::DockerConfig;
-    use crate::job::{run_sync_with_retry, JobMessage, JobState, CtrlAction};
+    use crate::job::{run_sync_with_retry, CtrlAction, JobMessage, JobState};
     use crate::provider::MirrorProvider;
 
     /// A no-op provider with configurable working_dir and disk_quota_bytes.
@@ -664,16 +669,36 @@ mod disk_quota_tests {
 
     #[async_trait]
     impl MirrorProvider for QuotaStubProvider {
-        fn name(&self) -> &str { "quota-stub" }
-        fn upstream(&self) -> &str { "rsync://localhost/test/" }
-        fn is_master(&self) -> bool { true }
-        fn interval(&self) -> Duration { Duration::from_secs(3600) }
-        fn retry(&self) -> u32 { 1 }
-        fn timeout(&self) -> Duration { Duration::ZERO }
-        fn working_dir(&self) -> &Path { &self.working_dir }
-        fn disk_quota_bytes(&self) -> u64 { self.disk_quota_bytes }
-        async fn run(&self) -> anyhow::Result<()> { Ok(()) }
-        async fn terminate(&self) -> anyhow::Result<()> { Ok(()) }
+        fn name(&self) -> &str {
+            "quota-stub"
+        }
+        fn upstream(&self) -> &str {
+            "rsync://localhost/test/"
+        }
+        fn is_master(&self) -> bool {
+            true
+        }
+        fn interval(&self) -> Duration {
+            Duration::from_secs(3600)
+        }
+        fn retry(&self) -> u32 {
+            1
+        }
+        fn timeout(&self) -> Duration {
+            Duration::ZERO
+        }
+        fn working_dir(&self) -> &Path {
+            &self.working_dir
+        }
+        fn disk_quota_bytes(&self) -> u64 {
+            self.disk_quota_bytes
+        }
+        async fn run(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn terminate(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
         fn set_docker_config(&mut self, _: DockerConfig) {}
         fn set_log_path_shared(&mut self, _: Arc<Mutex<PathBuf>>) {}
     }
@@ -737,9 +762,15 @@ mod disk_quota_tests {
         let msgs = run_and_collect(provider).await;
 
         let has_failed = msgs.iter().any(|m| m.status == SyncStatus::Failed);
-        assert!(!has_failed, "unexpected Failed message with quota=0: {msgs:?}");
+        assert!(
+            !has_failed,
+            "unexpected Failed message with quota=0: {msgs:?}"
+        );
         let has_success = msgs.iter().any(|m| m.status == SyncStatus::Success);
-        assert!(has_success, "expected Success message with quota=0: {msgs:?}");
+        assert!(
+            has_success,
+            "expected Success message with quota=0: {msgs:?}"
+        );
     }
 }
 
@@ -771,18 +802,32 @@ mod per_upstream_semaphore_tests {
 
     #[async_trait]
     impl MirrorProvider for SlowProvider {
-        fn name(&self) -> &str { "slow" }
-        fn upstream(&self) -> &str { "rsync://upstream.example.com/test/" }
-        fn is_master(&self) -> bool { true }
-        fn interval(&self) -> Duration { Duration::from_secs(3600) }
-        fn retry(&self) -> u32 { 1 }
-        fn timeout(&self) -> Duration { Duration::ZERO }
+        fn name(&self) -> &str {
+            "slow"
+        }
+        fn upstream(&self) -> &str {
+            "rsync://upstream.example.com/test/"
+        }
+        fn is_master(&self) -> bool {
+            true
+        }
+        fn interval(&self) -> Duration {
+            Duration::from_secs(3600)
+        }
+        fn retry(&self) -> u32 {
+            1
+        }
+        fn timeout(&self) -> Duration {
+            Duration::ZERO
+        }
         async fn run(&self) -> anyhow::Result<()> {
             self.running.notify_one();
             self.unblock.notified().await;
             Ok(())
         }
-        async fn terminate(&self) -> anyhow::Result<()> { Ok(()) }
+        async fn terminate(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
         fn set_docker_config(&mut self, _: DockerConfig) {}
         fn set_log_path_shared(&mut self, _: Arc<Mutex<PathBuf>>) {}
     }
@@ -812,12 +857,20 @@ mod per_upstream_semaphore_tests {
         };
 
         let job1 = MirrorJob::spawn(
-            Box::new(p1), vec![], tx1,
-            Arc::clone(&global_sem), Some(Arc::clone(&upstream_sem)), 50,
+            Box::new(p1),
+            vec![],
+            tx1,
+            Arc::clone(&global_sem),
+            Some(Arc::clone(&upstream_sem)),
+            50,
         );
         let job2 = MirrorJob::spawn(
-            Box::new(p2), vec![], tx2,
-            Arc::clone(&global_sem), Some(Arc::clone(&upstream_sem)), 50,
+            Box::new(p2),
+            vec![],
+            tx2,
+            Arc::clone(&global_sem),
+            Some(Arc::clone(&upstream_sem)),
+            50,
         );
 
         // Start both jobs concurrently.
@@ -834,7 +887,8 @@ mod per_upstream_semaphore_tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         // The upstream semaphore should have 0 permits available — job1 holds the only one.
         assert_eq!(
-            upstream_sem.available_permits(), 0,
+            upstream_sem.available_permits(),
+            0,
             "upstream semaphore should be fully held while job1 runs"
         );
 
@@ -848,7 +902,9 @@ mod per_upstream_semaphore_tests {
 
         // Unblock job2 and clean up.
         unblock2.notify_one();
-        drop(job1); drop(job2);
-        drop(rx1); drop(rx2);
+        drop(job1);
+        drop(job2);
+        drop(rx1);
+        drop(rx2);
     }
 }

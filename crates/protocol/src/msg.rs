@@ -50,7 +50,6 @@ pub struct MirrorStatus {
     // so a status reported or stored without these fields is byte-for-byte
     // identical to the legacy Go-compatible shape. A Go worker reporting
     // status to a tunasync-rs manager works unchanged.
-
     /// Bytes transferred during the most recent sync.
     /// Worker parses this from rsync output; 0 means unknown.
     #[serde(default, skip_serializing_if = "crate::is_default")]

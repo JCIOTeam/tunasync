@@ -968,8 +968,15 @@ async fn mirror_lifecycle_e2e() {
     // last_transferred_bytes is stored; verify it's reflected on subsequent GET.
     let (status, arr) = get_json(&app, "/workers/worker-e2e/jobs").await;
     assert_eq!(status, StatusCode::OK, "list worker jobs after success");
-    let fedora = arr.as_array().unwrap().iter().find(|j| j["name"] == "fedora");
-    assert!(fedora.is_some(), "fedora must appear in worker jobs after success");
+    let fedora = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["name"] == "fedora");
+    assert!(
+        fedora.is_some(),
+        "fedora must appear in worker jobs after success"
+    );
 
     // ── 4. Three consecutive failures → consecutive_failures increments ───
 

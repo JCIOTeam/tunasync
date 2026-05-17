@@ -50,7 +50,11 @@ impl BlackoutWindow {
             parse_weekday_range(day_part)?
         };
 
-        Some(BlackoutWindow { start, end, weekdays })
+        Some(BlackoutWindow {
+            start,
+            end,
+            weekdays,
+        })
     }
 
     /// Return `true` if `now` falls inside this blackout window.
@@ -66,12 +70,7 @@ impl BlackoutWindow {
             }
         }
 
-        let t = NaiveTime::from_hms_opt(
-            now.hour(),
-            now.minute(),
-            0,
-        )
-        .unwrap_or(self.start);
+        let t = NaiveTime::from_hms_opt(now.hour(), now.minute(), 0).unwrap_or(self.start);
 
         if self.start <= self.end {
             // Normal range (e.g. 08:00-18:00).
@@ -195,7 +194,13 @@ mod tests {
         assert_eq!(w.end, NaiveTime::from_hms_opt(18, 0, 0).unwrap());
         assert_eq!(
             w.weekdays,
-            vec![Weekday::Mon, Weekday::Tue, Weekday::Wed, Weekday::Thu, Weekday::Fri]
+            vec![
+                Weekday::Mon,
+                Weekday::Tue,
+                Weekday::Wed,
+                Weekday::Thu,
+                Weekday::Fri
+            ]
         );
     }
 
@@ -282,10 +287,8 @@ mod tests {
 
     #[test]
     fn is_in_blackout_returns_true_when_any_window_matches() {
-        let windows = parse_blackout_windows(&[
-            "02:00-06:00".to_string(),
-            "08:00-18:00 Mon-Fri".to_string(),
-        ]);
+        let windows =
+            parse_blackout_windows(&["02:00-06:00".to_string(), "08:00-18:00 Mon-Fri".to_string()]);
         // Monday 12:00 → second window matches.
         let t = utc(2024, 1, 15, 12, 0);
         assert!(is_in_blackout(&windows, &t));

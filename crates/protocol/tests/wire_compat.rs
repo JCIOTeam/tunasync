@@ -10,8 +10,8 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 use tunasync_protocol::{
-    is_zero_time, ClientCmd, CmdVerb, MirrorSchedules, MirrorStatus, SyncStatus,
-    WorkerCmd, WorkerStatus,
+    is_zero_time, ClientCmd, CmdVerb, MirrorSchedules, MirrorStatus, SyncStatus, WorkerCmd,
+    WorkerStatus,
 };
 
 /// Re-serialise a value and assert that the resulting JSON, when parsed back

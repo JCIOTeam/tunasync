@@ -188,11 +188,9 @@ impl std::future::Future for AcquireFuture {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         match std::pin::Pin::new(&mut self.rx).poll(cx) {
-            std::task::Poll::Ready(Ok(())) => {
-                std::task::Poll::Ready(Permit {
-                    inner: Arc::clone(&self.inner),
-                })
-            }
+            std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Permit {
+                inner: Arc::clone(&self.inner),
+            }),
             std::task::Poll::Ready(Err(_)) => {
                 // Sender dropped — shouldn't happen in normal operation.
                 // Treat as granted (the Inner::wake_next path failed to send

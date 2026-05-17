@@ -645,7 +645,10 @@ async fn main() -> Result<()> {
                 if stale_names.is_empty() {
                     println!(
                         "{}",
-                        t!("No stale disabled jobs to flush.", "没有需要清除的 stale 任务。")
+                        t!(
+                            "No stale disabled jobs to flush.",
+                            "没有需要清除的 stale 任务。"
+                        )
                     );
                 } else {
                     println!(
@@ -658,7 +661,10 @@ async fn main() -> Result<()> {
                     client.flush_disabled().await?;
                     println!(
                         "{}",
-                        t!("Flushed stale disabled jobs.", "已清除所有 stale disabled 任务。")
+                        t!(
+                            "Flushed stale disabled jobs.",
+                            "已清除所有 stale disabled 任务。"
+                        )
                     );
                 }
             } else {
@@ -738,22 +744,29 @@ async fn main() -> Result<()> {
                 let wid = wid.clone();
                 let client = &client;
                 async move {
-                    client.send_cmd(ClientCmd {
-                        cmd: CmdVerb::Stop,
-                        mirror_id: name.clone(),
-                        worker_id: wid,
-                        args: vec![],
-                        options: HashMap::new(),
-                    }).await?;
-                    println!("{}", t!(
-                        format!("Sent stop command for mirror {name:?}."),
-                        format!("已发送停止命令：镜像 {name:?}。")
-                    ));
+                    client
+                        .send_cmd(ClientCmd {
+                            cmd: CmdVerb::Stop,
+                            mirror_id: name.clone(),
+                            worker_id: wid,
+                            args: vec![],
+                            options: HashMap::new(),
+                        })
+                        .await?;
+                    println!(
+                        "{}",
+                        t!(
+                            format!("Sent stop command for mirror {name:?}."),
+                            format!("已发送停止命令：镜像 {name:?}。")
+                        )
+                    );
                     anyhow::Ok(())
                 }
             });
             let results: Vec<_> = join_all(futs).await;
-            for r in results { r?; }
+            for r in results {
+                r?;
+            }
         }
 
         Command::Disable { mirror, worker } => {
@@ -763,22 +776,29 @@ async fn main() -> Result<()> {
                 let wid = wid.clone();
                 let client = &client;
                 async move {
-                    client.send_cmd(ClientCmd {
-                        cmd: CmdVerb::Disable,
-                        mirror_id: name.clone(),
-                        worker_id: wid,
-                        args: vec![],
-                        options: HashMap::new(),
-                    }).await?;
-                    println!("{}", t!(
-                        format!("Sent disable command for mirror {name:?}."),
-                        format!("已发送禁用命令：镜像 {name:?}。")
-                    ));
+                    client
+                        .send_cmd(ClientCmd {
+                            cmd: CmdVerb::Disable,
+                            mirror_id: name.clone(),
+                            worker_id: wid,
+                            args: vec![],
+                            options: HashMap::new(),
+                        })
+                        .await?;
+                    println!(
+                        "{}",
+                        t!(
+                            format!("Sent disable command for mirror {name:?}."),
+                            format!("已发送禁用命令：镜像 {name:?}。")
+                        )
+                    );
                     anyhow::Ok(())
                 }
             });
             let results: Vec<_> = join_all(futs).await;
-            for r in results { r?; }
+            for r in results {
+                r?;
+            }
         }
 
         Command::Restart { mirror, worker } => {
@@ -788,22 +808,29 @@ async fn main() -> Result<()> {
                 let wid = wid.clone();
                 let client = &client;
                 async move {
-                    client.send_cmd(ClientCmd {
-                        cmd: CmdVerb::Restart,
-                        mirror_id: name.clone(),
-                        worker_id: wid,
-                        args: vec![],
-                        options: HashMap::new(),
-                    }).await?;
-                    println!("{}", t!(
-                        format!("Sent restart command for mirror {name:?}."),
-                        format!("已发送重启命令：镜像 {name:?}。")
-                    ));
+                    client
+                        .send_cmd(ClientCmd {
+                            cmd: CmdVerb::Restart,
+                            mirror_id: name.clone(),
+                            worker_id: wid,
+                            args: vec![],
+                            options: HashMap::new(),
+                        })
+                        .await?;
+                    println!(
+                        "{}",
+                        t!(
+                            format!("Sent restart command for mirror {name:?}."),
+                            format!("已发送重启命令：镜像 {name:?}。")
+                        )
+                    );
                     anyhow::Ok(())
                 }
             });
             let results: Vec<_> = join_all(futs).await;
-            for r in results { r?; }
+            for r in results {
+                r?;
+            }
         }
 
         Command::Reload { worker } => {

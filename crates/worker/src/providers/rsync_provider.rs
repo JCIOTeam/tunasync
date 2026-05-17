@@ -238,9 +238,7 @@ impl MirrorProvider for RsyncProvider {
             let staging = publish_dir
                 .parent()
                 .map(|p| p.join(format!(".staging-{}", self.name)))
-                .unwrap_or_else(|| {
-                    PathBuf::from(format!(".staging-{}", self.name))
-                });
+                .unwrap_or_else(|| PathBuf::from(format!(".staging-{}", self.name)));
             // Sanity check: staging parent and publish dir must share a device.
             if publish_dir.exists() {
                 let pub_meta = std::fs::metadata(&publish_dir)
@@ -249,7 +247,10 @@ impl MirrorProvider for RsyncProvider {
                 let stage_dir_for_meta = if staging_parent.exists() {
                     staging_parent.to_path_buf()
                 } else {
-                    publish_dir.parent().map(PathBuf::from).unwrap_or(publish_dir.clone())
+                    publish_dir
+                        .parent()
+                        .map(PathBuf::from)
+                        .unwrap_or(publish_dir.clone())
                 };
                 let stage_meta = std::fs::metadata(&stage_dir_for_meta)
                     .with_context(|| format!("stat {}", stage_dir_for_meta.display()))?;
@@ -357,7 +358,8 @@ impl MirrorProvider for RsyncProvider {
             if !size.is_empty() {
                 *self.data_size.lock().unwrap() = size;
             }
-            let transferred = tunasync_common::util::extract_transferred_bytes_from_rsync_log(&content);
+            let transferred =
+                tunasync_common::util::extract_transferred_bytes_from_rsync_log(&content);
             if transferred > 0 {
                 *self.transferred_bytes.lock().unwrap() = transferred;
             }
@@ -442,10 +444,7 @@ impl MirrorProvider for RsyncProvider {
                 return Ok(());
             }
         }
-        anyhow::bail!(
-            "all upstreams unreachable ({} URL(s) probed)",
-            urls.len()
-        )
+        anyhow::bail!("all upstreams unreachable ({} URL(s) probed)", urls.len())
     }
 
     fn set_docker_config(&mut self, config: DockerConfig) {
@@ -527,13 +526,16 @@ mod upstream_probe_tests {
         mc.upstream = "rsync://localhost/will-not-be-called/".into();
         // check_upstream defaults to false — leave it unset.
 
-        let provider = super::RsyncProvider::from_config(&mc, &global)
-            .expect("from_config should succeed");
+        let provider =
+            super::RsyncProvider::from_config(&mc, &global).expect("from_config should succeed");
 
         // Must return Ok without spawning rsync.
         // Cast to the trait to invoke the overridden probe_upstream().
         let provider: &dyn MirrorProvider = &provider;
-        provider.probe_upstream().await.expect("no-op probe should always succeed");
+        provider
+            .probe_upstream()
+            .await
+            .expect("no-op probe should always succeed");
     }
 }
 
@@ -559,8 +561,7 @@ mod atomic_publish_tests {
         mc.upstream = "rsync://localhost/unused/".into();
         mc.atomic_publish = true;
         // Override the mirror dir by constructing manually after from_config.
-        let mut p = super::RsyncProvider::from_config(&mc, &global)
-            .expect("from_config");
+        let mut p = super::RsyncProvider::from_config(&mc, &global).expect("from_config");
         p.working_dir = working_dir;
         // Silence log output by pointing log to /dev/null.
         p.log_path_shared = Arc::new(Mutex::new(PathBuf::from("/dev/null")));
@@ -607,7 +608,10 @@ mod atomic_publish_tests {
             "file.txt should be in publish_dir after atomic rename"
         );
         // Staging must not exist any more.
-        assert!(!staging.exists(), "staging dir should have been renamed away");
+        assert!(
+            !staging.exists(),
+            "staging dir should have been renamed away"
+        );
     }
 
     /// When publish_dir already exists it is first renamed to .old then
@@ -645,8 +649,14 @@ mod atomic_publish_tests {
             let _ = std::fs::remove_dir_all(&backup);
         }
 
-        assert!(publish_dir.join("new.txt").exists(), "new.txt should be present");
-        assert!(!publish_dir.join("old.txt").exists(), "old.txt should be gone");
+        assert!(
+            publish_dir.join("new.txt").exists(),
+            "new.txt should be present"
+        );
+        assert!(
+            !publish_dir.join("old.txt").exists(),
+            "old.txt should be gone"
+        );
         // Backup dir must be cleaned up.
         assert!(!backup.exists(), "backup dir should have been removed");
     }

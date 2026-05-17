@@ -109,7 +109,9 @@ pub fn build_router(shared: Arc<AppState>) -> Router {
         .route("/metrics", get(metrics))
         .route(
             "/maintenance",
-            post(enable_maintenance).delete(disable_maintenance).get(get_maintenance),
+            post(enable_maintenance)
+                .delete(disable_maintenance)
+                .get(get_maintenance),
         )
         .with_state(shared)
 }
@@ -604,9 +606,7 @@ async fn disable_maintenance(State(state): State<Arc<AppState>>) -> impl IntoRes
 
 /// `GET /maintenance` — check current maintenance mode status.
 async fn get_maintenance(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let enabled = state
-        .maintenance
-        .load(std::sync::atomic::Ordering::Relaxed);
+    let enabled = state.maintenance.load(std::sync::atomic::Ordering::Relaxed);
     Json(serde_json::json!({ "maintenance": enabled }))
 }
 
