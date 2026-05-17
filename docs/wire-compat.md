@@ -202,3 +202,36 @@ differences between Go's `encoding/json` and `serde_json`).
 
 The manager DB adapters (`redb`, `sqlite`) are tested identically via the
 `db_tests!` macro in `crates/manager/tests/integration.rs`.
+## New optional MirrorStatus fields (Rust port)
+
+The following fields were added to `MirrorStatus` in the Rust port.  They are
+all tagged `#[serde(default)]` (deserialise absent → zero/false) and
+`#[serde(skip_serializing_if = "is_default")]` (omit from JSON when zero).
+This means:
+
+- A Go manager receiving a Rust worker's status update simply ignores the
+  new fields (Go's `encoding/json` ignores unknown keys by default).
+- A Rust manager receiving status from an old Go worker gets the zero value
+  for each field, which is the correct "unknown / not reported" sentinel.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `last_transferred_bytes` | `u64` | `0` | Bytes transferred in the last sync |
+| `total_transferred_bytes` | `u64` | `0` | Cumulative bytes transferred |
+| `consecutive_failures` | `u32` | `0` | Failures since last success |
+| `stale` | `bool` | `false` | Manager has not seen a success in > stale_after |
+
+### Serialisation contract
+
+When all four fields are at their zero/false values the JSON object is
+identical to what a Go worker would produce — the fields are simply absent.
+This preserves full wire compatibility with the Go implementation.
+
+### Webhook events (Rust manager only)
+
+The Rust manager fires a fire-and-forget `{"text": "…"}` POST to
+`notify.webhook_url` (if configured) on these events:
+
+- Consecutive failures reaches `notify.alert_after_failures`
+- Recovery from consecutive failures (first success after failures)
+- Mirror transitions to/from the `stale` state
