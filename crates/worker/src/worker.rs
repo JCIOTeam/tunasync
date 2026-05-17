@@ -63,24 +63,90 @@ fn upstream_host(upstream: &str) -> Option<String> {
 }
 
 /// Compute the next `Instant` a mirror should run.
+///
+/// `cached_cron` is the precomputed `cron::Schedule` for this mirror, if any
+/// — built once at startup so we don't re-parse the TOML string on every
+/// scheduler tick.
 fn next_run_for(
     mc: &crate::config::MirrorConfig,
     global: &crate::config::GlobalConfig,
+    cached_cron: Option<&cron::Schedule>,
 ) -> (Instant, chrono::DateTime<chrono::Utc>) {
     let now_instant = Instant::now();
     let now_utc = chrono::Utc::now();
     let interval = mc.effective_interval(global);
 
-    if !mc.cron.is_empty() {
-        if let Ok(sched) = mc.cron.parse::<cron::Schedule>() {
-            if let Some(next_utc) = sched.upcoming(chrono::Utc).next() {
-                let delta = (next_utc - now_utc).to_std().unwrap_or(interval);
-                return (now_instant + delta, next_utc);
-            }
+    if let Some(sched) = cached_cron {
+        if let Some(next_utc) = sched.upcoming(chrono::Utc).next() {
+            let delta = (next_utc - now_utc).to_std().unwrap_or(interval);
+            return (now_instant + delta, next_utc);
         }
     }
     let next_dt = now_utc + chrono::Duration::from_std(interval).unwrap_or_default();
     (now_instant + interval, next_dt)
+}
+
+/// Build the per-mirror blackout-windows cache from config.
+///
+/// Done once at startup (and on hot-reload) so the scheduler hot path doesn't
+/// re-parse TOML strings on every tick.
+fn build_blackout_cache(
+    mirrors: &[crate::config::MirrorConfig],
+) -> HashMap<String, Vec<crate::blackout::BlackoutWindow>> {
+    mirrors
+        .iter()
+        .filter(|mc| !mc.blackout.is_empty())
+        .map(|mc| {
+            (
+                mc.name.clone(),
+                crate::blackout::parse_blackout_windows(&mc.blackout),
+            )
+        })
+        .collect()
+}
+
+/// Build the per-mirror precomputed `cron::Schedule` cache.
+///
+/// Invalid expressions are silently skipped here — the canonical validation
+/// happens at startup in `lib.rs::run`, which fails the worker outright on a
+/// bad cron string. This function is defensive in case hot-reload introduces
+/// a bad expression mid-flight; the scheduler then falls back to interval
+/// for that mirror until the next reload fixes the config.
+fn build_cron_cache(mirrors: &[crate::config::MirrorConfig]) -> HashMap<String, cron::Schedule> {
+    mirrors
+        .iter()
+        .filter(|mc| !mc.cron.is_empty())
+        .filter_map(|mc| {
+            parse_cron_lenient(&mc.cron)
+                .ok()
+                .map(|s| (mc.name.clone(), s))
+        })
+        .collect()
+}
+
+/// Parse a cron expression accepting both 5-field POSIX format
+/// (`minute hour dom month dow`) and the cron-crate native 6/7-field format
+/// (`sec minute hour dom month dow [year]`).
+///
+/// The `cron` crate (0.12) requires 6 or 7 fields. Operators are far more
+/// familiar with the classic 5-field syntax used by crontab(5), Kubernetes,
+/// systemd timers, and just about every other scheduler — so accepting both
+/// is essential. A 5-field expression is widened by prepending `"0 "` (run
+/// at second 0 of the matching minute).
+///
+/// Returns the same error type the `cron` crate uses, so callers can render
+/// it verbatim in startup error messages.
+pub(crate) fn parse_cron_lenient(expr: &str) -> Result<cron::Schedule, cron::error::Error> {
+    use std::str::FromStr;
+    let trimmed = expr.trim();
+    let field_count = trimmed.split_ascii_whitespace().count();
+    if field_count == 5 {
+        // Widen to 6 fields by prepending "0 " for the seconds field.
+        let widened = format!("0 {trimmed}");
+        cron::Schedule::from_str(&widened)
+    } else {
+        cron::Schedule::from_str(trimmed)
+    }
 }
 
 /// The worker: holds all jobs and coordinates the scheduler.
@@ -106,6 +172,14 @@ pub struct Worker {
     /// Shared mirror name set — kept in sync with `self.jobs` so the HTTP
     /// handler can validate mirror_id before accepting a command.
     mirror_names: Arc<RwLock<HashSet<String>>>,
+    /// Precomputed blackout windows per mirror name. Built once at startup
+    /// and rebuilt on hot-reload. Cached because the scheduler hot path
+    /// (every pop) would otherwise re-parse the TOML string list every tick.
+    blackouts_by_mirror: HashMap<String, Vec<crate::blackout::BlackoutWindow>>,
+    /// Precomputed cron::Schedule per mirror name (only for mirrors with a
+    /// non-empty `cron` field). Cached because `cron::Schedule::parse` is
+    /// non-trivial and the scheduler computes next_run frequently.
+    crons_by_mirror: HashMap<String, cron::Schedule>,
     /// Function to build a single mirror's provider+hooks pair.
     /// Used at startup and on hot-reload for new/modified mirrors.
     #[allow(clippy::type_complexity)]
@@ -204,6 +278,10 @@ impl Worker {
 
         let mirror_names = Arc::new(RwLock::new(jobs.keys().cloned().collect()));
 
+        // Precompute blackout and cron caches.
+        let blackouts_by_mirror = build_blackout_cache(&cfg.mirrors);
+        let crons_by_mirror = build_cron_cache(&cfg.mirrors);
+
         Self {
             cfg,
             config_path,
@@ -218,6 +296,8 @@ impl Worker {
             schedule,
             mirror_statuses,
             mirror_names,
+            blackouts_by_mirror,
+            crons_by_mirror,
             build_one_provider: crate::build_one_provider,
         }
     }
@@ -371,7 +451,8 @@ impl Worker {
                     let next_run = if let Some(mc) = job_cfg {
                         if !mc.cron.is_empty() {
                             // Cron: ignore last_update and compute the next tick.
-                            let (inst, _) = next_run_for(mc, &self.cfg.global);
+                            let cached = self.crons_by_mirror.get(&mc.name);
+                            let (inst, _) = next_run_for(mc, &self.cfg.global, cached);
                             inst
                         } else {
                             // Interval: last_update + interval, clamped to now.
@@ -501,14 +582,13 @@ impl Worker {
                     // Blackout check: if this mirror is inside a blackout window,
                     // push it back by 5 minutes instead of starting it.
                     // In-progress syncs are never interrupted — only new starts are gated.
+                    // Uses precomputed cache so we don't re-parse the TOML
+                    // strings every scheduler tick.
                     let in_blackout = self
-                        .cfg
-                        .mirrors
-                        .iter()
-                        .find(|m| m.name == entry.name)
-                        .map(|mc| {
-                            let windows = crate::blackout::parse_blackout_windows(&mc.blackout);
-                            crate::blackout::is_in_blackout(&windows, &chrono::Utc::now())
+                        .blackouts_by_mirror
+                        .get(&entry.name)
+                        .map(|windows| {
+                            crate::blackout::is_in_blackout(windows, &chrono::Utc::now())
                         })
                         .unwrap_or(false);
 
@@ -627,7 +707,8 @@ impl Worker {
         // so Stop/Disable during sync correctly prevents re-scheduling.
         if msg.schedule {
             if let Some(job_cfg) = self.cfg.mirrors.iter().find(|m| m.name == msg.name) {
-                let (next_run, next_dt) = next_run_for(job_cfg, &self.cfg.global);
+                let cached_cron = self.crons_by_mirror.get(&msg.name);
+                let (next_run, next_dt) = next_run_for(job_cfg, &self.cfg.global, cached_cron);
                 self.schedule.push(msg.name.clone(), next_run);
 
                 // Update scheduled time.
@@ -959,6 +1040,11 @@ impl Worker {
                 names.insert(name.clone());
             }
         }
+
+        // Rebuild the precomputed blackout and cron caches against the new
+        // mirror list so scheduler decisions reflect the hot-reloaded config.
+        self.blackouts_by_mirror = build_blackout_cache(&self.cfg.mirrors);
+        self.crons_by_mirror = build_cron_cache(&self.cfg.mirrors);
     }
 }
 
@@ -1052,14 +1138,19 @@ mod cron_schedule_tests {
         (mc, global)
     }
 
-    /// A cron expression `0 3 * * *` (daily at 03:00) must produce a next_run
-    /// strictly in the future, and the accompanying DateTime must be within
-    /// 24 hours + 1 min from now (next 03:00 can be up to 24h away).
+    /// A cron expression `0 3 * * *` (daily at 03:00, POSIX 5-field) must
+    /// produce a `next_run` that's strictly in the future, and the accompanying
+    /// DateTime must be at exactly 03:00 — not some interval-fallback time.
     #[test]
     fn cron_expression_produces_future_next_run() {
         let (mc, global) = mirror_with_cron("0 3 * * *");
         let now = std::time::Instant::now();
-        let (next_run, next_dt) = super::next_run_for(&mc, &global);
+        let cached = super::parse_cron_lenient(&mc.cron).ok();
+        assert!(
+            cached.is_some(),
+            "parse_cron_lenient must accept POSIX 5-field syntax"
+        );
+        let (next_run, next_dt) = super::next_run_for(&mc, &global, cached.as_ref());
 
         assert!(next_run > now, "next_run must be in the future");
 
@@ -1072,6 +1163,15 @@ mod cron_schedule_tests {
             delta <= chrono::Duration::hours(25),
             "daily cron next_dt should be ≤ 25h away, got {delta}"
         );
+        // Verify it's actually 03:00 UTC, not some interval-fallback value.
+        // Allowing seconds=0..1 because the cron crate may produce 03:00:00.
+        use chrono::Timelike;
+        assert_eq!(
+            next_dt.hour(),
+            3,
+            "next_dt hour must be 03 (the cron time), got {next_dt}"
+        );
+        assert_eq!(next_dt.minute(), 0, "minute must be 0");
     }
 
     /// Without a cron expression, next_run must be approximately
@@ -1083,7 +1183,7 @@ mod cron_schedule_tests {
         let interval_secs = interval_mins * 60;
         let (mc, global) = mirror_with_interval(interval_mins);
         let now = std::time::Instant::now();
-        let (next_run, _) = super::next_run_for(&mc, &global);
+        let (next_run, _) = super::next_run_for(&mc, &global, None);
 
         let expected_min = now + Duration::from_secs(interval_secs - 2);
         let expected_max = now + Duration::from_secs(interval_secs + 2);
@@ -1094,15 +1194,95 @@ mod cron_schedule_tests {
     }
 
     /// An invalid cron expression falls back to interval scheduling without
-    /// panicking (the validation pass in lib.rs catches bad crons at startup;
-    /// this guards the helper itself).
+    /// panicking. When passed `None` for cached_cron — which is exactly what
+    /// `build_cron_cache` does for unparseable expressions — the helper falls
+    /// back to interval. The validation pass in lib.rs catches bad crons at
+    /// startup so this path is only reached if the cache is bypassed.
     #[test]
     fn invalid_cron_falls_back_to_interval() {
         let (mut mc, global) = mirror_with_interval(60);
         mc.cron = "not a cron expression".into();
         let now = std::time::Instant::now();
-        let (next_run, _) = super::next_run_for(&mc, &global);
+        let cached = super::parse_cron_lenient(&mc.cron).ok();
+        let (next_run, _) = super::next_run_for(&mc, &global, cached.as_ref());
         // Should still produce a valid future instant, not panic.
         assert!(next_run > now);
+    }
+
+    /// build_cron_cache: parseable expressions get cached, unparseable are skipped.
+    #[test]
+    fn build_cron_cache_filters_unparseable() {
+        use crate::config::MirrorConfig;
+        let mirrors = vec![
+            MirrorConfig {
+                name: "ok".into(),
+                cron: "0 3 * * *".into(),
+                ..MirrorConfig::default()
+            },
+            MirrorConfig {
+                name: "bad".into(),
+                cron: "garbage".into(),
+                ..MirrorConfig::default()
+            },
+            MirrorConfig {
+                name: "empty".into(),
+                cron: String::new(),
+                ..MirrorConfig::default()
+            },
+        ];
+        let cache = super::build_cron_cache(&mirrors);
+        assert!(
+            cache.contains_key("ok"),
+            "expected 'ok' in cache, got {:?}",
+            cache.keys().collect::<Vec<_>>()
+        );
+        assert!(!cache.contains_key("bad"));
+        assert!(!cache.contains_key("empty"));
+        assert!(!cache.contains_key("bad"));
+        assert!(!cache.contains_key("empty"));
+    }
+
+    /// build_blackout_cache: only mirrors with non-empty blackout get an entry.
+    #[test]
+    fn build_blackout_cache_skips_empty() {
+        use crate::config::MirrorConfig;
+        let mirrors = vec![
+            MirrorConfig {
+                name: "has".into(),
+                blackout: vec!["08:00-18:00 Mon-Fri".into()],
+                ..MirrorConfig::default()
+            },
+            MirrorConfig {
+                name: "none".into(),
+                blackout: vec![],
+                ..MirrorConfig::default()
+            },
+        ];
+        let cache = super::build_blackout_cache(&mirrors);
+        assert!(cache.contains_key("has"));
+        assert_eq!(cache.get("has").unwrap().len(), 1);
+        assert!(!cache.contains_key("none"));
+    }
+
+    /// parse_cron_lenient: 5-field POSIX must work (documented user format).
+    #[test]
+    fn parse_cron_lenient_accepts_5_field_posix() {
+        assert!(super::parse_cron_lenient("0 3 * * *").is_ok());
+        assert!(super::parse_cron_lenient("*/15 * * * *").is_ok());
+        assert!(super::parse_cron_lenient("30 22 * * 1-5").is_ok());
+    }
+
+    /// parse_cron_lenient: native 6-field cron-crate syntax must still work.
+    #[test]
+    fn parse_cron_lenient_accepts_6_field_native() {
+        assert!(super::parse_cron_lenient("0 0 3 * * *").is_ok());
+        assert!(super::parse_cron_lenient("0 */15 * * * *").is_ok());
+    }
+
+    /// parse_cron_lenient: garbage rejected.
+    #[test]
+    fn parse_cron_lenient_rejects_garbage() {
+        assert!(super::parse_cron_lenient("not a cron").is_err());
+        assert!(super::parse_cron_lenient("99 99 99 99 99").is_err());
     }
 }

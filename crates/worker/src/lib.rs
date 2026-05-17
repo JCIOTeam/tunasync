@@ -122,9 +122,11 @@ pub async fn run(config_path: std::path::PathBuf) -> Result<()> {
 
     // Validate cron expressions at startup so a misconfigured mirror fails
     // fast rather than silently falling back to the interval scheduler.
+    // Accept both classic 5-field POSIX cron and the cron-crate's native
+    // 6/7-field format (see `worker::parse_cron_lenient`).
     for mc in &cfg.mirrors {
         if !mc.cron.is_empty() {
-            if let Err(e) = mc.cron.parse::<cron::Schedule>() {
+            if let Err(e) = crate::worker::parse_cron_lenient(&mc.cron) {
                 anyhow::bail!(
                     "mirror {:?}: invalid cron expression {:?}: {e}",
                     mc.name,
