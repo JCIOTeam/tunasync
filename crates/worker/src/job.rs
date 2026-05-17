@@ -340,6 +340,23 @@ async fn run_sync_with_retry(
         }
     }
 
+    // Upstream probe: if check_upstream is set, verify at least one of the
+    // configured URLs is reachable before wasting bandwidth on a full sync.
+    if let Err(e) = provider.probe_upstream().await {
+        tracing::warn!(mirror = %name, error = %e, "upstream probe failed; skipping sync");
+        let _ = status_tx
+            .send(JobMessage {
+                status: SyncStatus::Failed,
+                name: name.to_owned(),
+                msg: format!("upstream unreachable: {e}"),
+                schedule: true,
+                size: String::new(),
+                transferred_bytes: 0,
+            })
+            .await;
+        return false;
+    }
+
     // Announce pre-syncing.
     let _ = status_tx
         .send(JobMessage {

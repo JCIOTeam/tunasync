@@ -31,6 +31,13 @@ pub struct RsyncProvider {
     /// Parsed from `MirrorConfig::disk_quota` via `parse_size_bytes`.
     /// 0 = no quota check.
     pub disk_quota_bytes: u64,
+    /// Whether to probe upstream reachability before syncing.
+    /// Maps to `MirrorConfig::check_upstream`.
+    pub check_upstream: bool,
+    /// Fallback upstream URLs tried when the primary is unreachable.
+    /// These are only used for the pre-sync probe — the actual rsync
+    /// data source never changes.
+    pub upstream_fallback: Vec<String>,
     pub success_exit_codes: Vec<i32>,
     data_size: Mutex<String>,
     transferred_bytes: Mutex<u64>,
@@ -155,6 +162,8 @@ impl RsyncProvider {
             rsync_env,
             success_exit_codes,
             disk_quota_bytes,
+            check_upstream: mc.check_upstream,
+            upstream_fallback: mc.upstream_fallback.clone(),
             data_size: Mutex::new(String::new()),
             transferred_bytes: Mutex::new(0),
             current_pid: Arc::new(Mutex::new(None)),
@@ -294,6 +303,39 @@ impl MirrorProvider for RsyncProvider {
         self.disk_quota_bytes
     }
 
+    /// Probe upstream reachability before syncing.
+    ///
+    /// When `check_upstream` is true, tries the primary upstream and then each
+    /// fallback in order. Returns `Ok(())` as soon as one URL is reachable
+    /// (`rsync --list-only --timeout=10` exits 0). Returns `Err` only if every
+    /// URL fails — the sync is then skipped, not retried.
+    ///
+    /// When `check_upstream` is false (default) this is a no-op.
+    async fn probe_upstream(&self) -> anyhow::Result<()> {
+        if !self.check_upstream {
+            return Ok(());
+        }
+        let mut urls: Vec<&str> = vec![self.upstream.as_str()];
+        urls.extend(self.upstream_fallback.iter().map(String::as_str));
+        for url in &urls {
+            if probe_rsync_url(url).await.is_ok() {
+                if *url != self.upstream.as_str() {
+                    tracing::info!(
+                        mirror = %self.name,
+                        primary = %self.upstream,
+                        reachable = %url,
+                        "primary upstream unreachable; fallback responded"
+                    );
+                }
+                return Ok(());
+            }
+        }
+        anyhow::bail!(
+            "all upstreams unreachable ({} URL(s) probed)",
+            urls.len()
+        )
+    }
+
     fn set_docker_config(&mut self, config: DockerConfig) {
         self.docker_container_name = Some(config.container_name());
         self.docker_config = Some(config);
@@ -309,9 +351,76 @@ impl MirrorProvider for RsyncProvider {
     }
 }
 
+/// Probe a single rsync URL for reachability.
+///
+/// Runs `rsync --list-only --timeout=10 <url>` and returns `Ok(())` if the
+/// exit code is 0. This is intentionally lightweight — we don't care about
+/// the listing contents, only whether the daemon is accepting connections.
+async fn probe_rsync_url(url: &str) -> anyhow::Result<()> {
+    let out = tokio::process::Command::new("rsync")
+        .args(["--list-only", "--timeout=10", url])
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to spawn rsync probe: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let code = out.status.code().unwrap_or(-1);
+        anyhow::bail!("rsync probe exited {code} for {url}")
+    }
+}
+
 impl RsyncProvider {
     /// Set the docker container name when DockerHook wraps the command.
     pub fn set_docker_container(&mut self, name: String) {
         self.docker_container_name = Some(name);
+    }
+}
+
+#[cfg(test)]
+mod upstream_probe_tests {
+    //! Tests for probe_upstream / probe_rsync_url.
+    //!
+    //! The integration test (`probe_unreachable_url_fails_fast`) requires the
+    //! `rsync` binary to be present. It is marked `#[ignore]` so it doesn't
+    //! block CI environments that lack rsync; run it with `cargo test -- --ignored`.
+
+    use super::probe_rsync_url;
+
+    /// Probing a port that is not listening must return an error quickly.
+    /// Uses 127.0.0.1:1 — port 1 is privileged and virtually never open,
+    /// so rsync exits non-zero (usually with "connection refused").
+    #[tokio::test]
+    #[ignore = "requires rsync binary in PATH"]
+    async fn probe_unreachable_url_fails_fast() {
+        let result = probe_rsync_url("rsync://127.0.0.1:1/nonexistent").await;
+        assert!(
+            result.is_err(),
+            "expected probe to fail for unreachable URL, got Ok"
+        );
+    }
+
+    /// When check_upstream is false (default), probe_upstream must be a no-op
+    /// and always succeed — even with a bogus upstream URL.
+    #[tokio::test]
+    async fn probe_upstream_noop_when_disabled() {
+        use crate::config::{GlobalConfig, MirrorConfig, ProviderKind};
+        use crate::provider::MirrorProvider;
+
+        // Build a minimal config with check_upstream = false (the default).
+        let global = GlobalConfig::default();
+        let mut mc = MirrorConfig::default();
+        mc.name = "probe-noop-test".into();
+        mc.provider = ProviderKind::Rsync;
+        mc.upstream = "rsync://localhost/will-not-be-called/".into();
+        // check_upstream defaults to false — leave it unset.
+
+        let provider = super::RsyncProvider::from_config(&mc, &global)
+            .expect("from_config should succeed");
+
+        // Must return Ok without spawning rsync.
+        // Cast to the trait to invoke the overridden probe_upstream().
+        let provider: &dyn MirrorProvider = &provider;
+        provider.probe_upstream().await.expect("no-op probe should always succeed");
     }
 }
