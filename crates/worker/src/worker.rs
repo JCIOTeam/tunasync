@@ -451,7 +451,29 @@ impl Worker {
             while let Some(entry) = self.schedule.peek() {
                 if entry.next_run <= Instant::now() {
                     let entry = self.schedule.pop().unwrap();
-                    if let Some(job) = self.jobs.get(&entry.name) {
+
+                    // Blackout check: if this mirror is inside a blackout window,
+                    // push it back by 5 minutes instead of starting it.
+                    // In-progress syncs are never interrupted — only new starts are gated.
+                    let in_blackout = self
+                        .cfg
+                        .mirrors
+                        .iter()
+                        .find(|m| m.name == entry.name)
+                        .map(|mc| {
+                            let windows = crate::blackout::parse_blackout_windows(&mc.blackout);
+                            crate::blackout::is_in_blackout(&windows, &chrono::Utc::now())
+                        })
+                        .unwrap_or(false);
+
+                    if in_blackout {
+                        let retry_at = Instant::now() + Duration::from_secs(300);
+                        tracing::info!(
+                            mirror = %entry.name,
+                            "in blackout window — deferring sync by 5 minutes"
+                        );
+                        self.schedule.push(entry.name, retry_at);
+                    } else if let Some(job) = self.jobs.get(&entry.name) {
                         job.try_send(CtrlAction::Start);
                     }
                 } else {
