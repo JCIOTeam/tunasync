@@ -27,6 +27,7 @@ use tracing::{debug, error, info};
 use tunasync_protocol::SyncStatus;
 
 use crate::hooks::{HookPhase, JobHook};
+use crate::priority_semaphore::{Permit as PriorityPermit, PrioritySemaphore};
 use crate::provider::MirrorProvider;
 
 // Control actions (manager → job)
@@ -108,8 +109,9 @@ impl MirrorJob {
         provider: Box<dyn MirrorProvider>,
         hooks: Vec<Box<dyn JobHook>>,
         status_tx: mpsc::Sender<JobMessage>,
-        semaphore: Arc<tokio::sync::Semaphore>,
+        semaphore: Arc<PrioritySemaphore>,
         per_upstream_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+        priority: i32,
     ) -> Self {
         let name = provider.name().to_owned();
         let state = Arc::new(AtomicU32::new(JobState::None as u32));
@@ -119,7 +121,7 @@ impl MirrorJob {
         let task_state = Arc::clone(&state);
         tokio::spawn(run_job_task(
             provider, hooks, ctrl_rx, kill_rx, status_tx, semaphore,
-            per_upstream_semaphore, task_state,
+            per_upstream_semaphore, priority, task_state,
         ));
 
         Self {
@@ -168,8 +170,9 @@ async fn run_job_task(
     mut ctrl_rx: mpsc::Receiver<CtrlAction>,
     mut kill_rx: watch::Receiver<bool>,
     status_tx: mpsc::Sender<JobMessage>,
-    semaphore: Arc<tokio::sync::Semaphore>,
+    semaphore: Arc<PrioritySemaphore>,
     per_upstream_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    priority: i32,
     state: Arc<AtomicU32>,
 ) {
     let name = provider.name().to_owned();
@@ -226,14 +229,14 @@ async fn run_job_task(
 
         // Acquire semaphore slot (concurrency limit). ForceStart skips this.
         // We also watch for kill so Halt/Stop during semaphore wait takes effect.
-        let _permit = if action != CtrlAction::ForceStart {
+        // PrioritySemaphore wakes waiters in descending priority order.
+        let _permit: Option<PriorityPermit> = if action != CtrlAction::ForceStart {
             let sem = Arc::clone(&semaphore);
             tokio::select! {
-                permit = sem.acquire_owned() => {
-                    Some(permit.expect("semaphore closed"))
+                permit = sem.acquire(priority) => {
+                    Some(permit)
                 }
                 _ = kill_rx.changed() => {
-                    // Killed while waiting for semaphore — abort this sync.
                     info!(mirror = %name, "killed while waiting for semaphore");
                     continue;
                 }
@@ -756,6 +759,7 @@ mod per_upstream_semaphore_tests {
 
     use crate::hooks::DockerConfig;
     use crate::job::{CtrlAction, JobMessage, MirrorJob};
+    use crate::priority_semaphore::PrioritySemaphore;
     use crate::provider::MirrorProvider;
 
     struct SlowProvider {
@@ -789,7 +793,7 @@ mod per_upstream_semaphore_tests {
     /// start (acquire the upstream semaphore) until the first has finished.
     #[tokio::test]
     async fn second_job_waits_for_upstream_semaphore() {
-        let global_sem = Arc::new(Semaphore::new(4)); // plenty of global permits
+        let global_sem = Arc::new(PrioritySemaphore::new(4)); // plenty of global permits
         let upstream_sem = Arc::new(Semaphore::new(1)); // only 1 upstream slot
 
         let running1 = Arc::new(tokio::sync::Notify::new());
@@ -813,11 +817,11 @@ mod per_upstream_semaphore_tests {
 
         let job1 = MirrorJob::spawn(
             Box::new(p1), vec![], tx1,
-            Arc::clone(&global_sem), Some(Arc::clone(&upstream_sem)),
+            Arc::clone(&global_sem), Some(Arc::clone(&upstream_sem)), 50,
         );
         let job2 = MirrorJob::spawn(
             Box::new(p2), vec![], tx2,
-            Arc::clone(&global_sem), Some(Arc::clone(&upstream_sem)),
+            Arc::clone(&global_sem), Some(Arc::clone(&upstream_sem)), 50,
         );
 
         // Start both jobs concurrently.

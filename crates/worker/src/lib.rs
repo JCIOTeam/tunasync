@@ -9,6 +9,7 @@
 pub mod config;
 pub mod diff_config;
 pub mod blackout;
+pub mod priority_semaphore;
 pub mod hooks;
 pub mod http_server;
 pub mod job;

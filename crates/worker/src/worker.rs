@@ -29,6 +29,8 @@ use chrono::Utc;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, RwLock, Semaphore};
 use tracing::{error, info, warn};
+
+use crate::priority_semaphore::PrioritySemaphore;
 use tunasync_protocol::{
     zero_time, CmdVerb, MirrorSchedule, MirrorSchedules, MirrorStatus, SyncStatus, WorkerCmd,
     WorkerStatus,
@@ -90,7 +92,7 @@ pub struct Worker {
     status_rx: mpsc::Receiver<JobMessage>,
     cmd_tx: mpsc::Sender<WorkerCmd>,
     cmd_rx: mpsc::Receiver<WorkerCmd>,
-    semaphore: Arc<Semaphore>,
+    semaphore: Arc<PrioritySemaphore>,
     /// Per-upstream-host concurrency semaphores.
     /// Built from `GlobalConfig::per_upstream_concurrent` at startup.
     /// Each job acquires both the global semaphore and its host semaphore (if
@@ -129,7 +131,7 @@ impl Worker {
         F: Fn(&WorkerConfig) -> Vec<(Box<dyn MirrorProvider>, Vec<Box<dyn JobHook>>)>,
     {
         let concurrent = cfg.global.concurrent.max(1);
-        let semaphore = Arc::new(Semaphore::new(concurrent));
+        let semaphore = Arc::new(PrioritySemaphore::new(concurrent));
 
         let (status_tx, status_rx) = mpsc::channel::<JobMessage>(128);
         let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>(32);
@@ -174,10 +176,15 @@ impl Worker {
             // Look up the per-upstream semaphore for this provider's host.
             let upstream_sem = upstream_host(&upstream)
                 .and_then(|h| per_upstream_semaphores.get(&h).cloned());
+            // Look up configured priority for this mirror (default 50).
+            let priority = cfg.mirrors.iter()
+                .find(|m| m.name == name)
+                .map(|m| m.priority)
+                .unwrap_or(50);
 
             let job = MirrorJob::spawn(
                 provider, hooks, status_tx.clone(),
-                Arc::clone(&semaphore), upstream_sem,
+                Arc::clone(&semaphore), upstream_sem, priority,
             );
             jobs.insert(name, job);
         }
@@ -685,6 +692,7 @@ impl Worker {
                                             self.status_tx.clone(),
                                             Arc::clone(&self.semaphore),
                                             upstream_sem,
+                                            job_cfg.priority,
                                         );
                                         self.jobs.insert(name.clone(), new_job);
                                         // Fall through — send Start to the new job.
@@ -819,6 +827,7 @@ impl Worker {
                                 self.status_tx.clone(),
                                 Arc::clone(&self.semaphore),
                                 upstream_sem2,
+                                trans.config.priority,
                             );
                             self.jobs.insert(name.clone(), job);
                         }
@@ -878,6 +887,7 @@ impl Worker {
                                 self.status_tx.clone(),
                                 Arc::clone(&self.semaphore),
                                 upstream_sem3,
+                                trans.config.priority,
                             );
                             self.jobs.insert(name.clone(), job);
                         }
