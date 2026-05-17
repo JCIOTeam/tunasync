@@ -118,6 +118,20 @@ pub async fn run(config_path: std::path::PathBuf) -> Result<()> {
     // Flatten nested mirror configs (Go's recursiveMirrors).
     cfg.mirrors = config::flatten_mirrors(&cfg.mirrors_conf);
 
+    // Validate cron expressions at startup so a misconfigured mirror fails
+    // fast rather than silently falling back to the interval scheduler.
+    for mc in &cfg.mirrors {
+        if !mc.cron.is_empty() {
+            if let Err(e) = mc.cron.parse::<cron::Schedule>() {
+                anyhow::bail!(
+                    "mirror {:?}: invalid cron expression {:?}: {e}",
+                    mc.name,
+                    mc.cron
+                );
+            }
+        }
+    }
+
     tracing::info!(
         worker = %cfg.global.name,
         mirrors = cfg.mirrors.len(),

@@ -16,6 +16,7 @@ async-trait = { workspace = true }
 axum        = { workspace = true }
 axum-server = { workspace = true }
 chrono      = { workspace = true }
+cron        = { workspace = true }
 futures     = { workspace = true }
 reqwest     = { workspace = true }
 regex       = { workspace = true }

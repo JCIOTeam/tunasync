@@ -42,6 +42,30 @@ use crate::manager_client::ManagerClient;
 use crate::provider::MirrorProvider;
 use crate::schedule::ScheduleQueue;
 
+/// Compute the next `Instant` a mirror should run.
+///
+/// When the mirror config has a valid cron expression, the next tick from the
+/// cron schedule (relative to now in UTC) is converted to an `Instant`.
+/// Otherwise `now + interval` is used.  Falls back to `now + interval` if the
+/// cron expression produces no upcoming time (which should never happen for a
+/// valid expression).
+fn next_run_for(mc: &crate::config::MirrorConfig, global: &crate::config::GlobalConfig) -> (Instant, chrono::DateTime<chrono::Utc>) {
+    let now_instant = Instant::now();
+    let now_utc = chrono::Utc::now();
+    let interval = mc.effective_interval(global);
+
+    if !mc.cron.is_empty() {
+        if let Ok(sched) = mc.cron.parse::<cron::Schedule>() {
+            if let Some(next_utc) = sched.upcoming(chrono::Utc).next() {
+                let delta = (next_utc - now_utc).to_std().unwrap_or(interval);
+                return (now_instant + delta, next_utc);
+            }
+        }
+    }
+    let next_dt = now_utc + chrono::Duration::from_std(interval).unwrap_or_default();
+    (now_instant + interval, next_dt)
+}
+
 /// The worker: holds all jobs and coordinates the scheduler.
 pub struct Worker {
     cfg: WorkerConfig,
@@ -287,33 +311,43 @@ impl Worker {
                         _ => {}
                     }
 
-                    // Compute next_run = last_update + interval (matching Go's
-                    // `stime := m.LastUpdate.Add(job.provider.Interval())`).
-                    // If last_update is the zero time (mirror exists in manager but
-                    // has never completed a sync), or if next_run is in the past,
-                    // the job fires immediately.
-                    let interval = self
+                    // Compute next_run. When the mirror has a cron expression it
+                    // takes precedence over `last_update + interval`. Otherwise
+                    // next_run = last_update + interval — matching Go's
+                    // `stime := m.LastUpdate.Add(job.provider.Interval())`.
+                    // If last_update is zero (never synced) or next_run is in the
+                    // past the job fires immediately.
+                    let job_cfg = self
                         .cfg
                         .mirrors
                         .iter()
-                        .find(|m| m.name == status.name)
-                        .map(|m| m.effective_interval(&self.cfg.global))
-                        .unwrap_or_else(|| Duration::from_secs(3600));
+                        .find(|m| m.name == status.name);
 
-                    let next_run = if tunasync_protocol::is_zero_time(&status.last_update) {
-                        // Never synced before — start immediately.
-                        Instant::now()
-                    } else {
-                        let next_utc = status.last_update
-                            + chrono::Duration::from_std(interval)
-                                .unwrap_or(chrono::Duration::seconds(3600));
-                        let now_utc = Utc::now();
-                        if next_utc <= now_utc {
-                            Instant::now()
+                    let next_run = if let Some(mc) = job_cfg {
+                        if !mc.cron.is_empty() {
+                            // Cron: ignore last_update and compute the next tick.
+                            let (inst, _) = next_run_for(mc, &self.cfg.global);
+                            inst
                         } else {
-                            let delay = (next_utc - now_utc).to_std().unwrap_or(Duration::ZERO);
-                            Instant::now() + delay
+                            // Interval: last_update + interval, clamped to now.
+                            let interval = mc.effective_interval(&self.cfg.global);
+                            if tunasync_protocol::is_zero_time(&status.last_update) {
+                                Instant::now()
+                            } else {
+                                let next_utc = status.last_update
+                                    + chrono::Duration::from_std(interval)
+                                        .unwrap_or(chrono::Duration::seconds(3600));
+                                let now_utc = Utc::now();
+                                if next_utc <= now_utc {
+                                    Instant::now()
+                                } else {
+                                    let delay = (next_utc - now_utc).to_std().unwrap_or(Duration::ZERO);
+                                    Instant::now() + delay
+                                }
+                            }
                         }
+                    } else {
+                        Instant::now()
                     };
 
                     tracing::info!(
@@ -525,9 +559,7 @@ impl Worker {
         // so Stop/Disable during sync correctly prevents re-scheduling.
         if msg.schedule {
             if let Some(job_cfg) = self.cfg.mirrors.iter().find(|m| m.name == msg.name) {
-                let interval = job_cfg.effective_interval(&self.cfg.global);
-                let next_run = Instant::now() + interval;
-                let next_dt = Utc::now() + chrono::Duration::from_std(interval).unwrap_or_default();
+                let (next_run, next_dt) = next_run_for(job_cfg, &self.cfg.global);
                 self.schedule.push(msg.name.clone(), next_run);
 
                 // Update scheduled time.
@@ -900,5 +932,89 @@ async fn run_http_server(
         if let Err(e) = axum::serve(listener, router).await {
             error!(error = %e, "worker HTTP server error");
         }
+    }
+}
+
+#[cfg(test)]
+mod cron_schedule_tests {
+    //! Unit tests for `next_run_for` — cron vs interval scheduling.
+
+    use std::time::Duration;
+
+    use crate::config::{GlobalConfig, MirrorConfig, ProviderKind};
+
+    fn mirror_with_cron(expr: &str) -> (MirrorConfig, GlobalConfig) {
+        let global = GlobalConfig::default();
+        let mut mc = MirrorConfig::default();
+        mc.name = "cron-test".into();
+        mc.provider = ProviderKind::Rsync;
+        mc.upstream = "rsync://localhost/test/".into();
+        mc.cron = expr.to_owned();
+        (mc, global)
+    }
+
+    fn mirror_with_interval(secs: u64) -> (MirrorConfig, GlobalConfig) {
+        let mut global = GlobalConfig::default();
+        global.interval = secs;
+        let mut mc = MirrorConfig::default();
+        mc.name = "interval-test".into();
+        mc.provider = ProviderKind::Rsync;
+        mc.upstream = "rsync://localhost/test/".into();
+        // leave cron empty → use interval
+        (mc, global)
+    }
+
+    /// A cron expression `0 3 * * *` (daily at 03:00) must produce a next_run
+    /// strictly in the future, and the accompanying DateTime must be within
+    /// 24 hours + 1 min from now (next 03:00 can be up to 24h away).
+    #[test]
+    fn cron_expression_produces_future_next_run() {
+        let (mc, global) = mirror_with_cron("0 3 * * *");
+        let now = std::time::Instant::now();
+        let (next_run, next_dt) = super::next_run_for(&mc, &global);
+
+        assert!(next_run > now, "next_run must be in the future");
+
+        let delta = next_dt - chrono::Utc::now();
+        assert!(
+            delta > chrono::Duration::zero(),
+            "next_dt must be in the future"
+        );
+        assert!(
+            delta <= chrono::Duration::hours(25),
+            "daily cron next_dt should be ≤ 25h away, got {delta}"
+        );
+    }
+
+    /// Without a cron expression, next_run must be approximately
+    /// `now + interval` (within a 2-second tolerance for test execution time).
+    #[test]
+    fn interval_fallback_produces_now_plus_interval() {
+        // GlobalConfig::interval is in minutes.
+        let interval_mins = 60u64;
+        let interval_secs = interval_mins * 60;
+        let (mc, global) = mirror_with_interval(interval_mins);
+        let now = std::time::Instant::now();
+        let (next_run, _) = super::next_run_for(&mc, &global);
+
+        let expected_min = now + Duration::from_secs(interval_secs - 2);
+        let expected_max = now + Duration::from_secs(interval_secs + 2);
+        assert!(
+            next_run >= expected_min && next_run <= expected_max,
+            "interval-based next_run should be ≈ now + 1h"
+        );
+    }
+
+    /// An invalid cron expression falls back to interval scheduling without
+    /// panicking (the validation pass in lib.rs catches bad crons at startup;
+    /// this guards the helper itself).
+    #[test]
+    fn invalid_cron_falls_back_to_interval() {
+        let (mut mc, global) = mirror_with_interval(60);
+        mc.cron = "not a cron expression".into();
+        let now = std::time::Instant::now();
+        let (next_run, _) = super::next_run_for(&mc, &global);
+        // Should still produce a valid future instant, not panic.
+        assert!(next_run > now);
     }
 }
