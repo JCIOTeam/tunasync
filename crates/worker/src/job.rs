@@ -309,6 +309,37 @@ async fn run_sync_with_retry(
     ctrl_rx: &mut mpsc::Receiver<CtrlAction>,
     kill_rx: &mut watch::Receiver<bool>,
 ) -> bool {
+    // Disk-quota pre-check: skip (don't fail) if free space at working_dir is
+    // below the configured threshold.  schedule=true keeps the mirror in Ready
+    // state so it is retried at its next scheduled interval.
+    let quota = provider.disk_quota_bytes();
+    if quota > 0 {
+        let wd = provider.working_dir();
+        if let Some((avail, _total)) = tunasync_common::util::disk_space(wd) {
+            if avail < quota {
+                tracing::warn!(
+                    mirror = %name,
+                    available = avail,
+                    quota,
+                    "skipping sync: disk space below quota threshold"
+                );
+                let _ = status_tx
+                    .send(JobMessage {
+                        status: SyncStatus::Failed,
+                        name: name.to_owned(),
+                        msg: format!(
+                            "disk quota: only {avail} bytes available, need {quota}"
+                        ),
+                        schedule: true,
+                        size: String::new(),
+                        transferred_bytes: 0,
+                    })
+                    .await;
+                return false;
+            }
+        }
+    }
+
     // Announce pre-syncing.
     let _ = status_tx
         .send(JobMessage {
@@ -562,4 +593,108 @@ async fn run_hooks(
 
 fn set_state(state: &Arc<AtomicU32>, s: JobState) {
     state.store(s as u32, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+mod disk_quota_tests {
+    //! Tests for the disk-quota pre-sync check in `run_sync_with_retry`.
+
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::AtomicU32;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use tokio::sync::mpsc;
+    use tunasync_protocol::SyncStatus;
+
+    use crate::hooks::DockerConfig;
+    use crate::job::{run_sync_with_retry, JobMessage, JobState, CtrlAction};
+    use crate::provider::MirrorProvider;
+
+    /// A no-op provider with configurable working_dir and disk_quota_bytes.
+    struct QuotaStubProvider {
+        working_dir: PathBuf,
+        disk_quota_bytes: u64,
+    }
+
+    #[async_trait]
+    impl MirrorProvider for QuotaStubProvider {
+        fn name(&self) -> &str { "quota-stub" }
+        fn upstream(&self) -> &str { "rsync://localhost/test/" }
+        fn is_master(&self) -> bool { true }
+        fn interval(&self) -> Duration { Duration::from_secs(3600) }
+        fn retry(&self) -> u32 { 1 }
+        fn timeout(&self) -> Duration { Duration::ZERO }
+        fn working_dir(&self) -> &Path { &self.working_dir }
+        fn disk_quota_bytes(&self) -> u64 { self.disk_quota_bytes }
+        async fn run(&self) -> anyhow::Result<()> { Ok(()) }
+        async fn terminate(&self) -> anyhow::Result<()> { Ok(()) }
+        fn set_docker_config(&mut self, _: DockerConfig) {}
+        fn set_log_path_shared(&mut self, _: Arc<Mutex<PathBuf>>) {}
+    }
+
+    /// Drive `run_sync_with_retry` to completion and return every message sent.
+    async fn run_and_collect(provider: QuotaStubProvider) -> Vec<JobMessage> {
+        let (status_tx, mut status_rx) = mpsc::channel::<JobMessage>(16);
+        let (_ctrl_tx, mut ctrl_rx) = mpsc::channel::<CtrlAction>(4);
+        let (_kill_tx, mut kill_rx) = tokio::sync::watch::channel(false);
+        let state = Arc::new(AtomicU32::new(JobState::Ready as u32));
+
+        run_sync_with_retry(
+            &provider,
+            &[],
+            1,
+            &status_tx,
+            "quota-stub",
+            &state,
+            &mut ctrl_rx,
+            &mut kill_rx,
+        )
+        .await;
+
+        drop(status_tx); // close sender so recv() terminates
+        let mut msgs = Vec::new();
+        while let Some(m) = status_rx.recv().await {
+            msgs.push(m);
+        }
+        msgs
+    }
+
+    /// When quota > available space the sync is skipped: exactly one Failed
+    /// message with "disk quota" in the body; no PreSyncing is sent.
+    #[tokio::test]
+    async fn quota_exceeded_sends_failed_and_skips() {
+        let provider = QuotaStubProvider {
+            working_dir: PathBuf::from("/"),
+            disk_quota_bytes: u64::MAX, // impossible to satisfy
+        };
+        let msgs = run_and_collect(provider).await;
+
+        assert_eq!(msgs.len(), 1, "expected exactly one message, got {msgs:?}");
+        let msg = &msgs[0];
+        assert_eq!(msg.status, SyncStatus::Failed);
+        assert!(
+            msg.msg.contains("disk quota"),
+            "expected 'disk quota' in msg, got {:?}",
+            msg.msg
+        );
+        assert!(msg.schedule, "schedule must be true so mirror stays Ready");
+    }
+
+    /// When quota == 0 (disabled) the pre-check is skipped and the sync
+    /// proceeds normally.  The stub run() returns Ok, so we get a Success.
+    #[tokio::test]
+    async fn quota_zero_skips_check() {
+        let provider = QuotaStubProvider {
+            working_dir: PathBuf::from("/"),
+            disk_quota_bytes: 0,
+        };
+        let msgs = run_and_collect(provider).await;
+
+        let has_failed = msgs.iter().any(|m| m.status == SyncStatus::Failed);
+        assert!(!has_failed, "unexpected Failed message with quota=0: {msgs:?}");
+        let has_success = msgs.iter().any(|m| m.status == SyncStatus::Success);
+        assert!(has_success, "expected Success message with quota=0: {msgs:?}");
+    }
 }

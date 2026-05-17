@@ -27,6 +27,10 @@ pub struct RsyncProvider {
     options: Vec<String>,
     rsync_cmd: String,
     rsync_env: HashMap<String, String>,
+    /// Minimum free-space bytes required before starting a sync.
+    /// Parsed from `MirrorConfig::disk_quota` via `parse_size_bytes`.
+    /// 0 = no quota check.
+    pub disk_quota_bytes: u64,
     pub success_exit_codes: Vec<i32>,
     data_size: Mutex<String>,
     transferred_bytes: Mutex<u64>,
@@ -129,6 +133,13 @@ impl RsyncProvider {
         success_exit_codes.extend(global.dangerous_global_rsync_success_exit_codes.iter());
         success_exit_codes.extend(mc.rsync_success_exit_codes.iter());
 
+        // Parse disk quota — empty or unparseable = 0 = no check.
+        let disk_quota_bytes = if mc.disk_quota.is_empty() {
+            0
+        } else {
+            tunasync_common::util::parse_size_bytes(&mc.disk_quota).unwrap_or(0)
+        };
+
         Ok(Self {
             name: mc.name.clone(),
             upstream: mc.upstream.clone(),
@@ -143,6 +154,7 @@ impl RsyncProvider {
             rsync_cmd,
             rsync_env,
             success_exit_codes,
+            disk_quota_bytes,
             data_size: Mutex::new(String::new()),
             transferred_bytes: Mutex::new(0),
             current_pid: Arc::new(Mutex::new(None)),
@@ -272,6 +284,14 @@ impl MirrorProvider for RsyncProvider {
 
     fn transferred_bytes(&self) -> u64 {
         *self.transferred_bytes.lock().unwrap()
+    }
+
+    fn working_dir(&self) -> &std::path::Path {
+        &self.working_dir
+    }
+
+    fn disk_quota_bytes(&self) -> u64 {
+        self.disk_quota_bytes
     }
 
     fn set_docker_config(&mut self, config: DockerConfig) {

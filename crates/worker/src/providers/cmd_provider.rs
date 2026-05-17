@@ -33,6 +33,8 @@ pub struct CmdProvider {
     pub fail_on_match: Option<Regex>,
     pub size_pattern: Option<Regex>,
     pub success_exit_codes: Vec<i32>,
+    /// Minimum free-space bytes required before starting a sync. 0 = no check.
+    pub disk_quota_bytes: u64,
     data_size: Mutex<String>,
     /// PID of the currently running child process (set before wait, cleared after).
     current_pid: Arc<Mutex<Option<u32>>>,
@@ -97,6 +99,12 @@ impl CmdProvider {
             );
         }
 
+        let disk_quota_bytes = if mc.disk_quota.is_empty() {
+            0
+        } else {
+            tunasync_common::util::parse_size_bytes(&mc.disk_quota).unwrap_or(0)
+        };
+
         Ok(Self {
             name: mc.name.clone(),
             upstream: mc.upstream.clone(),
@@ -112,6 +120,7 @@ impl CmdProvider {
             fail_on_match,
             size_pattern,
             success_exit_codes,
+            disk_quota_bytes,
             data_size: Mutex::new(String::new()),
             current_pid: Arc::new(Mutex::new(None)),
             docker_container_name: None,
@@ -270,6 +279,14 @@ impl MirrorProvider for CmdProvider {
 
     fn data_size(&self) -> String {
         self.data_size.lock().unwrap().clone()
+    }
+
+    fn working_dir(&self) -> &std::path::Path {
+        &self.working_dir
+    }
+
+    fn disk_quota_bytes(&self) -> u64 {
+        self.disk_quota_bytes
     }
 
     fn set_docker_config(&mut self, config: DockerConfig) {
