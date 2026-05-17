@@ -42,13 +42,25 @@ use crate::manager_client::ManagerClient;
 use crate::provider::MirrorProvider;
 use crate::schedule::ScheduleQueue;
 
-/// Compute the next `Instant` a mirror should run.
+/// Extract the hostname from an upstream URL for per-upstream concurrency keying.
 ///
-/// When the mirror config has a valid cron expression, the next tick from the
-/// cron schedule (relative to now in UTC) is converted to an `Instant`.
-/// Otherwise `now + interval` is used.  Falls back to `now + interval` if the
-/// cron expression produces no upcoming time (which should never happen for a
-/// valid expression).
+/// Handles:
+/// - `rsync://host/module` or `http://host/path` → URL parse → host_str
+/// - rsync daemon syntax `host::module` → split on `::`
+/// - bare paths or anything else → returns `None` (no per-host limit applied)
+fn upstream_host(upstream: &str) -> Option<String> {
+    if upstream.contains("://") {
+        url::Url::parse(upstream)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned))
+    } else if upstream.contains("::") {
+        upstream.split("::").next().map(str::to_owned)
+    } else {
+        None
+    }
+}
+
+/// Compute the next `Instant` a mirror should run.
 fn next_run_for(mc: &crate::config::MirrorConfig, global: &crate::config::GlobalConfig) -> (Instant, chrono::DateTime<chrono::Utc>) {
     let now_instant = Instant::now();
     let now_utc = chrono::Utc::now();
@@ -79,6 +91,11 @@ pub struct Worker {
     cmd_tx: mpsc::Sender<WorkerCmd>,
     cmd_rx: mpsc::Receiver<WorkerCmd>,
     semaphore: Arc<Semaphore>,
+    /// Per-upstream-host concurrency semaphores.
+    /// Built from `GlobalConfig::per_upstream_concurrent` at startup.
+    /// Each job acquires both the global semaphore and its host semaphore (if
+    /// any) before starting, in that order, to avoid deadlock.
+    per_upstream_semaphores: HashMap<String, Arc<Semaphore>>,
     schedule: ScheduleQueue,
     mirror_statuses: HashMap<String, MirrorStatus>,
     /// Shared mirror name set — kept in sync with `self.jobs` so the HTTP
@@ -129,6 +146,14 @@ impl Worker {
         let mut jobs = HashMap::new();
         let mut mirror_statuses = HashMap::new();
 
+        // Build per-upstream semaphores from config.
+        let per_upstream_semaphores: HashMap<String, Arc<Semaphore>> = cfg
+            .global
+            .per_upstream_concurrent
+            .iter()
+            .map(|(host, &limit)| (host.clone(), Arc::new(Semaphore::new(limit.max(1)))))
+            .collect();
+
         for (provider, hooks) in provider_list {
             let name = provider.name().to_owned();
             let upstream = provider.upstream().to_owned();
@@ -141,12 +166,19 @@ impl Worker {
                     name: name.clone(),
                     worker: cfg.global.name.clone(),
                     is_master,
-                    upstream,
+                    upstream: upstream.clone(),
                     ..Default::default()
                 },
             );
 
-            let job = MirrorJob::spawn(provider, hooks, status_tx.clone(), Arc::clone(&semaphore));
+            // Look up the per-upstream semaphore for this provider's host.
+            let upstream_sem = upstream_host(&upstream)
+                .and_then(|h| per_upstream_semaphores.get(&h).cloned());
+
+            let job = MirrorJob::spawn(
+                provider, hooks, status_tx.clone(),
+                Arc::clone(&semaphore), upstream_sem,
+            );
             jobs.insert(name, job);
         }
 
@@ -166,6 +198,7 @@ impl Worker {
             cmd_tx,
             cmd_rx,
             semaphore,
+            per_upstream_semaphores,
             schedule,
             mirror_statuses,
             mirror_names,
@@ -644,11 +677,14 @@ impl Worker {
                             {
                                 match (self.build_one_provider)(job_cfg, &self.cfg) {
                                     Ok((provider, hooks)) => {
+                                        let upstream_sem = upstream_host(provider.upstream())
+                                            .and_then(|h| self.per_upstream_semaphores.get(&h).cloned());
                                         let new_job = MirrorJob::spawn(
                                             provider,
                                             hooks,
                                             self.status_tx.clone(),
                                             Arc::clone(&self.semaphore),
+                                            upstream_sem,
                                         );
                                         self.jobs.insert(name.clone(), new_job);
                                         // Fall through — send Start to the new job.
@@ -775,11 +811,14 @@ impl Worker {
                                 },
                             );
 
+                            let upstream_sem2 = upstream_host(provider.upstream())
+                                .and_then(|h| self.per_upstream_semaphores.get(&h).cloned());
                             let job = MirrorJob::spawn(
                                 provider,
                                 hooks,
                                 self.status_tx.clone(),
                                 Arc::clone(&self.semaphore),
+                                upstream_sem2,
                             );
                             self.jobs.insert(name.clone(), job);
                         }
@@ -831,11 +870,14 @@ impl Worker {
                                 },
                             );
 
+                            let upstream_sem3 = upstream_host(provider.upstream())
+                                .and_then(|h| self.per_upstream_semaphores.get(&h).cloned());
                             let job = MirrorJob::spawn(
                                 provider,
                                 hooks,
                                 self.status_tx.clone(),
                                 Arc::clone(&self.semaphore),
+                                upstream_sem3,
                             );
                             self.jobs.insert(name.clone(), job);
                         }

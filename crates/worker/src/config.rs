@@ -222,6 +222,20 @@ pub struct GlobalConfig {
     /// Extra rsync exit codes to treat as success for all mirrors.
     #[serde(default)]
     pub dangerous_global_rsync_success_exit_codes: Vec<i32>,
+
+    /// Per-upstream host concurrency limits.
+    ///
+    /// Maps upstream hostname (e.g. `"rsync.kernel.org"`) to the maximum number
+    /// of mirrors that may sync from that host simultaneously.  Hosts not listed
+    /// here have no extra limit beyond the global `concurrent` setting.
+    ///
+    /// Example in TOML:
+    /// ```toml
+    /// [global.per_upstream_concurrent]
+    /// "rsync.kernel.org" = 2
+    /// ```
+    #[serde(default)]
+    pub per_upstream_concurrent: std::collections::HashMap<String, usize>,
 }
 
 impl GlobalConfig {

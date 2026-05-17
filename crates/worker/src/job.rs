@@ -109,6 +109,7 @@ impl MirrorJob {
         hooks: Vec<Box<dyn JobHook>>,
         status_tx: mpsc::Sender<JobMessage>,
         semaphore: Arc<tokio::sync::Semaphore>,
+        per_upstream_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     ) -> Self {
         let name = provider.name().to_owned();
         let state = Arc::new(AtomicU32::new(JobState::None as u32));
@@ -117,7 +118,8 @@ impl MirrorJob {
 
         let task_state = Arc::clone(&state);
         tokio::spawn(run_job_task(
-            provider, hooks, ctrl_rx, kill_rx, status_tx, semaphore, task_state,
+            provider, hooks, ctrl_rx, kill_rx, status_tx, semaphore,
+            per_upstream_semaphore, task_state,
         ));
 
         Self {
@@ -167,6 +169,7 @@ async fn run_job_task(
     mut kill_rx: watch::Receiver<bool>,
     status_tx: mpsc::Sender<JobMessage>,
     semaphore: Arc<tokio::sync::Semaphore>,
+    per_upstream_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     state: Arc<AtomicU32>,
 ) {
     let name = provider.name().to_owned();
@@ -234,6 +237,27 @@ async fn run_job_task(
                     info!(mirror = %name, "killed while waiting for semaphore");
                     continue;
                 }
+            }
+        } else {
+            None
+        };
+
+        // Acquire per-upstream semaphore (if configured) after the global slot.
+        // Acquiring in this order (global first, upstream second) prevents
+        // a deadlock between jobs that share an upstream.
+        let _upstream_permit = if action != CtrlAction::ForceStart {
+            if let Some(ref us) = per_upstream_semaphore {
+                let us = Arc::clone(us);
+                let permit = tokio::select! {
+                    p = us.acquire_owned() => Some(p.expect("upstream semaphore closed")),
+                    _ = kill_rx.changed() => {
+                        info!(mirror = %name, "killed while waiting for upstream semaphore");
+                        continue;
+                    }
+                };
+                permit
+            } else {
+                None
             }
         } else {
             None
@@ -713,5 +737,118 @@ mod disk_quota_tests {
         assert!(!has_failed, "unexpected Failed message with quota=0: {msgs:?}");
         let has_success = msgs.iter().any(|m| m.status == SyncStatus::Success);
         assert!(has_success, "expected Success message with quota=0: {msgs:?}");
+    }
+}
+
+#[cfg(test)]
+mod per_upstream_semaphore_tests {
+    //! Tests for per-upstream concurrency limiting.
+    //!
+    //! We verify that with max=1 for an upstream host, a second job cannot
+    //! start until the first releases its permit.
+
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use tokio::sync::{mpsc, Semaphore};
+
+    use crate::hooks::DockerConfig;
+    use crate::job::{CtrlAction, JobMessage, MirrorJob};
+    use crate::provider::MirrorProvider;
+
+    struct SlowProvider {
+        /// How long to sleep inside run().
+        delay: Duration,
+        /// Set to true when run() is executing.
+        running: Arc<tokio::sync::Notify>,
+        /// Unblocks run() when set.
+        unblock: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl MirrorProvider for SlowProvider {
+        fn name(&self) -> &str { "slow" }
+        fn upstream(&self) -> &str { "rsync://upstream.example.com/test/" }
+        fn is_master(&self) -> bool { true }
+        fn interval(&self) -> Duration { Duration::from_secs(3600) }
+        fn retry(&self) -> u32 { 1 }
+        fn timeout(&self) -> Duration { Duration::ZERO }
+        async fn run(&self) -> anyhow::Result<()> {
+            self.running.notify_one();
+            self.unblock.notified().await;
+            Ok(())
+        }
+        async fn terminate(&self) -> anyhow::Result<()> { Ok(()) }
+        fn set_docker_config(&mut self, _: DockerConfig) {}
+        fn set_log_path_shared(&mut self, _: Arc<Mutex<PathBuf>>) {}
+    }
+
+    /// Two jobs with the same upstream and max=1: the second job must not
+    /// start (acquire the upstream semaphore) until the first has finished.
+    #[tokio::test]
+    async fn second_job_waits_for_upstream_semaphore() {
+        let global_sem = Arc::new(Semaphore::new(4)); // plenty of global permits
+        let upstream_sem = Arc::new(Semaphore::new(1)); // only 1 upstream slot
+
+        let running1 = Arc::new(tokio::sync::Notify::new());
+        let unblock1 = Arc::new(tokio::sync::Notify::new());
+        let running2 = Arc::new(tokio::sync::Notify::new());
+        let unblock2 = Arc::new(tokio::sync::Notify::new());
+
+        let (tx1, mut rx1) = mpsc::channel::<JobMessage>(8);
+        let (tx2, mut rx2) = mpsc::channel::<JobMessage>(8);
+
+        let p1 = SlowProvider {
+            delay: Duration::from_millis(50),
+            running: Arc::clone(&running1),
+            unblock: Arc::clone(&unblock1),
+        };
+        let p2 = SlowProvider {
+            delay: Duration::from_millis(50),
+            running: Arc::clone(&running2),
+            unblock: Arc::clone(&unblock2),
+        };
+
+        let job1 = MirrorJob::spawn(
+            Box::new(p1), vec![], tx1,
+            Arc::clone(&global_sem), Some(Arc::clone(&upstream_sem)),
+        );
+        let job2 = MirrorJob::spawn(
+            Box::new(p2), vec![], tx2,
+            Arc::clone(&global_sem), Some(Arc::clone(&upstream_sem)),
+        );
+
+        // Start both jobs concurrently.
+        job1.send(CtrlAction::Start).await;
+        job2.send(CtrlAction::Start).await;
+
+        // Wait for job1 to enter run().
+        tokio::time::timeout(Duration::from_secs(2), running1.notified())
+            .await
+            .expect("job1 should start running");
+
+        // job2 should NOT have started yet (upstream semaphore is held by job1).
+        // Give it a brief moment to make sure it's stuck.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The upstream semaphore should have 0 permits available — job1 holds the only one.
+        assert_eq!(
+            upstream_sem.available_permits(), 0,
+            "upstream semaphore should be fully held while job1 runs"
+        );
+
+        // Unblock job1 so it completes and releases the upstream semaphore.
+        unblock1.notify_one();
+
+        // Now job2 should be able to start.
+        tokio::time::timeout(Duration::from_secs(2), running2.notified())
+            .await
+            .expect("job2 should start after job1 finishes");
+
+        // Unblock job2 and clean up.
+        unblock2.notify_one();
+        drop(job1); drop(job2);
+        drop(rx1); drop(rx2);
     }
 }
