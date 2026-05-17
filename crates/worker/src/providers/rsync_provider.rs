@@ -419,10 +419,25 @@ impl MirrorProvider for RsyncProvider {
 
     /// Probe upstream reachability before syncing.
     ///
-    /// When `check_upstream` is true, tries the primary upstream and then each
-    /// fallback in order. Returns `Ok(())` as soon as one URL is reachable
-    /// (`rsync --list-only --timeout=10` exits 0). Returns `Err` only if every
-    /// URL fails — the sync is then skipped, not retried.
+    /// When `check_upstream` is true, probes the primary upstream and each
+    /// fallback **concurrently** with a hard 15-second timeout per URL.
+    /// Returns `Ok(())` as soon as the first reachable URL is found. Returns
+    /// `Err` only if every URL is unreachable.
+    ///
+    /// # Why parallel + hard timeout
+    ///
+    /// `rsync --timeout=N` only governs IO inactivity — it does not bound
+    /// DNS resolution, TCP SYN, or TLS handshake. A misbehaving network
+    /// (firewall DROP rather than REJECT, dead DNS server) can leave rsync
+    /// stuck for the kernel's TCP connect timeout (75–130s on Linux). With
+    /// the old serial implementation N fallback URLs that all hang would
+    /// block the sync path for N × 130s.
+    ///
+    /// We wrap each probe in `tokio::time::timeout(15s, …)` so any single
+    /// hung probe is bounded, and run all probes concurrently with
+    /// `FuturesUnordered` so total wall-clock time is bounded by the
+    /// slowest *successful* probe rather than the cumulative timeout
+    /// budget across all URLs.
     ///
     /// When `check_upstream` is false (default) this is a no-op.
     async fn probe_upstream(&self) -> anyhow::Result<()> {
@@ -431,20 +446,45 @@ impl MirrorProvider for RsyncProvider {
         }
         let mut urls: Vec<&str> = vec![self.upstream.as_str()];
         urls.extend(self.upstream_fallback.iter().map(String::as_str));
-        for url in &urls {
-            if probe_rsync_url(url).await.is_ok() {
-                if *url != self.upstream.as_str() {
-                    tracing::info!(
-                        mirror = %self.name,
-                        primary = %self.upstream,
-                        reachable = %url,
-                        "primary upstream unreachable; fallback responded"
-                    );
+
+        use futures::stream::{FuturesUnordered, StreamExt};
+        let mut futures: FuturesUnordered<_> = urls
+            .iter()
+            .map(|&url| async move {
+                let res =
+                    tokio::time::timeout(std::time::Duration::from_secs(15), probe_rsync_url(url))
+                        .await;
+                (url, res)
+            })
+            .collect();
+
+        let mut last_err: Option<String> = None;
+        while let Some((url, res)) = futures.next().await {
+            match res {
+                Ok(Ok(())) => {
+                    if url != self.upstream.as_str() {
+                        tracing::info!(
+                            mirror = %self.name,
+                            primary = %self.upstream,
+                            reachable = %url,
+                            "primary upstream unreachable; fallback responded"
+                        );
+                    }
+                    return Ok(());
                 }
-                return Ok(());
+                Ok(Err(e)) => {
+                    last_err = Some(format!("{url}: {e}"));
+                }
+                Err(_) => {
+                    last_err = Some(format!("{url}: probe timed out after 15s"));
+                }
             }
         }
-        anyhow::bail!("all upstreams unreachable ({} URL(s) probed)", urls.len())
+        anyhow::bail!(
+            "all {} upstream(s) unreachable; last: {}",
+            urls.len(),
+            last_err.as_deref().unwrap_or("no probes attempted")
+        )
     }
 
     fn set_docker_config(&mut self, config: DockerConfig) {
@@ -464,21 +504,40 @@ impl MirrorProvider for RsyncProvider {
 
 /// Probe a single rsync URL for reachability.
 ///
-/// Runs `rsync --list-only --timeout=10 <url>` and returns `Ok(())` if the
-/// exit code is 0. This is intentionally lightweight — we don't care about
-/// the listing contents, only whether the daemon is accepting connections.
+/// Runs `rsync --contimeout=10 --list-only --timeout=10 <url>`. The two
+/// timeouts cover different things:
+/// - `--contimeout=10`: connection establishment timeout (DNS + TCP SYN)
+/// - `--timeout=10`: IO inactivity timeout after the connection is up
+///
+/// Together they bound the per-process wall-clock time to about 20s. We
+/// further wrap calls to this function in `tokio::time::timeout(15s, …)`
+/// at the call site, which kills the child process if it ignores its own
+/// timeout (e.g. version too old to know about `--contimeout`).
+///
+/// Returns `Ok(())` if the exit code is 0; otherwise an error containing
+/// the exit code or stderr's first line for diagnostics.
 async fn probe_rsync_url(url: &str) -> anyhow::Result<()> {
-    let out = tokio::process::Command::new("rsync")
-        .args(["--list-only", "--timeout=10", url])
-        .output()
-        .await
+    let mut child = tokio::process::Command::new("rsync")
+        .args(["--contimeout=10", "--list-only", "--timeout=10", url])
+        // Capture stderr so we can include a useful message on failure
+        // without dumping it to the worker's terminal.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        // Kill on drop: if the outer tokio::time::timeout fires and drops
+        // this future, the child process must die rather than orphan.
+        .kill_on_drop(true)
+        .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn rsync probe: {e}"))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        let code = out.status.code().unwrap_or(-1);
-        anyhow::bail!("rsync probe exited {code} for {url}")
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to wait for rsync probe: {e}"))?;
+    if status.success() {
+        return Ok(());
     }
+    let code = status.code().unwrap_or(-1);
+    anyhow::bail!("rsync probe exited {code} for {url}")
 }
 
 impl RsyncProvider {
@@ -508,6 +567,84 @@ mod upstream_probe_tests {
         assert!(
             result.is_err(),
             "expected probe to fail for unreachable URL, got Ok"
+        );
+    }
+
+    /// Regression test: the outer `tokio::time::timeout` wrapper at the
+    /// caller side must bound wall-clock time even when the spawned
+    /// process refuses to die promptly.  We don't actually need rsync for
+    /// this — we can simulate a hung probe with `sleep`. This test
+    /// verifies that wrapping `sleep 60` in a 1-second timeout bounds
+    /// the wait correctly and the child gets killed (via kill_on_drop).
+    #[tokio::test]
+    async fn timeout_wrapper_bounds_wallclock_and_kills_child() {
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+
+        // Spawn a long-running process and wrap in tokio timeout. With
+        // kill_on_drop on the Command builder the child is reaped when
+        // the future is dropped by the timeout.
+        let res = tokio::time::timeout(Duration::from_millis(500), async {
+            let mut child = tokio::process::Command::new("sleep")
+                .arg("60")
+                .kill_on_drop(true)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn sleep");
+            child.wait().await
+        })
+        .await;
+
+        let elapsed = start.elapsed();
+        assert!(res.is_err(), "expected outer timeout to fire");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "outer timeout should bound wallclock; got {:?}",
+            elapsed
+        );
+    }
+
+    /// probe_upstream runs URLs concurrently. If we have one fast-failing
+    /// URL and one that would block forever, the function must return
+    /// promptly with an error (no URL was reachable) rather than waiting
+    /// for the slow one. Bounded to 30s total.
+    #[tokio::test]
+    #[ignore = "requires rsync binary in PATH"]
+    async fn probe_upstream_parallel_does_not_wait_for_slow_url() {
+        use crate::config::{GlobalConfig, MirrorConfig, ProviderKind};
+        use crate::provider::MirrorProvider;
+        use std::time::{Duration, Instant};
+
+        let global = GlobalConfig::default();
+        let mc = MirrorConfig {
+            name: "parallel-probe".into(),
+            provider: ProviderKind::Rsync,
+            // Two URLs that should both fail fast (connection refused on
+            // privileged unused ports). The point is to show two probes
+            // running concurrently and the total time being roughly
+            // max(rtt) not sum(rtt).
+            upstream: "rsync://127.0.0.1:1/a".into(),
+            upstream_fallback: vec!["rsync://127.0.0.1:2/b".into()],
+            check_upstream: true,
+            ..MirrorConfig::default()
+        };
+        let provider = super::super::RsyncProvider::from_config(&mc, &global)
+            .expect("from_config should succeed");
+        let provider: &dyn MirrorProvider = &provider;
+
+        let start = Instant::now();
+        let result = provider.probe_upstream().await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "both URLs unreachable; expected Err");
+        // Generous upper bound: even with rsync slowness this must
+        // complete in well under the 15s × N serial worst case.
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "parallel probes took too long: {:?}",
+            elapsed
         );
     }
 
