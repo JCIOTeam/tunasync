@@ -1027,22 +1027,28 @@ mod cron_schedule_tests {
 
     fn mirror_with_cron(expr: &str) -> (MirrorConfig, GlobalConfig) {
         let global = GlobalConfig::default();
-        let mut mc = MirrorConfig::default();
-        mc.name = "cron-test".into();
-        mc.provider = ProviderKind::Rsync;
-        mc.upstream = "rsync://localhost/test/".into();
-        mc.cron = expr.to_owned();
+        let mc = MirrorConfig {
+            name: "cron-test".into(),
+            provider: ProviderKind::Rsync,
+            upstream: "rsync://localhost/test/".into(),
+            cron: expr.to_owned(),
+            ..MirrorConfig::default()
+        };
         (mc, global)
     }
 
     fn mirror_with_interval(secs: u64) -> (MirrorConfig, GlobalConfig) {
-        let mut global = GlobalConfig::default();
-        global.interval = secs;
-        let mut mc = MirrorConfig::default();
-        mc.name = "interval-test".into();
-        mc.provider = ProviderKind::Rsync;
-        mc.upstream = "rsync://localhost/test/".into();
-        // leave cron empty → use interval
+        let global = GlobalConfig {
+            interval: secs,
+            ..GlobalConfig::default()
+        };
+        let mc = MirrorConfig {
+            name: "interval-test".into(),
+            provider: ProviderKind::Rsync,
+            upstream: "rsync://localhost/test/".into(),
+            // leave cron empty → use interval
+            ..MirrorConfig::default()
+        };
         (mc, global)
     }
 

@@ -520,10 +520,12 @@ mod upstream_probe_tests {
 
         // Build a minimal config with check_upstream = false (the default).
         let global = GlobalConfig::default();
-        let mut mc = MirrorConfig::default();
-        mc.name = "probe-noop-test".into();
-        mc.provider = ProviderKind::Rsync;
-        mc.upstream = "rsync://localhost/will-not-be-called/".into();
+        let mc = MirrorConfig {
+            name: "probe-noop-test".into(),
+            provider: ProviderKind::Rsync,
+            upstream: "rsync://localhost/will-not-be-called/".into(),
+            ..MirrorConfig::default()
+        };
         // check_upstream defaults to false — leave it unset.
 
         let provider =
@@ -555,11 +557,13 @@ mod atomic_publish_tests {
     /// Build a minimal RsyncProvider pointing at a tempdir.
     fn make_atomic_provider(working_dir: PathBuf) -> super::RsyncProvider {
         let global = GlobalConfig::default();
-        let mut mc = MirrorConfig::default();
-        mc.name = "atomic-test".into();
-        mc.provider = ProviderKind::Rsync;
-        mc.upstream = "rsync://localhost/unused/".into();
-        mc.atomic_publish = true;
+        let mc = MirrorConfig {
+            name: "atomic-test".into(),
+            provider: ProviderKind::Rsync,
+            upstream: "rsync://localhost/unused/".into(),
+            atomic_publish: true,
+            ..MirrorConfig::default()
+        };
         // Override the mirror dir by constructing manually after from_config.
         let mut p = super::RsyncProvider::from_config(&mc, &global).expect("from_config");
         p.working_dir = working_dir;

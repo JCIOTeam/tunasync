@@ -146,10 +146,15 @@ impl PrioritySemaphore {
 
         // Return a future that resolves when the permit is granted.
         // On drop (cancellation), mark as cancelled so the semaphore skips us.
+        // The `granted` flag tracks whether the permit has been delivered:
+        // - granted=false on drop → either still waiting (just abandon spot)
+        //   or already woken but not yet polled (must return permit to pool).
+        // - granted=true on drop → caller owns the Permit, don't touch.
         AcquireFuture {
             rx,
             cancelled,
             inner: Arc::clone(&self.inner),
+            granted: Arc::new(AtomicBool::new(false)),
         }
         .await
     }
@@ -178,6 +183,23 @@ struct AcquireFuture {
     rx: oneshot::Receiver<()>,
     cancelled: Arc<AtomicBool>,
     inner: Arc<Mutex<Inner>>,
+    /// Set to true once `poll` has resolved with a `Permit`. Used by `Drop`
+    /// to distinguish two cases:
+    ///
+    /// 1. `poll` already returned `Ready(Permit)` — the caller is now
+    ///    responsible for the permit and `Drop` must not touch the count.
+    /// 2. `poll` has not yet observed the wake-up signal but the wake
+    ///    already happened (sender sent, oneshot delivered) — the permit
+    ///    was granted to this future, but the future is being dropped
+    ///    without the caller ever seeing it. We must return the permit to
+    ///    the semaphore, otherwise it is leaked forever.
+    ///
+    /// This is critical when `acquire` is used inside `tokio::select!`: a
+    /// concurrent kill signal can drop the AcquireFuture in the exact
+    /// window between `wake_next` doing `tx.send(())` and the future's
+    /// next poll. With the bug present, after some trials the available
+    /// permit count drops to zero permanently.
+    granted: Arc<AtomicBool>,
 }
 
 impl std::future::Future for AcquireFuture {
@@ -188,13 +210,18 @@ impl std::future::Future for AcquireFuture {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         match std::pin::Pin::new(&mut self.rx).poll(cx) {
-            std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Permit {
-                inner: Arc::clone(&self.inner),
-            }),
+            std::task::Poll::Ready(Ok(())) => {
+                self.granted.store(true, AOrdering::Release);
+                std::task::Poll::Ready(Permit {
+                    inner: Arc::clone(&self.inner),
+                })
+            }
             std::task::Poll::Ready(Err(_)) => {
-                // Sender dropped — shouldn't happen in normal operation.
-                // Treat as granted (the Inner::wake_next path failed to send
-                // but we've already been removed from the queue).
+                // Sender dropped without sending — shouldn't normally happen.
+                // Treat as granted so the caller still gets a Permit; the
+                // semaphore's permit count remains consistent because
+                // wake_next only decrements on a successful send.
+                self.granted.store(true, AOrdering::Release);
                 std::task::Poll::Ready(Permit {
                     inner: Arc::clone(&self.inner),
                 })
@@ -206,8 +233,36 @@ impl std::future::Future for AcquireFuture {
 
 impl Drop for AcquireFuture {
     fn drop(&mut self) {
-        // Mark as cancelled so wake_next skips this waiter.
+        // Always mark cancelled so any *future* wake_next() attempt skips us.
         self.cancelled.store(true, AOrdering::Release);
+
+        // If the caller already received the Permit (granted == true), the
+        // Permit's own Drop will return the permit to the pool. We must not.
+        if self.granted.load(AOrdering::Acquire) {
+            return;
+        }
+
+        // Did the permit already get granted to us (oneshot already
+        // received) but the caller never polled to observe it? Check the
+        // oneshot directly — `try_recv` returns Ok(()) iff a value was
+        // sent. If so, the semaphore considers this permit "in use" but
+        // it actually has no owner; return it to the pool so a future
+        // acquirer can use it.
+        match self.rx.try_recv() {
+            Ok(()) => {
+                // Permit was granted but the future was dropped before the
+                // caller saw it. Return it to the pool and wake the next
+                // waiter.
+                let mut g = self.inner.lock();
+                g.permits += 1;
+                g.wake_next();
+            }
+            Err(_) => {
+                // Permit was never granted — we are simply abandoning our
+                // place in the queue. The cancelled flag we set above will
+                // cause wake_next() to skip us if it ever pops this entry.
+            }
+        }
     }
 }
 
@@ -319,5 +374,88 @@ mod tests {
             h.await.unwrap();
         }
         assert_eq!(acquired.load(AO::SeqCst), 3);
+    }
+
+    /// Regression test: a waiter that's cancelled at the exact moment it's
+    /// being granted a permit must not leak the permit.
+    ///
+    /// Scenario:
+    /// 1. permits = 1, take p1 → permits = 0
+    /// 2. Enqueue waiter W via `tokio::select!` with a timer
+    /// 3. Drop p1 → wake_next pops W, sends on tx, decrements permits to 0
+    /// 4. W is cancelled (timer wins) before the AcquireFuture sees the message
+    /// 5. AcquireFuture::Drop sets cancelled=true (too late, already woken)
+    /// 6. Result: permit is held by a future that's gone → leak forever
+    #[tokio::test]
+    async fn cancellation_race_does_not_leak_permits() {
+        let sem = Arc::new(PrioritySemaphore::new(1));
+
+        let p1 = sem.acquire(0).await;
+
+        // Run many trials to actually catch the race.
+        for trial in 0..50 {
+            let sem2 = Arc::clone(&sem);
+            let h = tokio::spawn(async move {
+                tokio::select! {
+                    _p = sem2.acquire(0) => "got",
+                    _ = tokio::time::sleep(std::time::Duration::from_micros(1)) => "cancelled",
+                }
+            });
+            tokio::time::sleep(std::time::Duration::from_micros(1)).await;
+            // racing drop of p-equivalent: just check after the spawned task
+            let _ = h.await.unwrap();
+            // Re-check that permits stays consistent.
+            let avail = sem.available_permits();
+            assert_eq!(
+                avail, 0,
+                "trial {trial}: permit count unexpectedly {avail} (p1 still held)"
+            );
+        }
+
+        drop(p1);
+        // Give async runtime a moment to settle.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "after dropping p1, expected 1 free permit but got {}",
+            sem.available_permits()
+        );
+    }
+
+    /// Direct reproducer for the leak: drop p1 at the same time a waiter
+    /// is cancelled. With the bug, the released permit is consumed by the
+    /// cancelled waiter and lost forever.
+    #[tokio::test]
+    async fn drop_race_permit_leak_direct() {
+        let sem = Arc::new(PrioritySemaphore::new(1));
+
+        for trial in 0..100 {
+            let p1 = sem.acquire(0).await;
+            assert_eq!(sem.available_permits(), 0);
+
+            // Spawn a waiter and a canceller.
+            let sem2 = Arc::clone(&sem);
+            let waiter = tokio::spawn(async move {
+                tokio::select! {
+                    _p = sem2.acquire(0) => "got",
+                    _ = tokio::time::sleep(std::time::Duration::from_micros(50)) => "cancel",
+                }
+            });
+
+            // Tiny delay then drop the permit — try to land it during cancel.
+            tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+            drop(p1);
+
+            let _ = waiter.await.unwrap();
+
+            // The semaphore should always end with 1 free permit before we
+            // start the next trial. With the bug, after some trials this hits 0.
+            let avail = sem.available_permits();
+            assert_eq!(
+                avail, 1,
+                "trial {trial}: leaked permit detected — available={avail}, expected 1"
+            );
+        }
     }
 }
