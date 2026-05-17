@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use clap_complete::Shell;
+use futures::future::join_all;
 use serde::Deserialize;
 use tunasync_protocol::{ClientCmd, CmdVerb, MirrorStatus, WebMirrorStatus, WorkerStatus};
 
@@ -155,7 +156,11 @@ enum Command {
     /// List all registered workers.
     Workers,
     /// Flush all disabled job rows from the manager DB.
-    Flush,
+    Flush {
+        /// Only flush mirrors that are both disabled and marked stale.
+        #[arg(long)]
+        stale_only: bool,
+    },
     /// Remove a worker from the manager.
     RmWorker {
         /// Worker ID.
@@ -214,6 +219,24 @@ enum Command {
         /// Shell type.
         shell: Shell,
     },
+    /// Manage global maintenance mode on the manager.
+    ///
+    /// In maintenance mode the manager rejects all incoming sync-start requests.
+    Maintenance {
+        #[command(subcommand)]
+        action: MaintenanceAction,
+    },
+}
+
+/// Subcommands for `tunasynctl maintenance`.
+#[derive(Debug, Subcommand)]
+enum MaintenanceAction {
+    /// Enable maintenance mode (POST /maintenance).
+    Enable,
+    /// Disable maintenance mode (DELETE /maintenance).
+    Disable,
+    /// Show whether maintenance mode is active (GET /maintenance).
+    Status,
 }
 
 /// Build the clap Command with help text in the current locale.
@@ -398,6 +421,21 @@ impl Client {
     async fn send_cmd(&self, cmd: ClientCmd) -> Result<serde_json::Value> {
         self.post("/cmd", &cmd).await
     }
+
+    /// Enable maintenance mode on the manager (POST /maintenance).
+    async fn maintenance_enable(&self) -> Result<serde_json::Value> {
+        self.post("/maintenance", &serde_json::json!({})).await
+    }
+
+    /// Disable maintenance mode on the manager (DELETE /maintenance).
+    async fn maintenance_disable(&self) -> Result<serde_json::Value> {
+        self.delete("/maintenance").await
+    }
+
+    /// Get maintenance mode status from the manager (GET /maintenance).
+    async fn maintenance_status(&self) -> Result<serde_json::Value> {
+        self.get("/maintenance").await
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -426,6 +464,49 @@ async fn resolve_worker(
         }
     }
     anyhow::bail!("mirror {mirror:?} not found on any worker; use --worker / --worker 指定")
+}
+
+/// Expand a mirror name that may contain glob metacharacters (`*`, `?`, `[`)
+/// by fetching all workers' jobs and filtering with the pattern.
+///
+/// Returns a list of `(mirror_name, worker_id)` pairs.  When the name contains
+/// no metacharacters the function skips the fetch and returns the single name
+/// with the worker resolved via `resolve_worker`.
+async fn expand_glob(
+    client: &Client,
+    pattern: &str,
+    explicit_worker: Option<&str>,
+) -> Result<Vec<(String, String)>> {
+    let has_glob = pattern.contains(['*', '?', '[']);
+    if !has_glob {
+        let wid = resolve_worker(client, pattern, explicit_worker).await?;
+        return Ok(vec![(pattern.to_owned(), wid)]);
+    }
+
+    let pat = glob::Pattern::new(pattern)
+        .with_context(|| format!("invalid glob pattern: {pattern:?}"))?;
+
+    // Fetch from all workers (or just the explicit one).
+    let workers = client.list_workers().await?;
+    let mut matched: Vec<(String, String)> = Vec::new();
+    for w in &workers {
+        if let Some(ew) = explicit_worker {
+            if w.id != ew {
+                continue;
+            }
+        }
+        let jobs = client.list_jobs_of_worker(&w.id).await.unwrap_or_default();
+        for j in jobs {
+            if pat.matches(&j.name) {
+                matched.push((j.name, w.id.clone()));
+            }
+        }
+    }
+
+    if matched.is_empty() {
+        anyhow::bail!("glob pattern {pattern:?} matched no mirrors");
+    }
+    Ok(matched)
 }
 
 fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
@@ -548,12 +629,45 @@ async fn main() -> Result<()> {
             print_json(&workers)?;
         }
 
-        Command::Flush => {
-            client.flush_disabled().await?;
-            println!(
-                "{}",
-                t!("Flushed disabled jobs.", "已清除所有 disabled 任务。")
-            );
+        Command::Flush { stale_only } => {
+            if stale_only {
+                // MirrorStatus (from /workers/{id}/jobs) has a `stale` field.
+                let workers = client.list_workers().await?;
+                let mut stale_names: Vec<String> = Vec::new();
+                for w in &workers {
+                    let jobs = client.list_jobs_of_worker(&w.id).await.unwrap_or_default();
+                    for j in jobs {
+                        if j.stale {
+                            stale_names.push(j.name);
+                        }
+                    }
+                }
+                if stale_names.is_empty() {
+                    println!(
+                        "{}",
+                        t!("No stale disabled jobs to flush.", "没有需要清除的 stale 任务。")
+                    );
+                } else {
+                    println!(
+                        "{}",
+                        t!(
+                            format!("Stale mirrors found: {stale_names:?}"),
+                            format!("发现 stale 镜像：{stale_names:?}")
+                        )
+                    );
+                    client.flush_disabled().await?;
+                    println!(
+                        "{}",
+                        t!("Flushed stale disabled jobs.", "已清除所有 stale disabled 任务。")
+                    );
+                }
+            } else {
+                client.flush_disabled().await?;
+                println!(
+                    "{}",
+                    t!("Flushed disabled jobs.", "已清除所有 disabled 任务。")
+                );
+            }
         }
 
         Command::RmWorker { worker } => {
@@ -618,63 +732,78 @@ async fn main() -> Result<()> {
         }
 
         Command::Stop { mirror, worker } => {
-            let worker_id = resolve_worker(&client, &mirror, worker.as_deref()).await?;
-            client
-                .send_cmd(ClientCmd {
-                    cmd: CmdVerb::Stop,
-                    mirror_id: mirror.clone(),
-                    worker_id,
-                    args: vec![],
-                    options: HashMap::new(),
-                })
-                .await?;
-            println!(
-                "{}",
-                t!(
-                    format!("Sent stop command for mirror {mirror:?}."),
-                    format!("已发送停止命令：镜像 {mirror:?}。")
-                )
-            );
+            let targets = expand_glob(&client, &mirror, worker.as_deref()).await?;
+            let futs = targets.iter().map(|(name, wid)| {
+                let name = name.clone();
+                let wid = wid.clone();
+                let client = &client;
+                async move {
+                    client.send_cmd(ClientCmd {
+                        cmd: CmdVerb::Stop,
+                        mirror_id: name.clone(),
+                        worker_id: wid,
+                        args: vec![],
+                        options: HashMap::new(),
+                    }).await?;
+                    println!("{}", t!(
+                        format!("Sent stop command for mirror {name:?}."),
+                        format!("已发送停止命令：镜像 {name:?}。")
+                    ));
+                    anyhow::Ok(())
+                }
+            });
+            let results: Vec<_> = join_all(futs).await;
+            for r in results { r?; }
         }
 
         Command::Disable { mirror, worker } => {
-            let worker_id = resolve_worker(&client, &mirror, worker.as_deref()).await?;
-            client
-                .send_cmd(ClientCmd {
-                    cmd: CmdVerb::Disable,
-                    mirror_id: mirror.clone(),
-                    worker_id,
-                    args: vec![],
-                    options: HashMap::new(),
-                })
-                .await?;
-            println!(
-                "{}",
-                t!(
-                    format!("Sent disable command for mirror {mirror:?}."),
-                    format!("已发送禁用命令：镜像 {mirror:?}。")
-                )
-            );
+            let targets = expand_glob(&client, &mirror, worker.as_deref()).await?;
+            let futs = targets.iter().map(|(name, wid)| {
+                let name = name.clone();
+                let wid = wid.clone();
+                let client = &client;
+                async move {
+                    client.send_cmd(ClientCmd {
+                        cmd: CmdVerb::Disable,
+                        mirror_id: name.clone(),
+                        worker_id: wid,
+                        args: vec![],
+                        options: HashMap::new(),
+                    }).await?;
+                    println!("{}", t!(
+                        format!("Sent disable command for mirror {name:?}."),
+                        format!("已发送禁用命令：镜像 {name:?}。")
+                    ));
+                    anyhow::Ok(())
+                }
+            });
+            let results: Vec<_> = join_all(futs).await;
+            for r in results { r?; }
         }
 
         Command::Restart { mirror, worker } => {
-            let worker_id = resolve_worker(&client, &mirror, worker.as_deref()).await?;
-            client
-                .send_cmd(ClientCmd {
-                    cmd: CmdVerb::Restart,
-                    mirror_id: mirror.clone(),
-                    worker_id,
-                    args: vec![],
-                    options: HashMap::new(),
-                })
-                .await?;
-            println!(
-                "{}",
-                t!(
-                    format!("Sent restart command for mirror {mirror:?}."),
-                    format!("已发送重启命令：镜像 {mirror:?}。")
-                )
-            );
+            let targets = expand_glob(&client, &mirror, worker.as_deref()).await?;
+            let futs = targets.iter().map(|(name, wid)| {
+                let name = name.clone();
+                let wid = wid.clone();
+                let client = &client;
+                async move {
+                    client.send_cmd(ClientCmd {
+                        cmd: CmdVerb::Restart,
+                        mirror_id: name.clone(),
+                        worker_id: wid,
+                        args: vec![],
+                        options: HashMap::new(),
+                    }).await?;
+                    println!("{}", t!(
+                        format!("Sent restart command for mirror {name:?}."),
+                        format!("已发送重启命令：镜像 {name:?}。")
+                    ));
+                    anyhow::Ok(())
+                }
+            });
+            let results: Vec<_> = join_all(futs).await;
+            for r in results { r?; }
         }
 
         Command::Reload { worker } => {
@@ -695,6 +824,21 @@ async fn main() -> Result<()> {
                 )
             );
         }
+
+        Command::Maintenance { action } => match action {
+            MaintenanceAction::Enable => {
+                client.maintenance_enable().await?;
+                println!("{}", t!("Maintenance mode enabled.", "已启用维护模式。"));
+            }
+            MaintenanceAction::Disable => {
+                client.maintenance_disable().await?;
+                println!("{}", t!("Maintenance mode disabled.", "已禁用维护模式。"));
+            }
+            MaintenanceAction::Status => {
+                let v = client.maintenance_status().await?;
+                print_json(&v)?;
+            }
+        },
     }
 
     Ok(())
