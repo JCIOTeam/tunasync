@@ -217,59 +217,51 @@ impl MirrorProvider for RsyncProvider {
     }
 
     async fn run(&self) -> Result<()> {
-        // Determine the sync destination.
+        // Atomic publish: write rsync output to a staging directory, then
+        // atomically swap staging↔publish on success.
         //
-        // When atomic_publish is enabled, rsync writes into a `.staging-<name>`
-        // directory that sits *next to* (not inside) the publish directory.
-        // On success we atomically rename it into place.  Both paths must share
-        // the same filesystem (checked by comparing device IDs) because rename(2)
-        // is only atomic within a single mount point.
+        // # Design
         //
-        // The staging dir is a sibling of the publish dir — NOT a child — so that
-        // renaming the publish dir to the backup path does not carry the staging
-        // dir along with it.
+        // The staging directory lives **outside** the public mirror root.
+        // Operators very commonly point nginx at `mirror_dir` directly, and
+        // any path under that root with a leading `.` (e.g. `.staging-foo`)
+        // is still served by default nginx config — exposing half-synced
+        // files to users. We instead place staging under `<log_dir>/staging/`
+        // by default, which is universally treated as worker-internal state.
         //
-        // NOTE: Atomic publish interacts poorly with `--link-dest` style hardlink
-        // rsync because hardlinks created into staging point into it, not the
-        // final directory.  Operators should avoid combining atomic_publish with
-        // link-dest rsync options.
+        // The swap itself uses `renameat2(2)` with `RENAME_EXCHANGE`
+        // (Linux 3.15+), which atomically swaps two paths. Compared to the
+        // legacy two-step approach
+        //   1. rename(publish, backup)
+        //   2. rename(staging, publish)
+        // the new approach has no intermediate state where `publish` does
+        // not exist — readers always see either the old or the new content,
+        // never a 404 in the gap between (1) and (2).
+        //
+        // After the swap, the staging path holds the *previous* mirror
+        // contents. We leave it in place: next sync writes into it again
+        // (incremental rsync benefits from this).
+        //
+        // # Caveats (documented for operators)
+        //
+        // - Staging and publish must share a filesystem (both rename forms
+        //   require this). We check device IDs and bail at sync start with
+        //   a clear error if they differ.
+        // - Atomic publish interacts poorly with --link-dest style hardlink
+        //   rsync: hardlinks created into staging point inside staging, not
+        //   inside the eventual publish location. Operators should not
+        //   combine atomic_publish with --link-dest.
         let publish_dir = self.working_dir.clone();
         let sync_target = if self.atomic_publish_enabled {
-            let staging = publish_dir
-                .parent()
-                .map(|p| p.join(format!(".staging-{}", self.name)))
-                .unwrap_or_else(|| PathBuf::from(format!(".staging-{}", self.name)));
-            // Sanity check: staging parent and publish dir must share a device.
-            if publish_dir.exists() {
-                let pub_meta = std::fs::metadata(&publish_dir)
-                    .with_context(|| format!("stat {}", publish_dir.display()))?;
-                let staging_parent = staging.parent().unwrap_or(staging.as_path());
-                let stage_dir_for_meta = if staging_parent.exists() {
-                    staging_parent.to_path_buf()
-                } else {
-                    publish_dir
-                        .parent()
-                        .map(PathBuf::from)
-                        .unwrap_or(publish_dir.clone())
-                };
-                let stage_meta = std::fs::metadata(&stage_dir_for_meta)
-                    .with_context(|| format!("stat {}", stage_dir_for_meta.display()))?;
-                use std::os::unix::fs::MetadataExt;
-                if pub_meta.dev() != stage_meta.dev() {
-                    anyhow::bail!(
-                        "atomic_publish requires staging and publish dir on the same \
-                         filesystem (dev {} vs {})",
-                        pub_meta.dev(),
-                        stage_meta.dev()
-                    );
-                }
-            }
-            std::fs::create_dir_all(&staging)
-                .with_context(|| format!("create staging dir {}", staging.display()))?;
-            staging
+            atomic_staging_path_for(&self.log_dir, &self.name)
         } else {
             publish_dir.clone()
         };
+
+        if self.atomic_publish_enabled {
+            ensure_atomic_publish_dirs(&sync_target, &publish_dir)
+                .with_context(|| format!("atomic publish setup for {}", self.name))?;
+        }
 
         let argv = self.build_argv_for_dest(&sync_target);
         // When Docker wrapping is active, the argv is wrapped with `docker run …`
@@ -306,45 +298,19 @@ impl MirrorProvider for RsyncProvider {
         *self.current_pid.lock().unwrap() = None;
         wait_result?;
 
-        // Atomic publish: rename .staging into the publish directory.
+        // Atomic publish: swap staging↔publish in a single atomic operation.
         if self.atomic_publish_enabled {
-            let backup = {
-                let mut b = publish_dir.clone();
-                let name = b
-                    .file_name()
-                    .map(|n| {
-                        let mut s = n.to_os_string();
-                        s.push(".old");
-                        s
-                    })
-                    .unwrap_or_else(|| std::ffi::OsString::from("mirror.old"));
-                b.set_file_name(name);
-                b
-            };
-            // Best-effort: rename existing publish dir out of the way (atomic on
-            // same filesystem), then rename staging into place, then remove backup.
-            if publish_dir.exists() {
-                std::fs::rename(&publish_dir, &backup).with_context(|| {
-                    format!(
-                        "atomic publish: rename {} → {}",
-                        publish_dir.display(),
-                        backup.display()
-                    )
-                })?;
-            }
-            std::fs::rename(&sync_target, &publish_dir).with_context(|| {
+            atomic_publish_swap(&sync_target, &publish_dir).with_context(|| {
                 format!(
-                    "atomic publish: rename {} → {}",
+                    "atomic publish: swap {} ↔ {}",
                     sync_target.display(),
                     publish_dir.display()
                 )
             })?;
-            if backup.exists() {
-                let _ = std::fs::remove_dir_all(&backup);
-            }
             tracing::info!(
                 mirror = %self.name,
                 dest = %publish_dir.display(),
+                staging = %sync_target.display(),
                 "atomic publish complete"
             );
         }
@@ -501,6 +467,236 @@ impl MirrorProvider for RsyncProvider {
         self.cgroup_hook = Some(hook);
     }
 }
+
+// ── Atomic publish helpers ──────────────────────────────────────────────────
+
+/// Compute the staging directory path for atomic publish.
+///
+/// Stored under `<log_dir>/staging/<mirror_name>/` rather than inside the
+/// mirror tree so that operators serving `mirror_dir` directly via nginx
+/// do not inadvertently expose half-synced contents.
+///
+/// Exposed for tests; the public function is in the trait impl.
+pub(crate) fn atomic_staging_path_for(log_dir: &std::path::Path, mirror_name: &str) -> PathBuf {
+    log_dir.join("staging").join(mirror_name)
+}
+
+/// Validate atomic-publish preconditions and create the staging directory.
+///
+/// Specifically:
+/// - Both dirs must end up on the same filesystem (renameat2 requirement).
+///   We check this by walking up to the nearest existing ancestor of each
+///   and comparing `st_dev`. The check is skipped if neither path exists yet.
+/// - Creates `staging` if absent (the first sync of a mirror starts here).
+/// - Cleans up any stale `.old`-suffixed leftover from the legacy two-step
+///   rename if it exists (defence in depth for upgraders).
+pub(crate) fn ensure_atomic_publish_dirs(
+    staging: &std::path::Path,
+    publish: &std::path::Path,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    // Always ensure staging exists before any device-id check, so the
+    // device check has a real path to stat.
+    if let Some(parent) = staging.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create staging parent {}", parent.display()))?;
+    }
+    if !staging.exists() {
+        std::fs::create_dir_all(staging)
+            .with_context(|| format!("create staging {}", staging.display()))?;
+    }
+
+    // Device-id check: walk up each path to the nearest existing ancestor.
+    let staging_for_meta = nearest_existing(staging);
+    let publish_for_meta = nearest_existing(publish);
+    if let (Some(s), Some(p)) = (staging_for_meta, publish_for_meta) {
+        let sm = std::fs::metadata(&s).with_context(|| format!("stat {}", s.display()))?;
+        let pm = std::fs::metadata(&p).with_context(|| format!("stat {}", p.display()))?;
+        if sm.dev() != pm.dev() {
+            anyhow::bail!(
+                "atomic_publish requires staging ({}) and publish ({}) on the same \
+                 filesystem (dev {} vs {})",
+                s.display(),
+                p.display(),
+                sm.dev(),
+                pm.dev()
+            );
+        }
+    }
+
+    // Defence-in-depth: remove stale .old backups from the legacy rename
+    // pattern. If we just upgraded from the two-step implementation, a
+    // failed run could have left a `<publish>.old` directory behind, which
+    // would interfere with reasoning about disk usage. Best-effort.
+    let mut backup = publish.to_path_buf();
+    if let Some(name) = backup.file_name() {
+        let mut s = name.to_os_string();
+        s.push(".old");
+        backup.set_file_name(s);
+        if backup.exists() {
+            let _ = std::fs::remove_dir_all(&backup);
+        }
+    }
+    Ok(())
+}
+
+/// Walk up `path` until an existing ancestor is found.
+fn nearest_existing(path: &std::path::Path) -> Option<PathBuf> {
+    let mut p: &std::path::Path = path;
+    loop {
+        if p.exists() {
+            return Some(p.to_path_buf());
+        }
+        match p.parent() {
+            Some(parent) if parent != p => p = parent,
+            _ => return None,
+        }
+    }
+}
+
+/// Atomically swap `staging` and `publish` directories.
+///
+/// Uses Linux's `renameat2(2)` with `RENAME_EXCHANGE`. After this returns
+/// `Ok`, readers always see either the previous publish contents or the
+/// new staging contents — there is no window where the publish path is
+/// missing.
+///
+/// Falls back to a two-step `rename` only on the first-ever publish (when
+/// the publish directory does not exist yet): in that case there is no
+/// concurrent reader risk because the path being created is new.
+pub(crate) fn atomic_publish_swap(
+    staging: &std::path::Path,
+    publish: &std::path::Path,
+) -> anyhow::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    // First-ever publish: just rename (no exchange needed since there's
+    // nothing to atomically replace). Single rename is itself atomic.
+    if !publish.exists() {
+        if let Some(parent) = publish.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create publish parent {}", parent.display()))?;
+        }
+        std::fs::rename(staging, publish).with_context(|| {
+            format!(
+                "first-time rename {} -> {}",
+                staging.display(),
+                publish.display()
+            )
+        })?;
+        // Recreate the staging dir so the next sync has somewhere to write.
+        std::fs::create_dir_all(staging)
+            .with_context(|| format!("recreate staging {}", staging.display()))?;
+        return Ok(());
+    }
+
+    // Both exist — do an atomic exchange via renameat2.
+    //
+    // Constants: AT_FDCWD = -100 on Linux/glibc; RENAME_EXCHANGE = 2.
+    // We invoke the syscall directly because libc on some targets does
+    // not export `renameat2`.
+    let c_staging = CString::new(staging.as_os_str().as_bytes())
+        .map_err(|e| anyhow::anyhow!("staging path contains NUL: {e}"))?;
+    let c_publish = CString::new(publish.as_os_str().as_bytes())
+        .map_err(|e| anyhow::anyhow!("publish path contains NUL: {e}"))?;
+    const SYS_RENAMEAT2: libc::c_long = 316; // x86_64
+    #[allow(clippy::useless_conversion)]
+    const RENAME_EXCHANGE: libc::c_uint = 2;
+    // SAFETY: we hold valid C strings, AT_FDCWD is the canonical "current
+    // working directory" sentinel, RENAME_EXCHANGE is a valid flag for
+    // renameat2(2). On error we read errno and convert to a Rust error.
+    let ret = unsafe {
+        libc::syscall(
+            SYS_RENAMEAT2,
+            libc::AT_FDCWD,
+            c_staging.as_ptr(),
+            libc::AT_FDCWD,
+            c_publish.as_ptr(),
+            RENAME_EXCHANGE,
+        )
+    };
+    if ret == 0 {
+        return Ok(());
+    }
+
+    let errno = std::io::Error::last_os_error();
+    // If the kernel/filesystem doesn't support RENAME_EXCHANGE (ENOSYS,
+    // EINVAL on some FUSE filesystems), fall back to the two-step rename.
+    // We log a warning so operators notice and can plan an upgrade.
+    let raw = errno.raw_os_error().unwrap_or(0);
+    if raw == libc::ENOSYS || raw == libc::EINVAL {
+        tracing::warn!(
+            staging = %staging.display(),
+            publish = %publish.display(),
+            errno = raw,
+            "renameat2(RENAME_EXCHANGE) unsupported on this kernel/filesystem; \
+             falling back to non-atomic two-step rename. Readers may see a \
+             brief 404 window during sync. Upgrade kernel to ≥3.15 and use a \
+             modern filesystem (ext4/xfs/btrfs) for atomic semantics."
+        );
+        return two_step_rename_fallback(staging, publish);
+    }
+    Err(anyhow::anyhow!(
+        "renameat2(RENAME_EXCHANGE) failed: {errno}"
+    ))
+}
+
+/// Non-atomic fallback: rename publish → publish.old, then staging → publish,
+/// then remove the .old directory. Used only when the kernel/filesystem
+/// doesn't support `renameat2(RENAME_EXCHANGE)`.
+fn two_step_rename_fallback(
+    staging: &std::path::Path,
+    publish: &std::path::Path,
+) -> anyhow::Result<()> {
+    let mut backup = publish.to_path_buf();
+    let backup_name = publish
+        .file_name()
+        .map(|n| {
+            let mut s = n.to_os_string();
+            s.push(".old");
+            s
+        })
+        .ok_or_else(|| anyhow::anyhow!("publish path has no filename"))?;
+    backup.set_file_name(backup_name);
+
+    // Step 1: publish -> backup. Brief window starts here.
+    std::fs::rename(publish, &backup).with_context(|| {
+        format!(
+            "fallback rename {} -> {}",
+            publish.display(),
+            backup.display()
+        )
+    })?;
+    // Step 2: staging -> publish. Brief window ends here.
+    let rename_res = std::fs::rename(staging, publish);
+    match rename_res {
+        Ok(()) => {
+            // Step 3: leave backup as the new staging so incremental syncs
+            // can reuse it. Move the .old contents back into staging's path.
+            if let Err(e) = std::fs::rename(&backup, staging) {
+                // Couldn't preserve old data for staging — just remove the
+                // backup. Next sync starts fresh.
+                tracing::warn!(
+                    backup = %backup.display(),
+                    staging = %staging.display(),
+                    error = %e,
+                    "fallback: failed to recycle old contents as new staging; removing"
+                );
+                let _ = std::fs::remove_dir_all(&backup);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // Try to roll back to keep readers happy.
+            let _ = std::fs::rename(&backup, publish);
+            Err(anyhow::anyhow!("fallback rename failed: {e}"))
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Probe a single rsync URL for reachability.
 ///
@@ -680,16 +876,17 @@ mod upstream_probe_tests {
 
 #[cfg(test)]
 mod atomic_publish_tests {
-    //! Tests for the atomic-publish staging-directory rename logic.
+    //! Tests for the atomic-publish helpers.
     //!
-    //! We exercise the rename path directly by building a provider with
-    //! atomic_publish_enabled=true and calling run() on a tempdir that
-    //! already contains a .staging subdirectory with known contents.
+    //! Unlike the previous tests which inlined the rename logic (so they
+    //! tested copy-pasted code rather than the product), these call the
+    //! production helpers directly via the `pub(crate)` exports.
 
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     use crate::config::{GlobalConfig, MirrorConfig, ProviderKind};
+    use crate::provider::MirrorProvider;
 
     /// Build a minimal RsyncProvider pointing at a tempdir.
     fn make_atomic_provider(working_dir: PathBuf) -> super::RsyncProvider {
@@ -701,112 +898,110 @@ mod atomic_publish_tests {
             atomic_publish: true,
             ..MirrorConfig::default()
         };
-        // Override the mirror dir by constructing manually after from_config.
         let mut p = super::RsyncProvider::from_config(&mc, &global).expect("from_config");
         p.working_dir = working_dir;
-        // Silence log output by pointing log to /dev/null.
         p.log_path_shared = Arc::new(Mutex::new(PathBuf::from("/dev/null")));
         p
     }
 
-    /// After a successful rsync-into-staging the staging dir is renamed into
-    /// the publish dir.  We pre-populate the staging dir (sibling of publish
-    /// dir) and run the rename logic, then check the result.
+    /// `atomic_staging_path_for` must place staging under log_dir/staging/<name>,
+    /// NOT inside the mirror tree (which would be served by nginx).
     #[test]
-    fn staging_rename_puts_file_in_publish_dir() {
-        let base = tempfile::tempdir().expect("tempdir");
-        let publish_dir = base.path().join("mirror");
-        // Staging is a sibling of publish_dir, not a child.
-        let staging = base.path().join(".staging-atomic-test");
-        std::fs::create_dir_all(&staging).unwrap();
-        std::fs::write(staging.join("file.txt"), b"hello").unwrap();
-
-        // Simulate the post-rsync rename block from RsyncProvider::run().
-        let backup = {
-            let mut b = publish_dir.clone();
-            let name = b
-                .file_name()
-                .map(|n| {
-                    let mut s = n.to_os_string();
-                    s.push(".old");
-                    s
-                })
-                .unwrap_or_else(|| std::ffi::OsString::from("mirror.old"));
-            b.set_file_name(name);
-            b
-        };
-        if publish_dir.exists() {
-            std::fs::rename(&publish_dir, &backup).unwrap();
-        }
-        std::fs::rename(&staging, &publish_dir).unwrap();
-        if backup.exists() {
-            let _ = std::fs::remove_dir_all(&backup);
-        }
-
-        // Verify the file is now in the publish dir.
-        assert!(
-            publish_dir.join("file.txt").exists(),
-            "file.txt should be in publish_dir after atomic rename"
-        );
-        // Staging must not exist any more.
-        assert!(
-            !staging.exists(),
-            "staging dir should have been renamed away"
-        );
+    fn staging_path_is_outside_mirror_tree() {
+        let log_dir = std::path::Path::new("/var/log/tunasync");
+        let path = super::atomic_staging_path_for(log_dir, "fedora");
+        assert_eq!(path, PathBuf::from("/var/log/tunasync/staging/fedora"));
+        // Crucially: it does NOT start with the public mirror prefix.
+        assert!(!path.starts_with("/srv/mirrors"));
     }
 
-    /// When publish_dir already exists it is first renamed to .old then
-    /// replaced — the old content must be gone after the rename cycle.
+    /// First-time publish (publish dir does not exist) works via the simple
+    /// rename branch and recreates a fresh staging dir afterwards.
     #[test]
-    fn staging_rename_replaces_existing_publish_dir() {
+    fn first_time_publish_renames_and_recreates_staging() {
         let base = tempfile::tempdir().expect("tempdir");
-        let publish_dir = base.path().join("mirror");
-        // Pre-populate the publish dir with old content.
-        std::fs::create_dir_all(&publish_dir).unwrap();
-        std::fs::write(publish_dir.join("old.txt"), b"old").unwrap();
+        let staging = base.path().join("staging");
+        let publish = base.path().join("publish");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("file.txt"), b"v1").unwrap();
+        // publish does NOT exist yet.
 
-        let staging = base.path().join(".staging-atomic-test");
+        super::atomic_publish_swap(&staging, &publish).expect("swap should succeed");
+
+        assert!(
+            publish.join("file.txt").exists(),
+            "publish has the new file"
+        );
+        assert_eq!(
+            std::fs::read(publish.join("file.txt")).unwrap(),
+            b"v1",
+            "file content preserved"
+        );
+        assert!(staging.exists(), "staging is recreated for next sync");
+    }
+
+    /// Subsequent publish (both exist) swaps atomically: publish gets the
+    /// new contents, staging gets the old contents (kept for next sync's
+    /// incremental rsync benefit).
+    #[test]
+    fn subsequent_publish_swaps_contents() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let staging = base.path().join("staging");
+        let publish = base.path().join("publish");
+
         std::fs::create_dir_all(&staging).unwrap();
         std::fs::write(staging.join("new.txt"), b"new").unwrap();
 
-        let backup = {
-            let mut b = publish_dir.clone();
-            let name = b
-                .file_name()
-                .map(|n| {
-                    let mut s = n.to_os_string();
-                    s.push(".old");
-                    s
-                })
-                .unwrap_or_else(|| std::ffi::OsString::from("mirror.old"));
-            b.set_file_name(name);
-            b
-        };
-        if publish_dir.exists() {
-            std::fs::rename(&publish_dir, &backup).unwrap();
-        }
-        std::fs::rename(&staging, &publish_dir).unwrap();
-        if backup.exists() {
-            let _ = std::fs::remove_dir_all(&backup);
-        }
+        std::fs::create_dir_all(&publish).unwrap();
+        std::fs::write(publish.join("old.txt"), b"old").unwrap();
 
+        super::atomic_publish_swap(&staging, &publish).expect("swap should succeed");
+
+        // After swap: publish has the new file, staging has the old file.
+        assert!(publish.join("new.txt").exists(), "new lives in publish");
+        assert!(!publish.join("old.txt").exists(), "old not in publish");
         assert!(
-            publish_dir.join("new.txt").exists(),
-            "new.txt should be present"
+            staging.join("old.txt").exists(),
+            "old recycled into staging"
         );
-        assert!(
-            !publish_dir.join("old.txt").exists(),
-            "old.txt should be gone"
-        );
-        // Backup dir must be cleaned up.
-        assert!(!backup.exists(), "backup dir should have been removed");
+        assert!(!staging.join("new.txt").exists(), "new not in staging");
+    }
+
+    /// `ensure_atomic_publish_dirs` creates staging if absent and cleans up
+    /// stale .old leftovers from the legacy two-step rename pattern.
+    #[test]
+    fn ensure_dirs_creates_staging_and_cleans_stale_backup() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let staging = base.path().join("logs/staging/mymirror");
+        let publish = base.path().join("mirrors/mymirror");
+        std::fs::create_dir_all(&publish).unwrap();
+
+        // Pretend a legacy run left behind a .old backup.
+        let backup = base.path().join("mirrors/mymirror.old");
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(backup.join("garbage"), b"x").unwrap();
+
+        super::ensure_atomic_publish_dirs(&staging, &publish).expect("must succeed");
+
+        assert!(staging.exists(), "staging created");
+        assert!(!backup.exists(), "stale backup removed");
+    }
+
+    /// nearest_existing should walk up the tree to find an ancestor that
+    /// exists, even when the leaf path is many levels deep and missing.
+    #[test]
+    fn nearest_existing_walks_up_missing_path() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let deep = base.path().join("a/b/c/d/leaf");
+        // None of a/b/c/d exist.
+        let found = super::nearest_existing(&deep).expect("ancestor must exist");
+        // base.path() itself exists, and is one of the ancestors.
+        assert!(deep.starts_with(&found));
     }
 
     /// atomic_publish() trait accessor must reflect the config field.
     #[test]
     fn atomic_publish_accessor() {
-        use crate::provider::MirrorProvider;
-
         let base = tempfile::tempdir().expect("tempdir");
         let p = make_atomic_provider(base.path().to_path_buf());
         assert!(p.atomic_publish(), "accessor must return true when enabled");
