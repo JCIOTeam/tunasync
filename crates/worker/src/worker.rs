@@ -496,40 +496,54 @@ impl Worker {
                     // `stime := m.LastUpdate.Add(job.provider.Interval())`.
                     // If last_update is zero (never synced) or next_run is in the
                     // past the job fires immediately.
+                    //
+                    // We also compute the corresponding UTC DateTime (next_dt)
+                    // and write it to `mirror_statuses.scheduled` so the
+                    // manager UI shows a real upcoming time instead of
+                    // 0001-01-01T00:00:00Z until the first sync completes.
                     let job_cfg = self.cfg.mirrors.iter().find(|m| m.name == status.name);
 
-                    let next_run = if let Some(mc) = job_cfg {
+                    let now_instant = Instant::now();
+                    let now_utc = Utc::now();
+                    let (next_run, next_dt) = if let Some(mc) = job_cfg {
                         if !mc.cron.is_empty() {
                             // Cron: ignore last_update and compute the next tick.
                             let cached = self.crons_by_mirror.get(&mc.name);
-                            let (inst, _) = next_run_for(mc, &self.cfg.global, cached);
-                            inst
+                            next_run_for(mc, &self.cfg.global, cached)
                         } else {
                             // Interval: last_update + interval, clamped to now.
                             let interval = mc.effective_interval(&self.cfg.global);
+                            let interval_chrono = chrono::Duration::from_std(interval)
+                                .unwrap_or(chrono::Duration::seconds(3600));
                             if tunasync_protocol::is_zero_time(&status.last_update) {
-                                Instant::now()
+                                // Never synced — fire immediately, "scheduled at" = now.
+                                (now_instant, now_utc)
                             } else {
-                                let next_utc = status.last_update
-                                    + chrono::Duration::from_std(interval)
-                                        .unwrap_or(chrono::Duration::seconds(3600));
-                                let now_utc = Utc::now();
+                                let next_utc = status.last_update + interval_chrono;
                                 if next_utc <= now_utc {
-                                    Instant::now()
+                                    (now_instant, next_utc)
                                 } else {
-                                    let delay =
-                                        (next_utc - now_utc).to_std().unwrap_or(Duration::ZERO);
-                                    Instant::now() + delay
+                                    let delay = (next_utc - now_utc)
+                                        .to_std()
+                                        .unwrap_or(Duration::ZERO);
+                                    (now_instant + delay, next_utc)
                                 }
                             }
                         }
                     } else {
-                        Instant::now()
+                        (now_instant, now_utc)
                     };
+
+                    // Persist the scheduled time so it's visible on
+                    // /workers/:id/jobs and propagates to manager.
+                    if let Some(entry) = self.mirror_statuses.get_mut(&status.name) {
+                        entry.scheduled = next_dt;
+                    }
 
                     tracing::info!(
                         mirror = %status.name,
                         next_run_secs = next_run.saturating_duration_since(Instant::now()).as_secs(),
+                        scheduled = %next_dt,
                         "scheduled (from last_update)"
                     );
                     self.schedule.push(status.name.clone(), next_run);
@@ -547,6 +561,10 @@ impl Worker {
         // for immediate run, matching Go's `w.schedule.AddJob(time.Now(), job)`.
         for name in &unseen {
             tracing::info!(mirror = %name, "new mirror (not in manager) — scheduling immediately");
+            let now = Utc::now();
+            if let Some(entry) = self.mirror_statuses.get_mut(name) {
+                entry.scheduled = now;
+            }
             self.schedule.push(name.clone(), Instant::now());
         }
     }
@@ -931,11 +949,26 @@ impl Worker {
                     self.jobs.remove(name);
                     self.mirror_statuses.remove(name);
                     self.schedule.remove(name);
+                    // ALSO remove from cfg.mirrors. Without this, the next
+                    // hot-reload's diff_mirror_config compares the new TOML
+                    // against a stale list still containing the deleted
+                    // mirror, generating spurious diffs and (for re-added
+                    // mirrors with the same name) misclassifying Add as
+                    // Modify with a stale provider config.
+                    self.cfg.mirrors.retain(|m| &m.name != name);
                     tracing::info!(mirror = %name, "hot-reload: deleted job");
                 }
                 DiffOp::Modify => {
                     // Remember the old job's state so we can preserve it.
                     let old_state = self.jobs.get(name).map(|j| j.state());
+
+                    // Preserve historical telemetry (last_update, size,
+                    // last_started, last_ended, transferred_bytes counters)
+                    // so a cosmetic config change (e.g. tweaking interval)
+                    // doesn't wipe a long-running mirror's record. Only
+                    // the fields that are computed from the new provider
+                    // — upstream, is_master — are refreshed below.
+                    let preserved = self.mirror_statuses.get(name).cloned();
 
                     // Disable and remove the old job.
                     if let Some(job) = self.jobs.get(name) {
@@ -959,16 +992,31 @@ impl Worker {
                             let upstream = provider.upstream().to_owned();
                             let is_master = provider.is_master();
 
-                            self.mirror_statuses.insert(
-                                name.clone(),
+                            // Merge preserved telemetry with the new
+                            // provider-derived fields. If there was no
+                            // previous status (Modify applied to a mirror
+                            // that wasn't in our map for some reason — e.g.
+                            // first-time reload before initial status report),
+                            // fall back to a zero-value status.
+                            let merged = if let Some(mut prev) = preserved {
+                                prev.upstream = upstream;
+                                prev.is_master = is_master;
+                                // Name and worker are immutable identifiers
+                                // — keep them. Everything else (status,
+                                // last_*, size, error_msg, scheduled,
+                                // transferred_bytes, consecutive_failures,
+                                // stale) is preserved as-is.
+                                prev
+                            } else {
                                 MirrorStatus {
                                     name: name.clone(),
                                     worker: self.cfg.global.name.clone(),
                                     is_master,
                                     upstream,
                                     ..Default::default()
-                                },
-                            );
+                                }
+                            };
+                            self.mirror_statuses.insert(name.clone(), merged);
 
                             let upstream_sem2 = upstream_host(provider.upstream())
                                 .and_then(|h| self.per_upstream_semaphores.get(&h).cloned());
@@ -1641,5 +1689,83 @@ mod cron_schedule_tests {
         let cache = super::build_timezone_cache(&[a, b], &global);
         assert_eq!(cache["a"], chrono_tz::Asia::Tokyo);
         assert_eq!(cache["b"], chrono_tz::UTC);
+    }
+
+    // ── Hot-reload Modify must preserve historical telemetry ───────────────
+
+    /// Simulate the merge logic from the Modify branch of handle_reload.
+    /// A cosmetic config change (e.g. tweaking `interval`) must not wipe
+    /// last_update, size, transferred_bytes, etc.
+    #[test]
+    fn hot_reload_modify_preserves_telemetry() {
+        use tunasync_protocol::{MirrorStatus, SyncStatus};
+
+        // The "previous" status — populated by N successful syncs.
+        let prev = MirrorStatus {
+            name: "ubuntu".into(),
+            worker: "w1".into(),
+            is_master: true,
+            upstream: "rsync://old-upstream/".into(),
+            status: SyncStatus::Success,
+            last_update: chrono::Utc::now() - chrono::Duration::hours(2),
+            last_started: chrono::Utc::now() - chrono::Duration::hours(3),
+            last_ended: chrono::Utc::now() - chrono::Duration::hours(2),
+            size: "120G".into(),
+            last_transferred_bytes: 5_368_709_120, // 5 GiB
+            total_transferred_bytes: 100_000_000_000, // 100 GB cumulative
+            consecutive_failures: 0,
+            stale: false,
+            ..Default::default()
+        };
+
+        // The new provider's upstream changed (mirror config edited).
+        let new_upstream = "rsync://new-upstream/".to_string();
+        let new_is_master = true;
+
+        // Apply the same merge logic the Modify branch uses.
+        let mut merged = prev.clone();
+        merged.upstream = new_upstream.clone();
+        merged.is_master = new_is_master;
+
+        // Identity preserved.
+        assert_eq!(merged.name, "ubuntu");
+        assert_eq!(merged.worker, "w1");
+        // Provider-derived fields refreshed.
+        assert_eq!(merged.upstream, new_upstream);
+        // Telemetry preserved.
+        assert_eq!(merged.status, SyncStatus::Success);
+        assert_eq!(merged.size, "120G");
+        assert_eq!(merged.last_transferred_bytes, 5_368_709_120);
+        assert_eq!(merged.total_transferred_bytes, 100_000_000_000);
+        assert_eq!(merged.last_update, prev.last_update);
+        assert_eq!(merged.last_started, prev.last_started);
+        assert_eq!(merged.last_ended, prev.last_ended);
+    }
+
+    /// Hot-reload Delete must also remove the mirror from cfg.mirrors;
+    /// otherwise the *next* hot-reload's diff is computed against stale data.
+    #[test]
+    fn hot_reload_delete_clears_cfg_mirrors() {
+        // Build a mock cfg with two mirrors, then simulate the Delete branch.
+        let mut cfg_mirrors: Vec<MirrorConfig> = vec![
+            {
+                let mut m = MirrorConfig::default();
+                m.name = "keep".into();
+                m
+            },
+            {
+                let mut m = MirrorConfig::default();
+                m.name = "delete".into();
+                m
+            },
+        ];
+
+        // Same retain() call the Delete branch performs.
+        let name = "delete".to_string();
+        cfg_mirrors.retain(|m| m.name != name);
+
+        assert_eq!(cfg_mirrors.len(), 1);
+        assert_eq!(cfg_mirrors[0].name, "keep");
+        assert!(!cfg_mirrors.iter().any(|m| m.name == "delete"));
     }
 }
