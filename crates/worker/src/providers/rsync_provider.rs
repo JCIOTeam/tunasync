@@ -594,22 +594,27 @@ pub(crate) fn atomic_publish_swap(
 
     // Both exist — do an atomic exchange via renameat2.
     //
-    // Constants: AT_FDCWD = -100 on Linux/glibc; RENAME_EXCHANGE = 2.
-    // We invoke the syscall directly because libc on some targets does
-    // not export `renameat2`.
+    // We go through `libc::syscall` rather than a higher-level wrapper because
+    // libc doesn't expose a Rust-level `renameat2` function — only the syscall
+    // number constant `libc::SYS_renameat2`. That constant is per-target so
+    // we get the correct number on x86_64, aarch64, riscv64, etc. without any
+    // arch-specific `cfg`. Hard-coding the x86_64 value (316) here was a real
+    // portability bug: on aarch64 syscall 316 is `pkey_mprotect`, not
+    // `renameat2`, and would silently misbehave on Apple Silicon, AWS
+    // Graviton, Raspberry Pi, and other ARM mirror hosts.
     let c_staging = CString::new(staging.as_os_str().as_bytes())
         .map_err(|e| anyhow::anyhow!("staging path contains NUL: {e}"))?;
     let c_publish = CString::new(publish.as_os_str().as_bytes())
         .map_err(|e| anyhow::anyhow!("publish path contains NUL: {e}"))?;
-    const SYS_RENAMEAT2: libc::c_long = 316; // x86_64
     #[allow(clippy::useless_conversion)]
     const RENAME_EXCHANGE: libc::c_uint = 2;
     // SAFETY: we hold valid C strings, AT_FDCWD is the canonical "current
     // working directory" sentinel, RENAME_EXCHANGE is a valid flag for
-    // renameat2(2). On error we read errno and convert to a Rust error.
+    // renameat2(2). `libc::SYS_renameat2` is the architecture-correct syscall
+    // number provided by the libc crate. On error we read errno and convert.
     let ret = unsafe {
         libc::syscall(
-            SYS_RENAMEAT2,
+            libc::SYS_renameat2,
             libc::AT_FDCWD,
             c_staging.as_ptr(),
             libc::AT_FDCWD,
