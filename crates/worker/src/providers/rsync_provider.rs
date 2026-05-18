@@ -730,15 +730,60 @@ pub(crate) async fn probe_rsync_url(url: &str) -> anyhow::Result<()> {
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn rsync probe: {e}"))?;
 
+    // Drain stderr concurrently with wait().
+    //
+    // Without this, rsync writing more than the OS pipe buffer (64 KiB on
+    // Linux) blocks on write(2). The child can't exit because its stderr
+    // is full; child.wait() blocks because the child hasn't exited. The
+    // outer 15s timeout would eventually fire and kill the process, but
+    // we'd wait the full 15s on what should be a 1s failure (e.g. a
+    // verbose --list-only on a huge module printing thousands of lines).
+    //
+    // Spawn a background drain task so the pipe is read continuously.
+    // The take() removes stderr from the Child so we own it independently
+    // of child.wait(); the drain task ends when EOF arrives (i.e. when
+    // rsync closes its stderr, which happens on exit).
+    use tokio::io::AsyncReadExt;
+    let stderr_drain = child.stderr.take().map(|mut s| {
+        tokio::spawn(async move {
+            let mut buf = Vec::with_capacity(4096);
+            let _ = s.read_to_end(&mut buf).await;
+            buf
+        })
+    });
+
     let status = child
         .wait()
         .await
         .map_err(|e| anyhow::anyhow!("failed to wait for rsync probe: {e}"))?;
+
+    // Best-effort: wait briefly for the drain task so we can include a
+    // stderr excerpt in the error message. Don't block forever — the
+    // process has already exited at this point, the pipe should EOF
+    // almost immediately.
+    let stderr_excerpt = if let Some(handle) = stderr_drain {
+        tokio::time::timeout(std::time::Duration::from_millis(500), handle)
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .map(|bytes| {
+                let s = String::from_utf8_lossy(&bytes);
+                s.lines().next().unwrap_or("").to_string()
+            })
+    } else {
+        None
+    };
+
     if status.success() {
         return Ok(());
     }
     let code = status.code().unwrap_or(-1);
-    anyhow::bail!("rsync probe exited {code} for {url}")
+    match stderr_excerpt {
+        Some(line) if !line.is_empty() => {
+            anyhow::bail!("rsync probe exited {code} for {url}: {line}")
+        }
+        _ => anyhow::bail!("rsync probe exited {code} for {url}"),
+    }
 }
 
 impl RsyncProvider {
