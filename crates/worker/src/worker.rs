@@ -1518,9 +1518,8 @@ mod cron_schedule_tests {
         let mut sems: HashMap<String, Arc<Semaphore>> = HashMap::new();
         sems.insert("removed-host".into(), Arc::new(Semaphore::new(2)));
 
-        let old_limits: HashMap<String, usize> = [("removed-host".to_string(), 2usize)]
-            .into_iter()
-            .collect();
+        let old_limits: HashMap<String, usize> =
+            [("removed-host".to_string(), 2usize)].into_iter().collect();
         let new_limits: HashMap<String, usize> = HashMap::new();
 
         let removed: Vec<String> = old_limits

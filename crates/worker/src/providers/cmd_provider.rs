@@ -506,7 +506,10 @@ mod tests {
         mc.atomic_publish = true;
         let p = super::CmdProvider::from_config(&mc, &global).expect("from_config");
         let p: &dyn MirrorProvider = &p;
-        assert!(p.atomic_publish(), "atomic_publish must be true after config");
+        assert!(
+            p.atomic_publish(),
+            "atomic_publish must be true after config"
+        );
     }
 
     /// When check_upstream is false (default), probe_upstream must be a
