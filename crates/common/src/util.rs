@@ -131,8 +131,12 @@ pub fn parse_size_bytes(s: &str) -> Option<u64> {
 /// Supports: "48h", "2d", "7d", "1d12h", "30m", "3600s".
 /// Returns `None` on parse failure.
 pub fn parse_duration_secs(s: &str) -> Option<u64> {
+    // Match a full duration string from start to end. Without the `^`
+    // anchor the regex would accept e.g. "about 48h" (matching just the
+    // "48h" suffix) and silently produce a wrong value. We want strict
+    // parsing: only well-formed all-digit-plus-unit input is valid.
     static RE: Lazy<regex::Regex> = Lazy::new(|| {
-        regex::Regex::new(r"(?i)(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$")
+        regex::Regex::new(r"(?i)^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$")
             .expect("static regex")
     });
     let s = s.trim();
@@ -260,6 +264,21 @@ mod tests {
         assert_eq!(parse_duration_secs("30m"), Some(30 * 60));
         assert_eq!(parse_duration_secs("3600s"), Some(3600));
         assert!(parse_duration_secs("").is_none());
+    }
+
+    /// Reject inputs with junk *before* the duration. The original regex
+    /// lacked a `^` anchor and silently accepted "about 48h" as 48h, which
+    /// makes typos like "stale_after = '~48h'" or "max_age = 'about 48h'"
+    /// produce a wrong value rather than a config error.
+    #[test]
+    fn parse_duration_rejects_unanchored_prefix() {
+        assert!(parse_duration_secs("about 48h").is_none());
+        assert!(parse_duration_secs("~48h").is_none());
+        assert!(parse_duration_secs("foo48h").is_none());
+        assert!(parse_duration_secs(" 48h").is_some()); // trim() handles leading WS
+        assert!(parse_duration_secs("48h ").is_some()); // trim() handles trailing WS
+        assert!(parse_duration_secs("48 h").is_none()); // internal space rejected
+        assert!(parse_duration_secs("48h junk").is_none());
     }
 
     #[test]
