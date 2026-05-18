@@ -166,10 +166,20 @@ impl CgroupHook {
             job_path.join("tasks")
         };
 
+        // Up to 4 attempts: read the procs list, SIGKILL anyone in it, sleep
+        // and re-check. Order of checks matters:
+        //
+        //   1. Read the procs file. If the file vanished (cgroup deleted from
+        //      under us by another component), we're done — Ok.
+        //   2. If the list is empty, we're done — Ok. THIS MUST HAPPEN BEFORE
+        //      the attempt-cap check below: it's perfectly legitimate for a
+        //      previous attempt's SIGKILL to have cleaned everything up and
+        //      this final read to confirm "yes, empty now". Bailing here would
+        //      be a false-positive failure on a successful cleanup.
+        //   3. Only after seeing non-empty contents do we treat attempt==3 as
+        //      "we tried 3 times and processes are still hanging on" — that's
+        //      a real failure worth bailing on.
         for attempt in 0..4u32 {
-            if attempt == 3 {
-                anyhow::bail!("failed to empty cgroup after 3 kill rounds");
-            }
             let content = match fs::read_to_string(&procs_file) {
                 Ok(c) => c,
                 Err(_) => return Ok(()),
@@ -180,6 +190,12 @@ impl CgroupHook {
                 .collect();
             if pids.is_empty() {
                 return Ok(());
+            }
+            if attempt == 3 {
+                anyhow::bail!(
+                    "failed to empty cgroup after 3 kill rounds (still {} pids)",
+                    pids.len()
+                );
             }
             for pid in &pids {
                 tracing::debug!(pid, "SIGKILL cgroup process");
