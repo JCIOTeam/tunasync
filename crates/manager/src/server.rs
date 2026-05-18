@@ -160,7 +160,13 @@ async fn list_mirror_by_name(
 }
 
 /// `DELETE /jobs/disabled` — flush all disabled job rows.
+///
+/// Gated by maintenance mode: this is a destructive operator action and must
+/// not be permitted while maintenance is engaged.
 async fn flush_disabled_jobs(State(state): State<Arc<AppState>>) -> Response {
+    if let Some(r) = check_maintenance(&state) {
+        return r;
+    }
     match state.db.flush_disabled_jobs() {
         Err(e) => db_err(e),
         Ok(()) => ok_msg("flushed").into_response(),
@@ -258,9 +264,11 @@ async fn update_job_of_worker(
     Path((worker_id, _job)): Path<(String, String)>,
     Json(mut incoming): Json<MirrorStatus>,
 ) -> Response {
-    if let Some(r) = check_maintenance(&state) {
-        return r;
-    }
+    // Note: this endpoint is NOT gated by maintenance mode. Workers must
+    // continue reporting status updates even while operators are doing
+    // destructive maintenance — otherwise the UI freezes mid-sync and the
+    // worker's local mirror_statuses diverge from the manager's view, with
+    // no way to reconcile after maintenance is disabled.
     if incoming.name.is_empty() {
         return bad_req("mirror Name should not be empty");
     }

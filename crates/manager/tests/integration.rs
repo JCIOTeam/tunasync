@@ -1057,3 +1057,116 @@ async fn mirror_lifecycle_e2e() {
     let (status, _) = delete_req(&app, "/maintenance").await;
     assert_eq!(status, StatusCode::OK, "disable maintenance");
 }
+
+/// Maintenance mode is for stopping destructive *operator* actions, not for
+/// freezing telemetry. Workers must continue to report status, schedules,
+/// size, and heartbeats while operators are doing maintenance — otherwise
+/// the UI freezes and worker state diverges from the manager's view.
+///
+/// Conversely, mutating operator actions (`/cmd`, `/jobs/disabled` flush,
+/// worker deletion) must be blocked.
+#[tokio::test]
+async fn maintenance_blocks_operator_actions_not_worker_telemetry() {
+    let app = make_app();
+    let zero = "0001-01-01T00:00:00Z";
+
+    // Register a worker + mirror so the endpoints have something to act on.
+    let worker = serde_json::json!({
+        "id": "w-maint",
+        "url": "http://127.0.0.1:65500",
+        "token": "",
+        "last_online": zero,
+        "last_register": zero
+    });
+    let (status, _) = post_json(&app, "/workers", &worker).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let first_update = serde_json::json!({
+        "name": "m1",
+        "worker": "w-maint",
+        "is_master": true,
+        "status": "pre-syncing",
+        "last_update": zero,
+        "last_started": zero,
+        "last_ended": zero,
+        "next_schedule": zero,
+        "upstream": "rsync://u/",
+        "size": "",
+        "error_msg": ""
+    });
+    let (status, _) = post_json(&app, "/workers/w-maint/jobs/m1", &first_update).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Enable maintenance.
+    let (status, _) = post_json(&app, "/maintenance", &serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK, "enable maintenance");
+
+    // ─── Worker telemetry must STILL succeed ─────────────────────────────
+
+    // Status update.
+    let now_update = serde_json::json!({
+        "name": "m1",
+        "worker": "w-maint",
+        "is_master": true,
+        "status": "success",
+        "last_update": zero,
+        "last_started": zero,
+        "last_ended": zero,
+        "next_schedule": zero,
+        "upstream": "rsync://u/",
+        "size": "1.2T",
+        "error_msg": ""
+    });
+    let (status, _) = post_json(&app, "/workers/w-maint/jobs/m1", &now_update).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "worker status update must succeed during maintenance"
+    );
+
+    // Heartbeat.
+    let (status, _) = post_json(&app, "/workers/w-maint/heartbeat", &serde_json::json!({})).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "worker heartbeat must succeed during maintenance"
+    );
+
+    // Size update.
+    let size_msg = serde_json::json!({"name": "m1", "size": "1.3T"});
+    let (status, _) = post_json(&app, "/workers/w-maint/jobs/m1/size", &size_msg).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "worker size update must succeed during maintenance"
+    );
+
+    // ─── Destructive operator actions must FAIL ──────────────────────────
+
+    // flush_disabled_jobs — newly gated.
+    let (status, _) = delete_req(&app, "/jobs/disabled").await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "/jobs/disabled flush must be blocked during maintenance"
+    );
+
+    // delete_worker — already gated.
+    let (status, _) = delete_req(&app, "/workers/w-maint").await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "DELETE /workers/:id must be blocked during maintenance"
+    );
+
+    // Disable maintenance and verify operator actions work again.
+    let (status, _) = delete_req(&app, "/maintenance").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = delete_req(&app, "/jobs/disabled").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "/jobs/disabled flush must work again after maintenance disable"
+    );
+}
