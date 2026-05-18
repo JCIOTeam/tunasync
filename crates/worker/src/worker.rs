@@ -1017,6 +1017,90 @@ impl Worker {
             );
         }
 
+        // Apply per-upstream concurrency changes. Mirrors per-mirror
+        // semantics of the global semaphore reload above:
+        //
+        // * New host         → insert a new Semaphore. Visible to subsequent
+        //                      MirrorJob::spawn() calls (including any
+        //                      Modify or Add transitions in this same diff).
+        // * Removed host     → drop the map entry. Currently-running jobs
+        //                      that hold a clone of the old Arc continue to
+        //                      use it until they finish — we cannot revoke a
+        //                      permit that is in active use. Subsequent
+        //                      respawns of those jobs (Modify, restart) will
+        //                      pick up None and run unconstrained.
+        // * Limit increased  → add_permits on the existing Arc, so already-
+        //                      spawned jobs that share the Arc see the new
+        //                      ceiling immediately.
+        // * Limit decreased  → warn. tokio's Semaphore has no
+        //                      `remove_permits` analogue, and silently
+        //                      revoking a permit held by a running sync
+        //                      would deadlock that sync. Operator must
+        //                      restart the worker to shrink.
+        //
+        // Important: read the OLD limits from `self.cfg.global` *before*
+        // we overwrite it with `new_cfg.global` lower down.
+        {
+            let old_limits = &self.cfg.global.per_upstream_concurrent;
+            let new_limits = &new_cfg.global.per_upstream_concurrent;
+
+            // Removed hosts.
+            let removed: Vec<String> = old_limits
+                .keys()
+                .filter(|h| !new_limits.contains_key(*h))
+                .cloned()
+                .collect();
+            for host in &removed {
+                self.per_upstream_semaphores.remove(host);
+                tracing::info!(
+                    host = %host,
+                    "hot-reload: removed per-upstream concurrency limit \
+                     (running jobs keep the old limit until they finish or restart)"
+                );
+            }
+
+            // New / modified hosts.
+            for (host, &new_limit) in new_limits {
+                let new_limit = new_limit.max(1);
+                match old_limits.get(host) {
+                    None => {
+                        self.per_upstream_semaphores
+                            .insert(host.clone(), Arc::new(Semaphore::new(new_limit)));
+                        tracing::info!(
+                            host = %host,
+                            limit = new_limit,
+                            "hot-reload: added per-upstream concurrency limit \
+                             (existing jobs for this host are not retroactively constrained)"
+                        );
+                    }
+                    Some(&old) => {
+                        let old_limit = old.max(1);
+                        if new_limit > old_limit {
+                            let added = new_limit - old_limit;
+                            if let Some(sem) = self.per_upstream_semaphores.get(host) {
+                                sem.add_permits(added);
+                            }
+                            tracing::info!(
+                                host = %host,
+                                from = old_limit,
+                                to = new_limit,
+                                added,
+                                "hot-reload: grew per-upstream concurrency limit"
+                            );
+                        } else if new_limit < old_limit {
+                            tracing::warn!(
+                                host = %host,
+                                from = old_limit,
+                                to = new_limit,
+                                "hot-reload: cannot shrink per-upstream concurrency limit \
+                                 on a running worker — keeping {old_limit} until restart"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // Detect manager-list changes. The ManagerClient was built at startup
         // with a fixed list of base URLs (it does not currently support
         // runtime swap), so we cannot honour this change without a restart.
@@ -1284,5 +1368,108 @@ mod cron_schedule_tests {
     fn parse_cron_lenient_rejects_garbage() {
         assert!(super::parse_cron_lenient("not a cron").is_err());
         assert!(super::parse_cron_lenient("99 99 99 99 99").is_err());
+    }
+
+    /// Direct unit test for the per-upstream-semaphore diff logic.
+    /// We don't run a full Worker — we just exercise the same algorithm
+    /// against synthetic old/new maps to ensure the four cases
+    /// (added / removed / grown / shrunk) take the right code path.
+    #[test]
+    fn per_upstream_hot_reload_diff_logic() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        // Initial state: kernel.org=2, debian.org=3.
+        let mut sems: HashMap<String, Arc<Semaphore>> = HashMap::new();
+        sems.insert("kernel.org".into(), Arc::new(Semaphore::new(2)));
+        sems.insert("debian.org".into(), Arc::new(Semaphore::new(3)));
+        let mut old_limits: HashMap<String, usize> = HashMap::new();
+        old_limits.insert("kernel.org".into(), 2);
+        old_limits.insert("debian.org".into(), 3);
+
+        // New config:
+        // - kernel.org grew 2 → 5
+        // - debian.org SHRUNK 3 → 1 (must NOT actually shrink; warn instead)
+        // - fedora.org is new (limit 4)
+        // - ubuntu.com (not in old map, hence absent in `removed`)
+        // - apache.org was never in either map (no change)
+        // - the absence of any new entry for an old key triggers Remove
+        let mut new_limits: HashMap<String, usize> = HashMap::new();
+        new_limits.insert("kernel.org".into(), 5);
+        new_limits.insert("debian.org".into(), 1);
+        new_limits.insert("fedora.org".into(), 4);
+
+        // Apply the diff (same shape as the hot-reload code).
+        let removed: Vec<String> = old_limits
+            .keys()
+            .filter(|h| !new_limits.contains_key(*h))
+            .cloned()
+            .collect();
+        for host in &removed {
+            sems.remove(host);
+        }
+        for (host, &new_limit) in &new_limits {
+            let new_limit = new_limit.max(1);
+            match old_limits.get(host) {
+                None => {
+                    sems.insert(host.clone(), Arc::new(Semaphore::new(new_limit)));
+                }
+                Some(&old) => {
+                    let old_limit = old.max(1);
+                    if new_limit > old_limit {
+                        if let Some(sem) = sems.get(host) {
+                            sem.add_permits(new_limit - old_limit);
+                        }
+                    }
+                    // shrink case: deliberately don't touch the semaphore.
+                }
+            }
+        }
+
+        // Assertions:
+        // 1. kernel.org grew from 2 to 5 → available permits 5.
+        assert_eq!(sems["kernel.org"].available_permits(), 5);
+        // 2. debian.org tried to shrink 3 → 1: must still hold 3 permits
+        //    (we cannot revoke a permit safely).
+        assert_eq!(sems["debian.org"].available_permits(), 3);
+        // 3. fedora.org is new with 4 permits.
+        assert_eq!(sems["fedora.org"].available_permits(), 4);
+        // 4. apache.org never existed.
+        assert!(!sems.contains_key("apache.org"));
+        // 5. No host was removed in this scenario.
+        assert!(removed.is_empty());
+        assert_eq!(sems.len(), 3);
+    }
+
+    /// Verify that removing a host from `new_limits` drops it from the map.
+    /// Existing jobs that hold a clone of the Arc keep it alive externally,
+    /// but the worker's lookup map for new spawns no longer contains it.
+    #[test]
+    fn per_upstream_hot_reload_removal() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let mut sems: HashMap<String, Arc<Semaphore>> = HashMap::new();
+        sems.insert("removed-host".into(), Arc::new(Semaphore::new(2)));
+
+        let old_limits: HashMap<String, usize> = [("removed-host".to_string(), 2usize)]
+            .into_iter()
+            .collect();
+        let new_limits: HashMap<String, usize> = HashMap::new();
+
+        let removed: Vec<String> = old_limits
+            .keys()
+            .filter(|h| !new_limits.contains_key(*h))
+            .cloned()
+            .collect();
+        for host in &removed {
+            sems.remove(host);
+        }
+
+        assert_eq!(removed, vec!["removed-host".to_string()]);
+        assert!(!sems.contains_key("removed-host"));
+        assert!(sems.is_empty());
     }
 }
