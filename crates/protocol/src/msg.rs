@@ -320,7 +320,8 @@ mod tests {
 
     #[test]
     fn client_cmd_accepts_null_args_and_options() {
-        let json = r#"{"cmd":"start","mirror_id":"ubuntu","worker_id":"w1","args":null,"options":null}"#;
+        let json =
+            r#"{"cmd":"start","mirror_id":"ubuntu","worker_id":"w1","args":null,"options":null}"#;
         let cmd: ClientCmd = serde_json::from_str(json).expect("null collections must decode");
         assert_eq!(cmd.worker_id, "w1");
         assert!(cmd.args.is_empty());

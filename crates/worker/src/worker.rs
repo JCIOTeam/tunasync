@@ -523,9 +523,8 @@ impl Worker {
                                 if next_utc <= now_utc {
                                     (now_instant, next_utc)
                                 } else {
-                                    let delay = (next_utc - now_utc)
-                                        .to_std()
-                                        .unwrap_or(Duration::ZERO);
+                                    let delay =
+                                        (next_utc - now_utc).to_std().unwrap_or(Duration::ZERO);
                                     (now_instant + delay, next_utc)
                                 }
                             }
@@ -1711,7 +1710,7 @@ mod cron_schedule_tests {
             last_started: chrono::Utc::now() - chrono::Duration::hours(3),
             last_ended: chrono::Utc::now() - chrono::Duration::hours(2),
             size: "120G".into(),
-            last_transferred_bytes: 5_368_709_120, // 5 GiB
+            last_transferred_bytes: 5_368_709_120,    // 5 GiB
             total_transferred_bytes: 100_000_000_000, // 100 GB cumulative
             consecutive_failures: 0,
             stale: false,

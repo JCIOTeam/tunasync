@@ -105,10 +105,7 @@ impl DockerConfig {
                 ]);
             } else if k == "TUNASYNC_WORKING_DIR" {
                 // Override with the active (possibly staging) dir.
-                argv.extend([
-                    "-e".into(),
-                    format!("{k}={}", active_wd.to_string_lossy()),
-                ]);
+                argv.extend(["-e".into(), format!("{k}={}", active_wd.to_string_lossy())]);
             } else {
                 argv.extend(["-e".into(), format!("{k}={v}")]);
             }
@@ -130,11 +127,7 @@ impl DockerConfig {
             ),
         ];
         if working_dir_override.is_some() && active_wd != self.working_dir {
-            runtime_vols.push(format!(
-                "{}:{}",
-                active_wd.display(),
-                active_wd.display()
-            ));
+            runtime_vols.push(format!("{}:{}", active_wd.display(), active_wd.display()));
         }
         for vol in &runtime_vols {
             argv.extend(["-v".into(), vol.clone()]);
@@ -308,10 +301,7 @@ mod tests {
             "TUNASYNC_WORKING_DIR".to_string(),
             "/srv/mirrors/debian".to_string(),
         );
-        env.insert(
-            "TUNASYNC_MIRROR_NAME".to_string(),
-            "debian".to_string(),
-        );
+        env.insert("TUNASYNC_MIRROR_NAME".to_string(), "debian".to_string());
         DockerConfig {
             mirror_name: "debian".into(),
             image: "rsync:latest".into(),
