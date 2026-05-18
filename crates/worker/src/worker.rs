@@ -747,6 +747,9 @@ impl Worker {
             status_entry.status = msg.status;
             status_entry.error_msg = msg.msg.clone();
         }
+        // Propagate the skip hint so the manager can decide not to increment
+        // consecutive_failures. Cleared (false) for all normal messages.
+        status_entry.skip_failure_count = msg.skip_sync;
         if !msg.size.is_empty() {
             status_entry.size = msg.size.clone();
         }

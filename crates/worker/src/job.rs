@@ -91,6 +91,15 @@ pub struct JobMessage {
     pub size: String,
     /// Bytes transferred during this sync (0 = unknown).
     pub transferred_bytes: u64,
+    /// True when the sync was intentionally *skipped* rather than attempted
+    /// and failed. Used by disk-quota pre-checks and upstream-probe failures.
+    ///
+    /// A skipped sync is reported as `SyncStatus::Failed` on the wire so the
+    /// manager UI shows a visible reason, but it MUST NOT increment
+    /// `consecutive_failures` — a full disk or unreachable upstream is not an
+    /// indication that the mirror's sync logic is broken, and we don't want
+    /// operators paged at 02:00 because disk was full for 10 intervals.
+    pub skip_sync: bool,
 }
 
 // MirrorJob
@@ -316,6 +325,7 @@ async fn run_job_task(
                 schedule,
                 size: String::new(),
                 transferred_bytes: 0,
+                skip_sync: false,
             })
             .await;
 
@@ -365,6 +375,7 @@ async fn run_sync_with_retry(
                         schedule: true,
                         size: String::new(),
                         transferred_bytes: 0,
+                        skip_sync: true,
                     })
                     .await;
                 return false;
@@ -384,6 +395,7 @@ async fn run_sync_with_retry(
                 schedule: true,
                 size: String::new(),
                 transferred_bytes: 0,
+                skip_sync: true,
             })
             .await;
         return false;
@@ -398,6 +410,7 @@ async fn run_sync_with_retry(
             schedule: false,
             size: String::new(),
             transferred_bytes: 0,
+            skip_sync: false,
         })
         .await;
     set_state(state, JobState::Ready);
@@ -476,6 +489,7 @@ async fn run_sync_with_retry(
                 schedule: false,
                 size: String::new(),
                 transferred_bytes: 0,
+                skip_sync: false,
             })
             .await;
 
@@ -579,6 +593,7 @@ async fn run_sync_with_retry(
                 schedule: false,
                 size,
                 transferred_bytes: transferred,
+                skip_sync: false,
             })
             .await;
     } else if post_exec_ok {
@@ -593,6 +608,7 @@ async fn run_sync_with_retry(
                 schedule: true,
                 size: String::new(),
                 transferred_bytes: 0,
+                skip_sync: false,
             })
             .await;
     }
@@ -632,6 +648,7 @@ async fn run_hooks(
                     schedule: true,
                     size: String::new(),
                     transferred_bytes: 0,
+                    skip_sync: false,
                 })
                 .await;
             return Err(());
@@ -732,6 +749,8 @@ mod disk_quota_tests {
 
     /// When quota > available space the sync is skipped: exactly one Failed
     /// message with "disk quota" in the body; no PreSyncing is sent.
+    /// The message carries skip_sync=true so the manager will NOT increment
+    /// consecutive_failures.
     #[tokio::test]
     async fn quota_exceeded_sends_failed_and_skips() {
         let provider = QuotaStubProvider {
@@ -749,6 +768,10 @@ mod disk_quota_tests {
             msg.msg
         );
         assert!(msg.schedule, "schedule must be true so mirror stays Ready");
+        assert!(
+            msg.skip_sync,
+            "quota skip must carry skip_sync=true so manager doesn't increment consecutive_failures"
+        );
     }
 
     /// When quota == 0 (disabled) the pre-check is skipped and the sync

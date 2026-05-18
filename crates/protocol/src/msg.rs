@@ -92,6 +92,17 @@ pub struct MirrorStatus {
     /// the configured `stale_after`. Cleared automatically on next Success.
     #[serde(default, skip_serializing_if = "crate::is_default")]
     pub stale: bool,
+
+    /// Transient hint from worker to manager: this `Failed` status was an
+    /// intentional *skip* (disk quota exceeded, upstream unreachable) rather
+    /// than an actual sync attempt that went wrong. When true the manager
+    /// MUST NOT increment `consecutive_failures` — a full disk or a
+    /// temporarily-unreachable upstream should never page on-call.
+    ///
+    /// Absent in Go-originated messages (Go has no quota/probe features) and
+    /// absent in persisted records (it is never stored — cleared on read-back).
+    #[serde(default, skip_serializing_if = "crate::is_default")]
+    pub skip_failure_count: bool,
 }
 
 impl Default for MirrorStatus {
@@ -115,6 +126,7 @@ impl Default for MirrorStatus {
             total_transferred_bytes: 0,
             consecutive_failures: 0,
             stale: false,
+            skip_failure_count: false,
         }
     }
 }

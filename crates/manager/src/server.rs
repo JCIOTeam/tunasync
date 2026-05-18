@@ -336,21 +336,31 @@ async fn update_job_of_worker(
     // Consecutive failures + stale tracking.
     match incoming.status {
         SyncStatus::Failed => {
-            incoming.consecutive_failures = cur.consecutive_failures + 1;
+            // A skipped sync (disk quota exceeded, upstream unreachable) is
+            // reported as Failed so the UI shows a reason, but it must NOT
+            // count as a failure for alerting purposes. Only a genuine sync
+            // attempt that went wrong should accumulate the counter.
+            if incoming.skip_failure_count {
+                incoming.consecutive_failures = cur.consecutive_failures;
+            } else {
+                incoming.consecutive_failures = cur.consecutive_failures + 1;
+            }
             incoming.stale = cur.stale; // preserve stale flag
 
             // Webhook: alert on consecutive failure threshold.
             let threshold = state.notify.alert_after_failures;
             if threshold > 0 && incoming.consecutive_failures == threshold {
                 let url = state.notify.webhook_url.clone();
-                let client = state.http_client.clone();
-                let text = format!(
-                    "⚠️ Mirror {} on worker {} has failed {} consecutive times. Last error: {}",
-                    incoming.name, worker_id, incoming.consecutive_failures, incoming.error_msg
-                );
-                tokio::spawn(async move {
-                    crate::webhook::send(&client, &url, &text).await;
-                });
+                if !url.is_empty() {
+                    let client = state.http_client.clone();
+                    let text = format!(
+                        "⚠️ Mirror {} on worker {} has failed {} consecutive times. Last error: {}",
+                        incoming.name, worker_id, incoming.consecutive_failures, incoming.error_msg
+                    );
+                    tokio::spawn(async move {
+                        crate::webhook::send(&client, &url, &text).await;
+                    });
+                }
             }
         }
         SyncStatus::Success => {

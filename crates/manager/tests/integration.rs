@@ -1170,3 +1170,69 @@ async fn maintenance_blocks_operator_actions_not_worker_telemetry() {
         "/jobs/disabled flush must work again after maintenance disable"
     );
 }
+
+/// skip_failure_count=true in a Failed status MUST NOT increment
+/// consecutive_failures. This prevents a full disk or unreachable upstream
+/// from eventually paging on-call just because the condition persisted.
+#[tokio::test]
+async fn skip_failure_count_does_not_increment_consecutive_failures() {
+    let app = make_app();
+    let zero = "0001-01-01T00:00:00Z";
+
+    let worker = serde_json::json!({
+        "id": "w-skip",
+        "url": "http://127.0.0.1:65501",
+        "token": "",
+        "last_online": zero,
+        "last_register": zero
+    });
+    post_json(&app, "/workers", &worker).await;
+
+    // Helper: report a status update.
+    let report = |skip: bool, consecutive: u32| {
+        serde_json::json!({
+            "name": "skip-test",
+            "worker": "w-skip",
+            "is_master": true,
+            "status": "failed",
+            "last_update": zero,
+            "last_started": zero,
+            "last_ended": zero,
+            "next_schedule": zero,
+            "upstream": "rsync://u/",
+            "size": "",
+            "error_msg": "disk quota: only 0 bytes available, need 1073741824",
+            "skip_failure_count": skip,
+            "consecutive_failures": consecutive,
+        })
+    };
+
+    // Report 5 skipped failures.
+    for _ in 0..5 {
+        let (status, _) = post_json(&app, "/workers/w-skip/jobs/skip-test", &report(true, 0)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // consecutive_failures must still be 0.
+    let (_, body) = get_json(&app, "/workers/w-skip/jobs").await;
+    let jobs: Vec<serde_json::Value> = serde_json::from_value(body).unwrap();
+    let mirror = jobs.iter().find(|j| j["name"] == "skip-test").unwrap();
+    assert_eq!(
+        mirror["consecutive_failures"].as_u64().unwrap_or(0),
+        0,
+        "skip_failure_count=true must not increment consecutive_failures"
+    );
+
+    // Now report a real failure (skip=false).
+    let (status, _) = post_json(&app, "/workers/w-skip/jobs/skip-test", &report(false, 0)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, body) = get_json(&app, "/workers/w-skip/jobs").await;
+    let jobs: Vec<serde_json::Value> = serde_json::from_value(body).unwrap();
+    let mirror = jobs.iter().find(|j| j["name"] == "skip-test").unwrap();
+    assert_eq!(
+        mirror["consecutive_failures"].as_u64().unwrap_or(0),
+        1,
+        "skip_failure_count=false (real failure) must increment consecutive_failures"
+    );
+}
