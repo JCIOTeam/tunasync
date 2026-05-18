@@ -451,3 +451,118 @@ async fn probe_url(url: &str) -> anyhow::Result<()> {
     // ftp://, file://, custom schemes: optimistic — assume reachable.
     Ok(())
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for CmdProvider's new extension fields.
+    //!
+    //! These were added alongside the same fields on RsyncProvider but had
+    //! no direct test coverage. The integration paths through
+    //! atomic_publish_swap and probe_url are tested via rsync_provider.rs;
+    //! here we verify that CmdProvider correctly reads its config fields,
+    //! that the MirrorProvider trait getters reflect those values, and that
+    //! the no-op probe path returns Ok when check_upstream is false.
+
+    use crate::config::{GlobalConfig, MirrorConfig, ProviderKind};
+    use crate::provider::MirrorProvider;
+
+    fn base_global() -> GlobalConfig {
+        let mut g = GlobalConfig::default();
+        g.log_dir = "/tmp/tunasync-cmd-test-log".into();
+        g.mirror_dir = "/tmp/tunasync-cmd-test-mirror".into();
+        g
+    }
+
+    fn base_mirror() -> MirrorConfig {
+        let mut mc = MirrorConfig::default();
+        mc.name = "cmd-test".into();
+        mc.provider = ProviderKind::Command;
+        mc.upstream = "https://example.com/data/".into();
+        mc.command = "/bin/true".into();
+        mc
+    }
+
+    /// atomic_publish defaults to false; the trait getter must reflect this.
+    #[test]
+    fn atomic_publish_defaults_to_false() {
+        let global = base_global();
+        let mc = base_mirror();
+        let p = super::CmdProvider::from_config(&mc, &global).expect("from_config");
+        let p: &dyn MirrorProvider = &p;
+        assert!(
+            !p.atomic_publish(),
+            "atomic_publish must default to false on CmdProvider"
+        );
+    }
+
+    /// Setting atomic_publish = true in the config must propagate to the
+    /// trait getter.
+    #[test]
+    fn atomic_publish_flows_through_from_config() {
+        let global = base_global();
+        let mut mc = base_mirror();
+        mc.atomic_publish = true;
+        let p = super::CmdProvider::from_config(&mc, &global).expect("from_config");
+        let p: &dyn MirrorProvider = &p;
+        assert!(p.atomic_publish(), "atomic_publish must be true after config");
+    }
+
+    /// When check_upstream is false (default), probe_upstream must be a
+    /// no-op — it must not try to hit example.com / spawn rsync / DNS-resolve.
+    #[tokio::test]
+    async fn probe_upstream_noop_when_check_disabled() {
+        let global = base_global();
+        let mc = base_mirror();
+        let p = super::CmdProvider::from_config(&mc, &global).expect("from_config");
+        // Even with a bogus upstream, this must return Ok in <100ms.
+        let start = std::time::Instant::now();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(200), p.probe_upstream()).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "noop probe should be instant, took {elapsed:?}"
+        );
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "noop probe must return Ok, got {result:?}"
+        );
+    }
+
+    /// upstream_fallback flows through unchanged from MirrorConfig.
+    #[test]
+    fn upstream_fallback_flows_through() {
+        let global = base_global();
+        let mut mc = base_mirror();
+        mc.upstream_fallback = vec![
+            "https://fallback1.example.com/".into(),
+            "https://fallback2.example.com/".into(),
+        ];
+        let p = super::CmdProvider::from_config(&mc, &global).expect("from_config");
+        assert_eq!(p.upstream_fallback.len(), 2);
+        assert_eq!(p.upstream_fallback[0], "https://fallback1.example.com/");
+    }
+
+    /// disk_quota = "100M" parses to 100 * 1024 * 1024 bytes via the helper.
+    #[test]
+    fn disk_quota_parsed_into_bytes() {
+        let global = base_global();
+        let mut mc = base_mirror();
+        mc.disk_quota = "100M".into();
+        let p = super::CmdProvider::from_config(&mc, &global).expect("from_config");
+        let p: &dyn MirrorProvider = &p;
+        assert_eq!(p.disk_quota_bytes(), 100 * 1024 * 1024);
+    }
+
+    /// Empty disk_quota means no check (0 bytes).
+    #[test]
+    fn disk_quota_empty_is_zero() {
+        let global = base_global();
+        let mc = base_mirror();
+        let p = super::CmdProvider::from_config(&mc, &global).expect("from_config");
+        let p: &dyn MirrorProvider = &p;
+        assert_eq!(p.disk_quota_bytes(), 0);
+    }
+}

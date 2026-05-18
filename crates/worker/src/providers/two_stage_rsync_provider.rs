@@ -461,3 +461,85 @@ impl TwoStageRsyncProvider {
         self.docker_container_name = Some(name);
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for TwoStageRsyncProvider's new extension fields.
+
+    use crate::config::{GlobalConfig, MirrorConfig, ProviderKind};
+    use crate::provider::MirrorProvider;
+
+    fn base_global() -> GlobalConfig {
+        let mut g = GlobalConfig::default();
+        g.log_dir = "/tmp/tunasync-2srsync-test-log".into();
+        g.mirror_dir = "/tmp/tunasync-2srsync-test-mirror".into();
+        g
+    }
+
+    fn base_mirror() -> MirrorConfig {
+        let mut mc = MirrorConfig::default();
+        mc.name = "2srsync-test".into();
+        mc.provider = ProviderKind::TwoStageRsync;
+        mc.upstream = "rsync://example.com/data/".into();
+        mc.stage1_profile = "debian".into();
+        mc
+    }
+
+    /// atomic_publish defaults to false; trait getter reflects it.
+    #[test]
+    fn atomic_publish_defaults_to_false() {
+        let global = base_global();
+        let mc = base_mirror();
+        let p = super::TwoStageRsyncProvider::from_config(&mc, &global).expect("from_config");
+        let p: &dyn MirrorProvider = &p;
+        assert!(!p.atomic_publish());
+    }
+
+    /// Setting atomic_publish = true propagates.
+    #[test]
+    fn atomic_publish_flows_through() {
+        let global = base_global();
+        let mut mc = base_mirror();
+        mc.atomic_publish = true;
+        let p = super::TwoStageRsyncProvider::from_config(&mc, &global).expect("from_config");
+        let p: &dyn MirrorProvider = &p;
+        assert!(p.atomic_publish());
+    }
+
+    /// check_upstream = false → probe_upstream is instant-Ok.
+    #[tokio::test]
+    async fn probe_upstream_noop_when_check_disabled() {
+        let global = base_global();
+        let mc = base_mirror();
+        let p = super::TwoStageRsyncProvider::from_config(&mc, &global).expect("from_config");
+        let start = std::time::Instant::now();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(200), p.probe_upstream()).await;
+        let elapsed = start.elapsed();
+        assert!(elapsed < std::time::Duration::from_millis(100));
+        assert!(matches!(result, Ok(Ok(()))));
+    }
+
+    /// upstream_fallback flows through.
+    #[test]
+    fn upstream_fallback_flows_through() {
+        let global = base_global();
+        let mut mc = base_mirror();
+        mc.upstream_fallback = vec!["rsync://fallback.example.com/data/".into()];
+        let p = super::TwoStageRsyncProvider::from_config(&mc, &global).expect("from_config");
+        assert_eq!(p.upstream_fallback.len(), 1);
+    }
+
+    /// disk_quota = "500M" parses correctly.
+    #[test]
+    fn disk_quota_parsed_into_bytes() {
+        let global = base_global();
+        let mut mc = base_mirror();
+        mc.disk_quota = "500M".into();
+        let p = super::TwoStageRsyncProvider::from_config(&mc, &global).expect("from_config");
+        let p: &dyn MirrorProvider = &p;
+        assert_eq!(p.disk_quota_bytes(), 500 * 1024 * 1024);
+    }
+}
