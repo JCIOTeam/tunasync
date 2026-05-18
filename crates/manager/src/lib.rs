@@ -18,15 +18,21 @@ use crate::db::open as open_db;
 use crate::server::{build_router, AppState};
 
 /// Start the manager from a config file path, blocking until the server exits.
+///
+/// Only falls back to defaults when the file does not exist. Parse errors,
+/// permission errors, etc. are fatal — silently swallowing a typo in the
+/// config and starting with defaults is a much worse operator experience
+/// than a clear "fix your config" message.
 pub async fn run(config_path: std::path::PathBuf) -> Result<()> {
-    let cfg: ManagerConfig =
-        tunasync_common::config::load_toml(&config_path).unwrap_or_else(|_| {
-            tracing::warn!(
-                path = %config_path.display(),
-                "config file not found or unreadable — using defaults"
-            );
-            ManagerConfig::default()
-        });
+    let cfg: ManagerConfig = if config_path.exists() {
+        tunasync_common::config::load_toml(&config_path)?
+    } else {
+        tracing::warn!(
+            path = %config_path.display(),
+            "config file not found — using defaults"
+        );
+        ManagerConfig::default()
+    };
     run_with_config(cfg).await
 }
 
@@ -248,7 +254,7 @@ async fn stale_detector(state: std::sync::Arc<AppState>, stale_secs: u64) {
 
         let now = chrono::Utc::now();
 
-        for mut mirror in mirrors {
+        for mirror in mirrors {
             let age = now - mirror.last_update;
             let was_stale = mirror.stale;
             let is_stale = !tunasync_protocol::is_zero_time(&mirror.last_update)
@@ -259,13 +265,61 @@ async fn stale_detector(state: std::sync::Arc<AppState>, stale_secs: u64) {
                 );
 
             if is_stale != was_stale {
-                mirror.stale = is_stale;
+                // Re-fetch the current row immediately before writing so we
+                // merge our stale-flag change onto the latest worker telemetry
+                // rather than overwriting it. Without this, the sequence
+                //
+                //   t0  stale_detector reads mirror (Failed, stale=false)
+                //   t1  worker reports Success → last_update bumped, stale
+                //       implicitly cleared by the new last_update
+                //   t2  stale_detector writes its stale=true plus the OLD
+                //       (Failed, old last_update) row, losing the Success.
+                //
+                // is a real data-loss bug. The narrow window (read → write)
+                // is on the order of hundreds of microseconds, but a 5-minute
+                // scan over thousands of mirrors will hit it eventually.
+                //
+                // Strategy: fetch the latest row. If `last_update` has moved
+                // forward since our scan, re-evaluate `is_stale` against the
+                // fresh row — the worker has reported new data and our scan's
+                // verdict is potentially stale itself. Then write only if the
+                // verdict still differs from the persisted `stale` flag.
+                let fresh = match state.db.get_mirror_status(&mirror.worker, &mirror.name) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(
+                            mirror = %mirror.name,
+                            error = %e,
+                            "stale_detector: failed to re-fetch row; skipping"
+                        );
+                        continue;
+                    }
+                };
 
-                // Persist the stale flag change.
+                let fresh_is_stale = !tunasync_protocol::is_zero_time(&fresh.last_update)
+                    && (now - fresh.last_update) > stale_duration
+                    && !matches!(
+                        fresh.status,
+                        tunasync_protocol::SyncStatus::Disabled
+                            | tunasync_protocol::SyncStatus::Paused
+                    );
+
+                if fresh_is_stale == fresh.stale {
+                    // Either a worker write since our scan already updated
+                    // last_update past the threshold (clearing stale) or
+                    // another stale_detector pass already wrote the flag.
+                    // Nothing to do.
+                    continue;
+                }
+
+                // Merge: take the fresh row and only flip stale.
+                let mut to_write = fresh.clone();
+                to_write.stale = fresh_is_stale;
+
                 if let Err(e) =
                     state
                         .db
-                        .update_mirror_status(&mirror.worker, &mirror.name, mirror.clone())
+                        .update_mirror_status(&mirror.worker, &mirror.name, to_write.clone())
                 {
                     tracing::warn!(
                         mirror = %mirror.name,
@@ -274,6 +328,10 @@ async fn stale_detector(state: std::sync::Arc<AppState>, stale_secs: u64) {
                     );
                     continue;
                 }
+
+                // Use the actual written value for downstream notification.
+                let is_stale = fresh_is_stale;
+                let mirror = to_write;
 
                 // Webhook notification.
                 if !state.notify.webhook_url.is_empty() {
