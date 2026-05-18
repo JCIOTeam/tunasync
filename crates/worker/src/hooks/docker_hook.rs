@@ -50,15 +50,44 @@ impl DockerConfig {
 
     /// Build the full `docker run …` argv by prepending docker flags to the
     /// provider's original command.
+    /// Build the full `docker run …` argv by prepending docker flags to the
+    /// provider's original command. Uses `self.working_dir` for `-w`, `-v`,
+    /// and `TUNASYNC_WORKING_DIR`.
     pub fn wrap_argv(&self, inner_argv: &[String]) -> Vec<String> {
+        self.wrap_argv_for(inner_argv, None)
+    }
+
+    /// Like `wrap_argv` but with an optional working-directory override.
+    ///
+    /// When `working_dir_override` is `Some(p)`, the container's `-w`,
+    /// the working-dir bind mount, and the `TUNASYNC_WORKING_DIR` env var
+    /// all use `p` instead of `self.working_dir`. This is essential for
+    /// atomic_publish: rsync writes to a staging directory and the swap
+    /// happens host-side after the sync completes. If the container were
+    /// still pointed at the publish dir, the user's mirror script would
+    /// write directly there and bypass the staging mechanism entirely.
+    ///
+    /// The mount is added *in addition* to the publish-dir mount (the
+    /// container may legitimately need to read the publish dir, e.g. for
+    /// delta uploads), so we still mount `self.working_dir` as well.
+    pub fn wrap_argv_for(
+        &self,
+        inner_argv: &[String],
+        working_dir_override: Option<&std::path::Path>,
+    ) -> Vec<String> {
+        let active_wd: PathBuf = working_dir_override
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.working_dir.clone());
+
         let mut argv = vec!["docker".into(), "run".into(), "--rm".into()];
 
         // Attach stdout/stderr.
         argv.extend(["-a".into(), "STDOUT".into(), "-a".into(), "STDERR".into()]);
         // Container name.
         argv.extend(["--name".into(), self.container_name()]);
-        // Working directory inside container.
-        argv.extend(["-w".into(), self.working_dir.to_string_lossy().into()]);
+        // Working directory inside container — staging dir when atomic_publish
+        // is active so user scripts can't bypass the swap.
+        argv.extend(["-w".into(), active_wd.to_string_lossy().into()]);
         // Run as current user.
         argv.extend([
             "-u".into(),
@@ -74,6 +103,12 @@ impl DockerConfig {
                     "-e".into(),
                     format!("{k}={}", log_file_path.to_string_lossy()),
                 ]);
+            } else if k == "TUNASYNC_WORKING_DIR" {
+                // Override with the active (possibly staging) dir.
+                argv.extend([
+                    "-e".into(),
+                    format!("{k}={}", active_wd.to_string_lossy()),
+                ]);
             } else {
                 argv.extend(["-e".into(), format!("{k}={v}")]);
             }
@@ -83,11 +118,10 @@ impl DockerConfig {
         for vol in &self.volumes {
             argv.extend(["-v".into(), vol.clone()]);
         }
-        // Runtime volume mounts: log dir and working dir.
-        // Note: log_dir already contains all log files including the rotated
-        // ones, so no separate log_file mount is needed (avoids Docker
-        // creating an unwanted directory if the file doesn't exist yet).
-        let runtime_vols = [
+        // Runtime volume mounts: log dir, publish dir, and (if different) the
+        // active working dir. We mount the publish dir even under atomic_publish
+        // so the container can read previous content for delta uploads.
+        let mut runtime_vols = vec![
             format!("{}:{}", self.log_dir.display(), self.log_dir.display()),
             format!(
                 "{}:{}",
@@ -95,6 +129,13 @@ impl DockerConfig {
                 self.working_dir.display()
             ),
         ];
+        if working_dir_override.is_some() && active_wd != self.working_dir {
+            runtime_vols.push(format!(
+                "{}:{}",
+                active_wd.display(),
+                active_wd.display()
+            ));
+        }
         for vol in &runtime_vols {
             argv.extend(["-v".into(), vol.clone()]);
         }
@@ -140,6 +181,15 @@ impl DockerHook {
     /// Build wrapped argv — delegates to DockerConfig.
     pub fn wrap_argv(&self, inner_argv: &[String]) -> Vec<String> {
         self.config.wrap_argv(inner_argv)
+    }
+
+    /// Build wrapped argv with an explicit working-dir override (atomic_publish).
+    pub fn wrap_argv_for(
+        &self,
+        inner_argv: &[String],
+        working_dir_override: Option<&std::path::Path>,
+    ) -> Vec<String> {
+        self.config.wrap_argv_for(inner_argv, working_dir_override)
     }
 
     /// Send `docker stop -t 2 {container}` to gracefully stop the container.
@@ -239,4 +289,105 @@ fn unsafe_getuid() -> u32 {
 #[cfg(not(unix))]
 fn unsafe_getgid() -> u32 {
     0
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    //! Verify that `wrap_argv_for` correctly retargets `-w`, the working-dir
+    //! bind mount, and the `TUNASYNC_WORKING_DIR` env when atomic_publish
+    //! provides a staging-dir override.
+
+    use super::*;
+    use std::collections::HashMap;
+
+    fn make_config() -> DockerConfig {
+        let mut env = HashMap::new();
+        env.insert(
+            "TUNASYNC_WORKING_DIR".to_string(),
+            "/srv/mirrors/debian".to_string(),
+        );
+        env.insert(
+            "TUNASYNC_MIRROR_NAME".to_string(),
+            "debian".to_string(),
+        );
+        DockerConfig {
+            mirror_name: "debian".into(),
+            image: "rsync:latest".into(),
+            volumes: vec![],
+            options: vec![],
+            memory_limit_bytes: 0,
+            working_dir: PathBuf::from("/srv/mirrors/debian"),
+            log_dir: PathBuf::from("/var/log/tunasync"),
+            log_file: Arc::new(Mutex::new(PathBuf::from("/var/log/tunasync/debian.log"))),
+            env,
+        }
+    }
+
+    /// Without an override, wrap_argv uses the publish dir for -w, the
+    /// working-dir mount, and TUNASYNC_WORKING_DIR. This is the unchanged
+    /// pre-fix behaviour (and the correct behaviour when atomic_publish=false).
+    #[test]
+    fn wrap_argv_default_uses_publish_dir() {
+        let cfg = make_config();
+        let argv = cfg.wrap_argv(&["rsync".into(), "src/".into(), "dst/".into()]);
+        let joined = argv.join(" ");
+        assert!(joined.contains("-w /srv/mirrors/debian"));
+        assert!(joined.contains("-v /srv/mirrors/debian:/srv/mirrors/debian"));
+        assert!(joined.contains("TUNASYNC_WORKING_DIR=/srv/mirrors/debian"));
+    }
+
+    /// With a staging-dir override, -w, TUNASYNC_WORKING_DIR, and an
+    /// *additional* -v all point at the staging dir. The publish-dir mount
+    /// is kept for delta reads.
+    #[test]
+    fn wrap_argv_for_with_override_targets_staging() {
+        let cfg = make_config();
+        let staging = PathBuf::from("/var/log/tunasync/staging/debian");
+        let argv = cfg.wrap_argv_for(
+            &["rsync".into(), "src/".into(), "dst/".into()],
+            Some(staging.as_path()),
+        );
+        let joined = argv.join(" ");
+
+        // -w must point at staging.
+        assert!(
+            joined.contains("-w /var/log/tunasync/staging/debian"),
+            "argv missing staging -w: {joined}"
+        );
+
+        // TUNASYNC_WORKING_DIR must be overridden in the -e flags.
+        assert!(
+            joined.contains("TUNASYNC_WORKING_DIR=/var/log/tunasync/staging/debian"),
+            "argv missing overridden TUNASYNC_WORKING_DIR: {joined}"
+        );
+        // The old publish-dir value must NOT appear in any TUNASYNC_WORKING_DIR -e flag.
+        assert!(
+            !joined.contains("TUNASYNC_WORKING_DIR=/srv/mirrors/debian"),
+            "argv still has stale TUNASYNC_WORKING_DIR=publish: {joined}"
+        );
+
+        // Staging volume must be mounted in addition to the publish-dir mount.
+        assert!(
+            joined.contains("-v /var/log/tunasync/staging/debian:/var/log/tunasync/staging/debian"),
+            "argv missing staging volume mount: {joined}"
+        );
+        assert!(
+            joined.contains("-v /srv/mirrors/debian:/srv/mirrors/debian"),
+            "argv missing publish-dir volume mount (needed for delta reads): {joined}"
+        );
+    }
+
+    /// Other env vars unrelated to working dir must not be perturbed.
+    #[test]
+    fn wrap_argv_for_preserves_other_env() {
+        let cfg = make_config();
+        let argv = cfg.wrap_argv_for(
+            &["rsync".into()],
+            Some(std::path::Path::new("/tmp/staging")),
+        );
+        let joined = argv.join(" ");
+        assert!(joined.contains("TUNASYNC_MIRROR_NAME=debian"));
+    }
 }

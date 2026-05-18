@@ -214,8 +214,17 @@ impl MirrorProvider for CmdProvider {
         // When Docker wrapping is active, the argv is wrapped with `docker run …`
         // and env vars go through `-e` flags (inside the container). The host
         // `docker run` process doesn't need those env overrides.
+        //
+        // CRITICAL: when atomic_publish is on, the container must see the
+        // staging dir (not the publish dir) as its working directory and
+        // TUNASYNC_WORKING_DIR. Otherwise a user-supplied mirror script
+        // running inside the container would write directly to the publish
+        // path and completely bypass the atomic-swap mechanism.
         let (argv, spawn_env) = if let Some(docker) = &self.docker_config {
-            (docker.wrap_argv(&self.command), HashMap::new())
+            (
+                docker.wrap_argv_for(&self.command, wd_override),
+                HashMap::new(),
+            )
         } else {
             (self.command.clone(), env)
         };
