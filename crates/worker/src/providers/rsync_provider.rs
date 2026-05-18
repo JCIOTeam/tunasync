@@ -712,7 +712,7 @@ fn two_step_rename_fallback(
 ///
 /// Returns `Ok(())` if the exit code is 0; otherwise an error containing
 /// the exit code or stderr's first line for diagnostics.
-async fn probe_rsync_url(url: &str) -> anyhow::Result<()> {
+pub(crate) async fn probe_rsync_url(url: &str) -> anyhow::Result<()> {
     let mut child = tokio::process::Command::new("rsync")
         .args(["--contimeout=10", "--list-only", "--timeout=10", url])
         // Capture stderr so we can include a useful message on failure

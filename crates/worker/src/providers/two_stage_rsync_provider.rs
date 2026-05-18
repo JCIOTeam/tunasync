@@ -68,6 +68,12 @@ pub struct TwoStageRsyncProvider {
     pub success_exit_codes: Vec<i32>,
     /// Minimum free-space bytes required before starting a sync. 0 = no check.
     pub disk_quota_bytes: u64,
+    /// Whether to probe upstream reachability before syncing.
+    pub check_upstream: bool,
+    /// Fallback upstream URLs.
+    pub upstream_fallback: Vec<String>,
+    /// Whether to swap staging↔publish atomically via renameat2 after sync.
+    pub atomic_publish_enabled: bool,
     data_size: Mutex<String>,
     current_pid: Arc<Mutex<Option<u32>>>,
     docker_container_name: Option<String>,
@@ -209,6 +215,9 @@ impl TwoStageRsyncProvider {
             rsync_env,
             success_exit_codes,
             disk_quota_bytes,
+            check_upstream: mc.check_upstream,
+            upstream_fallback: mc.upstream_fallback.clone(),
+            atomic_publish_enabled: mc.atomic_publish,
             data_size: Mutex::new(String::new()),
             current_pid: Arc::new(Mutex::new(None)),
             docker_container_name: None,
@@ -218,21 +227,21 @@ impl TwoStageRsyncProvider {
         })
     }
 
-    fn build_argv(&self, opts: &[String]) -> Vec<String> {
+    fn build_argv(&self, opts: &[String], dest: &std::path::Path) -> Vec<String> {
         let mut argv = vec![self.rsync_cmd.clone()];
         argv.extend(opts.iter().cloned());
         argv.push(self.upstream.clone());
-        argv.push(self.working_dir.to_string_lossy().into());
+        argv.push(dest.to_string_lossy().into());
         argv
     }
 
-    async fn run_stage(&self, stage: u8) -> Result<()> {
+    async fn run_stage(&self, stage: u8, dest: &std::path::Path) -> Result<()> {
         let opts = if stage == 1 {
             &self.stage1_options
         } else {
             &self.stage2_options
         };
-        let argv = self.build_argv(opts);
+        let argv = self.build_argv(opts, dest);
         // When Docker wrapping is active, wrap argv and use empty env.
         let (argv, spawn_env) = if let Some(docker) = &self.docker_config {
             (docker.wrap_argv(&argv), HashMap::new())
@@ -249,7 +258,7 @@ impl TwoStageRsyncProvider {
         } else {
             Some(log_file.as_path())
         };
-        let proc = runner::spawn(&argv, &self.working_dir, &spawn_env, lp)
+        let proc = runner::spawn(&argv, dest, &spawn_env, lp)
             .await
             .with_context(|| format!("spawn rsync stage {stage} for {}", self.name))?;
 
@@ -297,8 +306,20 @@ impl MirrorProvider for TwoStageRsyncProvider {
     async fn run(&self) -> Result<()> {
         *self.data_size.lock().unwrap() = String::new();
 
-        self.run_stage(1).await?;
-        self.run_stage(2).await?;
+        // Determine destination (staging or publish dir).
+        let publish_dir = self.working_dir.clone();
+        let dest = if self.atomic_publish_enabled {
+            super::rsync_provider::atomic_staging_path_for(&self.log_dir, &self.name)
+        } else {
+            publish_dir.clone()
+        };
+        if self.atomic_publish_enabled {
+            super::rsync_provider::ensure_atomic_publish_dirs(&dest, &publish_dir)
+                .with_context(|| format!("atomic publish setup for {}", self.name))?;
+        }
+
+        self.run_stage(1, &dest).await?;
+        self.run_stage(2, &dest).await?;
 
         // Extract size from the shared log after successful run.
         // Stage2 overwrites stage1 in the same file (tee_to_log truncates),
@@ -312,6 +333,18 @@ impl MirrorProvider for TwoStageRsyncProvider {
             if !size.is_empty() {
                 *self.data_size.lock().unwrap() = size;
             }
+        }
+
+        // Atomic publish swap.
+        if self.atomic_publish_enabled {
+            super::rsync_provider::atomic_publish_swap(&dest, &publish_dir).with_context(|| {
+                format!(
+                    "atomic publish: swap {} ↔ {}",
+                    dest.display(),
+                    publish_dir.display()
+                )
+            })?;
+            tracing::info!(mirror = %self.name, dest = %publish_dir.display(), "atomic publish complete");
         }
         Ok(())
     }
@@ -369,6 +402,57 @@ impl MirrorProvider for TwoStageRsyncProvider {
 
     fn disk_quota_bytes(&self) -> u64 {
         self.disk_quota_bytes
+    }
+
+    fn atomic_publish(&self) -> bool {
+        self.atomic_publish_enabled
+    }
+
+    /// Probe upstream reachability before syncing. See `RsyncProvider::probe_upstream`
+    /// for the rationale (per-URL 15s timeout, concurrent probing).
+    async fn probe_upstream(&self) -> anyhow::Result<()> {
+        if !self.check_upstream {
+            return Ok(());
+        }
+        let mut urls: Vec<&str> = vec![self.upstream.as_str()];
+        urls.extend(self.upstream_fallback.iter().map(String::as_str));
+
+        use futures::stream::{FuturesUnordered, StreamExt};
+        let mut futures: FuturesUnordered<_> = urls
+            .iter()
+            .map(|&url| async move {
+                let res = tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    super::rsync_provider::probe_rsync_url(url),
+                )
+                .await;
+                (url, res)
+            })
+            .collect();
+
+        let mut last_err: Option<String> = None;
+        while let Some((url, res)) = futures.next().await {
+            match res {
+                Ok(Ok(())) => {
+                    if url != self.upstream.as_str() {
+                        tracing::info!(
+                            mirror = %self.name,
+                            primary = %self.upstream,
+                            reachable = %url,
+                            "primary upstream unreachable; fallback responded"
+                        );
+                    }
+                    return Ok(());
+                }
+                Ok(Err(e)) => last_err = Some(format!("{url}: {e}")),
+                Err(_) => last_err = Some(format!("{url}: probe timed out after 15s")),
+            }
+        }
+        anyhow::bail!(
+            "all {} upstream(s) unreachable; last: {}",
+            urls.len(),
+            last_err.as_deref().unwrap_or("no probes attempted")
+        )
     }
 }
 

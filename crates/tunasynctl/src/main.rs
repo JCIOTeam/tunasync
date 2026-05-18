@@ -157,10 +157,18 @@ enum Command {
     Workers,
     /// Flush all disabled job rows from the manager DB.
     Flush {
-        /// Only flush mirrors that are both disabled and marked stale.
+        /// Safety guard: only flush if at least one currently-disabled
+        /// mirror is also marked stale. Note that the manager endpoint
+        /// is all-or-nothing — when this flag is enabled and the guard
+        /// passes, ALL disabled mirrors are still removed (not just
+        /// the stale ones), because the manager has no per-mirror flush.
         #[arg(long)]
         stale_only: bool,
     },
+    /// List all mirrors currently marked as stale by the manager's stale
+    /// detector. Read-only — does not flush or modify anything. Useful for
+    /// operators checking whether the stale_after threshold has fired.
+    Stale,
     /// Remove a worker from the manager.
     RmWorker {
         /// Worker ID.
@@ -630,42 +638,88 @@ async fn main() -> Result<()> {
         }
 
         Command::Flush { stale_only } => {
+            // The manager's only flush endpoint is `DELETE /jobs/disabled`,
+            // which removes *all* disabled rows — there is no per-mirror
+            // selective flush. So --stale-only is implemented as a safety
+            // guard: it refuses to flush unless at least one of the
+            // currently-disabled mirrors is also marked stale. This is the
+            // common use case ("clean up mirrors that were disabled, are
+            // probably abandoned, and have not been updated in days"); it
+            // avoids accidentally clearing recently-disabled mirrors that
+            // an operator may still want to re-enable.
             if stale_only {
-                // MirrorStatus (from /workers/{id}/jobs) has a `stale` field.
                 let workers = client.list_workers().await?;
-                let mut stale_names: Vec<String> = Vec::new();
+                // Find mirrors that are BOTH disabled AND stale.
+                let mut stale_disabled: Vec<(String, String)> = Vec::new();
+                let mut other_stale: Vec<(String, String)> = Vec::new();
                 for w in &workers {
                     let jobs = client.list_jobs_of_worker(&w.id).await.unwrap_or_default();
                     for j in jobs {
-                        if j.stale {
-                            stale_names.push(j.name);
+                        let is_disabled = j.status.to_string().eq_ignore_ascii_case("disabled");
+                        if j.stale && is_disabled {
+                            stale_disabled.push((j.name.clone(), w.id.clone()));
+                        } else if j.stale {
+                            other_stale.push((j.name.clone(), w.id.clone()));
                         }
                     }
                 }
-                if stale_names.is_empty() {
+                if stale_disabled.is_empty() {
                     println!(
                         "{}",
                         t!(
-                            "No stale disabled jobs to flush.",
-                            "没有需要清除的 stale 任务。"
+                            "No stale disabled mirrors found — refusing to flush.",
+                            "没有 stale 且 disabled 的镜像 — 拒绝清除。"
                         )
                     );
+                    if !other_stale.is_empty() {
+                        let names: Vec<&str> =
+                            other_stale.iter().map(|(n, _)| n.as_str()).collect();
+                        println!(
+                            "{}",
+                            t!(
+                                format!(
+                                    "Note: {} stale but non-disabled mirror(s) exist: {:?}",
+                                    other_stale.len(),
+                                    names
+                                ),
+                                format!(
+                                    "提示：另有 {} 个 stale 但未 disabled 的镜像：{:?}",
+                                    other_stale.len(),
+                                    names
+                                )
+                            )
+                        );
+                    }
                 } else {
+                    let names: Vec<&str> = stale_disabled.iter().map(|(n, _)| n.as_str()).collect();
                     println!(
                         "{}",
                         t!(
-                            format!("Stale mirrors found: {stale_names:?}"),
-                            format!("发现 stale 镜像：{stale_names:?}")
+                            format!(
+                                "Flushing {} stale-and-disabled mirror(s): {:?}",
+                                stale_disabled.len(),
+                                names
+                            ),
+                            format!(
+                                "将清除 {} 个 stale 且 disabled 的镜像：{:?}",
+                                stale_disabled.len(),
+                                names
+                            )
+                        )
+                    );
+                    // Note: the manager flushes ALL disabled rows, not just
+                    // the stale ones. Be honest with the operator about that.
+                    println!(
+                        "{}",
+                        t!(
+                            "Note: manager's flush endpoint is all-or-nothing; \
+                             ALL currently-disabled mirrors will be removed.",
+                            "提示：manager 的 flush 端点是全清的；所有当前 \
+                             disabled 的镜像都将被删除。"
                         )
                     );
                     client.flush_disabled().await?;
-                    println!(
-                        "{}",
-                        t!(
-                            "Flushed stale disabled jobs.",
-                            "已清除所有 stale disabled 任务。"
-                        )
-                    );
+                    println!("{}", t!("Flush complete.", "清除完成。"));
                 }
             } else {
                 client.flush_disabled().await?;
@@ -673,6 +727,71 @@ async fn main() -> Result<()> {
                     "{}",
                     t!("Flushed disabled jobs.", "已清除所有 disabled 任务。")
                 );
+            }
+        }
+
+        Command::Stale => {
+            let workers = client.list_workers().await?;
+            // Group stale mirrors by status (disabled vs other) so the
+            // operator can see at a glance which ones are flush-candidates.
+            let mut stale_disabled: Vec<(String, String, String)> = Vec::new();
+            let mut stale_active: Vec<(String, String, String)> = Vec::new();
+            for w in &workers {
+                let jobs = client.list_jobs_of_worker(&w.id).await.unwrap_or_default();
+                for j in jobs {
+                    if !j.stale {
+                        continue;
+                    }
+                    let status_lc = j.status.to_string().to_ascii_lowercase();
+                    let last_update = j.last_update.format("%Y-%m-%d %H:%M UTC").to_string();
+                    let entry = (j.name.clone(), w.id.clone(), last_update);
+                    if status_lc == "disabled" {
+                        stale_disabled.push(entry);
+                    } else {
+                        stale_active.push(entry);
+                    }
+                }
+            }
+            if stale_disabled.is_empty() && stale_active.is_empty() {
+                println!("{}", t!("No stale mirrors.", "没有 stale 镜像。"));
+            } else {
+                let (h_name, h_worker, h_last) = if is_zh() {
+                    ("名称", "Worker", "最后更新")
+                } else {
+                    ("Name", "Worker", "Last update")
+                };
+                if !stale_active.is_empty() {
+                    println!(
+                        "{}",
+                        t!(
+                            format!("Stale and active ({}):", stale_active.len()),
+                            format!("Stale 且活跃（共 {} 个）:", stale_active.len())
+                        )
+                    );
+                    println!("{:<30} {:<20} {}", h_name, h_worker, h_last);
+                    for (n, w, t) in &stale_active {
+                        println!("{n:<30} {w:<20} {t}");
+                    }
+                }
+                if !stale_disabled.is_empty() {
+                    if !stale_active.is_empty() {
+                        println!();
+                    }
+                    println!(
+                        "{}",
+                        t!(
+                            format!("Stale and disabled ({}, flushable):", stale_disabled.len()),
+                            format!(
+                                "Stale 且 disabled（共 {} 个，可清除）:",
+                                stale_disabled.len()
+                            )
+                        )
+                    );
+                    println!("{:<30} {:<20} {}", h_name, h_worker, h_last);
+                    for (n, w, t) in &stale_disabled {
+                        println!("{n:<30} {w:<20} {t}");
+                    }
+                }
             }
         }
 
