@@ -74,6 +74,141 @@ tunasync-rs is **wire-compatible** with the Go implementation: a Rust manager ca
 | Default port | 12345 | 14242 |
 | `tunasynctl` CLI | Same commands | ✅ Compatible (`-p`, `-w` short flags) |
 
+## New features in the Rust port
+
+The following features are unique to tunasync-rs and have no Go equivalent. All are opt-in via config and default to off, so existing Go configs work unchanged.
+
+### Disk quota pre-sync check
+
+Skip a sync if free disk space falls below a threshold. The mirror stays in the scheduler queue and retries at its next interval.
+
+```toml
+[[mirrors]]
+name = "debian"
+disk_quota = "100G"   # skip sync if < 100 GiB free in mirror dir
+```
+
+### Cron-style scheduling
+
+Schedule syncs with a standard 5-field cron expression instead of a fixed interval. Overrides the `interval` field when set.
+
+```toml
+[[mirrors]]
+name = "kernel"
+cron = "0 3 * * *"   # daily at 03:00 (in the mirror's effective timezone)
+```
+
+Accepts both 5-field POSIX (`minute hour dom month dow`) and the cron-crate 6/7-field format. Invalid expressions cause the worker to fail at startup with a clear error.
+
+### Timezone-aware scheduling
+
+Cron expressions and blackout windows are interpreted in the **UTC timezone by default**. Set `timezone` to use a local time:
+
+```toml
+[global]
+timezone = "Asia/Shanghai"   # all mirrors default to CST
+
+[[mirrors]]
+name = "euromirror"
+timezone = "Europe/Berlin"   # per-mirror override
+cron = "0 3 * * *"           # fires at 03:00 CET/CEST, not 03:00 UTC
+```
+
+Valid values are IANA timezone names (e.g. `"Asia/Shanghai"`, `"America/New_York"`, `"Europe/Berlin"`, `"UTC"`). Invalid names cause the worker to fail at startup. The timezone applies to both `cron` and `blackout` windows for that mirror.
+
+> **Upgrading from Go:** The Go worker uses the host's local timezone implicitly. If your cron/blackout schedules relied on local time, set `timezone` explicitly when switching to the Rust version.
+
+### Blackout windows
+
+Suppress new syncs during busy periods. In-progress syncs are never interrupted — only new starts are gated. When the scheduler fires a job during a blackout, it defers by 5 minutes and tries again.
+
+```toml
+[[mirrors]]
+name = "debian"
+# Interpreted in the mirror's effective timezone (see above — defaults to UTC).
+blackout = ["08:00-18:00 Mon-Fri", "22:00-04:00"]
+```
+
+Format: `"HH:MM-HH:MM [<days>]"`. The optional day specifier accepts weekday ranges (`Mon-Fri`, `Sat-Sun`), single days (`Mon`), or `daily` (equivalent to omitting the field). Midnight wraparound is supported: `"22:00-04:00"` covers 22:00–23:59 and 00:00–04:00.
+
+### Job priority
+
+Higher-priority mirrors get a concurrency slot ahead of lower-priority ones when many jobs are waiting.
+
+```toml
+[[mirrors]]
+name = "critical"
+priority = 90   # default is 50; higher = runs first
+```
+
+### Per-upstream concurrency limit
+
+Limit how many mirrors may sync from the same upstream host simultaneously, independent of the global `concurrent` setting.
+
+```toml
+[global.per_upstream_concurrent]
+"rsync.kernel.org" = 2
+"ftp.debian.org"   = 1
+```
+
+Changes to this map take effect on the next SIGHUP / `tunasynctl reload` (hot-reload supported). The global `concurrent` limit still applies; the per-upstream limit adds an additional constraint.
+
+### Upstream probe with fallback
+
+Check upstream reachability before starting a sync. If the primary upstream is unreachable, the fallback list is tried concurrently with a 15-second timeout per URL. The sync is skipped (not failed permanently) if all URLs are unreachable.
+
+```toml
+[[mirrors]]
+name = "kernel"
+check_upstream = true
+upstream_fallback = ["rsync://mirror.example.com/kernel/"]
+```
+
+The fallback list is for health-checking only — the actual sync data source is always `upstream`.
+
+### Atomic publish
+
+Rsync into a staging directory (`<log_dir>/staging/<name>/`) first, then atomically swap it with the publish directory using `renameat2(RENAME_EXCHANGE)`. Users always see either the old or new content; there is no window where the publish path is missing.
+
+```toml
+[[mirrors]]
+name = "debian"
+atomic_publish = true
+```
+
+**Requirement:** `log_dir` and `mirror_dir` must be on the **same filesystem** (rename is only atomic within a single mount). The worker checks device IDs at startup and refuses to sync if they differ.
+
+Falls back to a two-step rename (brief 404 window) only on kernels/filesystems that don't support `RENAME_EXCHANGE` (pre-3.15 kernels or some FUSE mounts); a warning is logged.
+
+### Maintenance mode
+
+Put the manager into read-only mode. All mutating API calls (sync updates, commands) return 503 until maintenance mode is disabled.
+
+```bash
+tunasynctl maintenance enable
+tunasynctl maintenance status
+tunasynctl maintenance disable
+```
+
+### Glob expansion in tunasynctl
+
+`stop`, `disable`, `restart`, and `start` accept glob patterns to operate on multiple mirrors at once:
+
+```bash
+tunasynctl disable "debian-*"
+tunasynctl restart "ubuntu-*" -w worker1
+tunasynctl stop "*"
+```
+
+Exact names skip the glob fetch entirely (same performance as before).
+
+### Flush stale mirrors
+
+```bash
+tunasynctl flush --stale-only    # flush only mirrors marked stale by the manager
+tunasynctl stale                 # list all stale mirrors
+```
+
 ## Design
 
 Same architecture as upstream — see `docs/wire-compat.md` for the protocol mapping.
@@ -94,11 +229,11 @@ Same architecture as upstream — see `docs/wire-compat.md` for the protocol map
 +------------+ |   <------------------+   |    |     Scheduler     |
 |  redb /    | |   |                  |   |    +-------------------+
 |  sqlite    | +---+                  +---+
-|  redis     |                          |
-+------------+                          +
+|  redis     |
++------------+
 ```
 
-### Job Run Process
+### Job run process
 
 ```
          ┌─────────────────────────────┐
@@ -134,139 +269,76 @@ mkdir -p ~/tunasync_demo /tmp/tunasync/{log,manager-db}
 name = "test_worker"                     # Worker identity (used as worker_id)
 log_dir = "/tmp/tunasync/log"            # Default log directory
 mirror_dir = "/tmp/tunasync"             # Default mirror data directory
-concurrent = 10                          # Max concurrent sync jobs (0 = unlimited)
+concurrent = 10                          # Max concurrent sync jobs
 interval = 120                           # Default sync interval in minutes
 retry = 3                                # Default retry count on failure
 timeout = 600                            # Default timeout in seconds (0 = no timeout)
-# rsync_options = ["--no-motd"]          # Global rsync options appended to every rsync job
-# exec_on_success = []                   # Global post-success commands
-# exec_on_failure = []                   # Global post-failure commands
+
+# Timezone for cron expressions and blackout windows.
+# Defaults to UTC when unset. Use IANA names: "Asia/Shanghai", "Europe/Berlin", etc.
+# timezone = "UTC"
+
+# Per-upstream host concurrency limits (optional).
+# [global.per_upstream_concurrent]
+# "rsync.kernel.org" = 2
 
 [manager]
-api_base = "http://localhost:14242"      # Manager URL (single)
-# api_base_list = [                      # Multiple managers (overrides api_base)
-#     "http://mgr1:14242",
-#     "http://mgr2:14242",
-# ]
-# ca_cert = "/etc/tunasync/ca.crt"       # CA cert for TLS
+api_base = "http://localhost:14242"
 
 [server]
-hostname = "localhost"                   # Public hostname for worker URL
-listen_addr = "127.0.0.1"               # Worker HTTP listener address
-listen_port = 6000                       # Worker HTTP listener port
-# ssl_cert = ""                          # Worker TLS cert
-# ssl_key = ""                           # Worker TLS key
-
-# Docker hook — wraps sync jobs in containers (mutually exclusive with cgroup)
-[docker]
-enable = false
-# volumes = ["/data:/data"]              # Global Docker volumes
-# options = ["--network=host"]           # Global Docker options
-
-# Cgroup hook — limits CPU/memory per job (Linux only, mutually exclusive with docker)
-[cgroup]
-enable = false
-# base_path = "/sys/fs/cgroup"          # Cgroup mount point
-# group = "tunasync"                    # Cgroup slice name
-
-# ZFS snapshot hook
-[zfs]
-enable = false
-# zpool = "tank"                        # ZFS pool name
-
-# Btrfs snapshot hook (Linux only)
-[btrfs_snapshot]
-enable = false
-# snapshot_path = "/snapshots"          # Btrfs snapshot directory
-
-# Include additional mirror configs via glob
-[include]
-# include_mirrors = "/etc/tunasync/mirrors.d/*.conf"   # Go-compatible [include] section
+hostname = "localhost"
+listen_addr = "127.0.0.1"
+listen_port = 6000
 
 # --- Mirror definitions ---
-# provider types: "command", "rsync", "two-stage-rsync"
 
-# Simple rsync mirror
 [[mirrors]]
 name = "elvish"
 provider = "rsync"
 upstream = "rsync://rsync.elv.sh/elvish/"
 use_ipv4 = true
-# interval = 60                          # Override global interval (minutes)
-# retry = 3                              # Override global retry count
-# timeout = 600                          # Override global timeout (seconds)
-# mirror_dir = "/data/elvish"            # Override global mirror_dir
-# log_dir = "/var/log/tunasync/elvish"   # Override global log_dir
-# username = "mirror"                    # Rsync username
-# password = "secret"                    # Rsync password (env: RSYNC_PASSWORD)
-# exclude_file = "/etc/tunasync/exclude.txt"  # Rsync exclude-from file
+# interval = 60           # minutes
+# cron = "0 3 * * *"     # alternative: cron schedule (overrides interval)
+# timezone = "Asia/Shanghai"  # per-mirror timezone (overrides [global].timezone)
+# blackout = ["08:00-18:00 Mon-Fri"]  # suppress new syncs during these windows
+# disk_quota = "100G"     # skip sync if free space < threshold
+# priority = 50           # higher = runs first when semaphore contested
+# check_upstream = false  # probe upstream before syncing
+# upstream_fallback = []  # fallback URLs for the probe (health-check only)
+# atomic_publish = false  # use staging dir + renameat2 swap
 
-# Command mirror (arbitrary shell command)
 [[mirrors]]
 name = "myrepo"
 provider = "command"
 upstream = "https://example.com/repo/"
 command = "wget -m -np -nd https://example.com/repo/ -P /path/to/mirror"
-# fail_on_match = "error|failed"         # Fail if regex matches log output
-# size_pattern = "Total size: ([\\d.]+[KMG])"  # Extract size from log
-# success_exit_codes = [0, 1, 2]         # Treat these exit codes as success
-# env = { "MY_VAR" = "value" }           # Extra environment variables
-# The following environment variables are always injected by tunasync:
-#   TUNASYNC_MIRROR_NAME    Mirror name (same as [[mirrors]] name field)
-#   TUNASYNC_WORKING_DIR    Effective mirror data directory
-#   TUNASYNC_UPSTREAM_URL   upstream field value
-#   TUNASYNC_LOG_DIR        Log directory (parent of the log file)
-#   TUNASYNC_LOG_FILE       Full path to the current log file
+# The following env vars are always injected:
+#   TUNASYNC_MIRROR_NAME, TUNASYNC_WORKING_DIR, TUNASYNC_UPSTREAM_URL,
+#   TUNASYNC_LOG_DIR, TUNASYNC_LOG_FILE
 
-# Two-stage rsync (for large repos like Debian)
 [[mirrors]]
 name = "debian"
 provider = "two-stage-rsync"
 upstream = "rsync://ftp.debian.org/debian/"
-stage1_profile = "debian"                # "debian" or "debian-oldstyle"
+stage1_profile = "debian"
 use_ipv4 = true
-# command = "/usr/local/bin/rsync"       # Override rsync binary path
-
-# Docker-wrapped mirror
-# [[mirrors]]
-# name = "docker-mirror"
-# provider = "command"
-# upstream = "https://example.com/"
-# command = "sync-script $TUNASYNC_UPSTREAM_URL"
-# docker_image = "sync-runner:latest"    # Docker image (enables docker hook)
-# docker_volumes = ["/data:/data"]       # Per-mirror Docker volumes
-# docker_options = ["--network=host"]    # Per-mirror Docker options
-# memory_limit = "512M"                  # Memory limit (K/M/G suffix)
-
-# Mirror with custom role and hooks
-# [[mirrors]]
-# name = "slave-mirror"
-# provider = "rsync"
-# upstream = "rsync://master.example.com/mirror/"
-# role = "slave"                         # "master" (default) or "slave"
-# exec_on_success = ["curl -s http://notify/success"]
-# exec_on_failure = ["curl -s http://notify/failure"]
 ```
+
+A fully-commented reference config is available at [`examples/worker.conf`](examples/worker.conf).
 
 ### Manager config (`~/tunasync_demo/manager.conf`)
 
 ```toml
 [server]
-addr = "127.0.0.1"                       # Listen address
-port = 14242                             # Listen port (default: 14242)
-# ssl_cert = "/etc/tunasync/server.crt"  # TLS certificate
-# ssl_key = "/etc/tunasync/server.key"   # TLS private key
-# debug = true                           # Enable debug logging
+addr = "127.0.0.1"
+port = 14242
 
 [files]
-db_type = "sqlite"                       # "redb" (default), "sqlite", or "redis"
-db_file = "/tmp/tunasync/manager-db/tunasync.db"  # DB file path
-# ca_cert = ""                           # CA cert for worker TLS verification
-# status_file = "/var/lib/tunasync/tunasync.json"
-                                         # JSON status snapshot written every 30 s.
-                                         # Skipped if parent dir does not exist.
-                                         # Set to "" to disable.
+db_type = "sqlite"     # "redb" (default), "sqlite", or "redis"
+db_file = "/tmp/tunasync/manager-db/tunasync.db"
 ```
+
+A fully-commented reference config is available at [`examples/manager.conf`](examples/manager.conf).
 
 Supported `db_type` values: `redb` (default), `sqlite`, `redis`. When using Redis, set `db_file` to a Redis URL (e.g. `redis://localhost:6379/0`). Data is wire-compatible with Go — both versions can share the same Redis instance.
 
@@ -288,7 +360,7 @@ tunasynctl start elvish -p 14242 -w test_worker
 
 ```bash
 tunasync manager -c ~/tunasync_demo/manager.conf
-tunasync worker -c ~/tunasync_demo/worker.conf
+tunasync worker  -c ~/tunasync_demo/worker.conf
 ```
 
 Mirror data will be synced into `/tmp/tunasync/`.
@@ -299,24 +371,30 @@ Mirror data will be synced into `/tmp/tunasync/`.
 # List all mirror statuses
 tunasynctl list --all -p 14242
 
-# Start / stop / disable a specific mirror
-tunasynctl start elvish -p 14242
-tunasynctl stop elvish -p 14242
-tunasynctl disable elvish -p 14242
+# Start / stop / disable / restart a mirror (exact name or glob)
+tunasynctl start  elvish   -p 14242
+tunasynctl stop   "debian-*" -p 14242
+tunasynctl disable elvish  -p 14242
+tunasynctl restart "ubuntu-*" -p 14242
 
 # Reload worker config (hot-reload without restart)
-# worker ID is required — use the name= value from [global] in worker.conf
 tunasynctl reload test_worker -p 14242
+
+# Flush disabled mirrors; --stale-only limits to stale ones
+tunasynctl flush              -p 14242
+tunasynctl flush --stale-only -p 14242
+
+# Maintenance mode
+tunasynctl maintenance enable  -p 14242
+tunasynctl maintenance status  -p 14242
+tunasynctl maintenance disable -p 14242
 ```
 
 ### Shell completion
 
-Pre-generated completion scripts for bash, zsh, and fish are in the `completions/` directory. They support static flag completion and — when `jq` is available and the manager is reachable — dynamic completion of mirror names and worker IDs.
+Pre-generated completion scripts for bash, zsh, and fish are in the `completions/` directory.
 
 ```bash
-# bash (system-wide)
-sudo cp completions/tunasynctl.bash /etc/bash_completion.d/tunasynctl
-
 # bash (per user)
 tunasynctl completion bash >> ~/.bashrc && source ~/.bashrc
 
@@ -329,100 +407,67 @@ tunasynctl completion fish > ~/.config/fish/completions/tunasynctl.fish
 
 ### Language / 语言
 
-`tunasynctl` detects the system locale and outputs Chinese when `LANG` (or `LANGUAGE`, `LC_ALL`, `LC_MESSAGES`) starts with `zh`. Use `TUNASYNCTL_LANG` to override explicitly:
+`tunasynctl` detects the system locale and outputs Chinese when `LANG` starts with `zh`. Override with `TUNASYNCTL_LANG`:
 
 ```bash
-TUNASYNCTL_LANG=zh tunasynctl list --format table   # Force Chinese
-TUNASYNCTL_LANG=en tunasynctl list --format table   # Force English
+TUNASYNCTL_LANG=zh tunasynctl list --format table
+TUNASYNCTL_LANG=en tunasynctl list --format table
 ```
 
 ### Security
 
-Worker-manager communication uses HTTP(S). If both run on the same machine, plain HTTP is sufficient — leave `ssl_cert` / `ssl_key` empty on the manager and `ca_cert` empty on the worker, with `api_base` using `http://`.
-
-For encrypted communication, set `ssl_cert` and `ssl_key` on the manager, `ca_cert` on the worker, and use `https://` as the `api_base` prefix.
+For encrypted worker-manager communication, set `ssl_cert` and `ssl_key` on the manager, `ca_cert` on the worker, and use `https://` in `api_base`. For same-host deployments, plain HTTP is sufficient.
 
 ### Running as a systemd service
 
 Service files are provided in the `initscripts/` directory.
 
 ```bash
-# Create tunasync user
 sudo useradd -r -s /bin/false tunasync
-
-# Install binaries
-sudo cp target/release/tunasync /usr/bin/
-sudo cp target/release/tunasynctl /usr/bin/
-
-# Install config and service files
-sudo mkdir -p /etc/tunasync /var/lib/tunasync
+sudo cp target/release/{tunasync,tunasynctl} /usr/bin/
 sudo cp initscripts/tunasync-manager.service /etc/systemd/system/
-sudo cp initscripts/tunasync-worker.service /etc/systemd/system/
-sudo cp manager.conf /etc/tunasync/
-sudo cp worker.conf /etc/tunasync/
-
-# Enable and start
+sudo cp initscripts/tunasync-worker.service  /etc/systemd/system/
+sudo cp manager.conf worker.conf /etc/tunasync/
 sudo systemctl daemon-reload
-sudo systemctl enable --now tunasync-manager
-sudo systemctl enable --now tunasync-worker
+sudo systemctl enable --now tunasync-manager tunasync-worker
 
-# Hot-reload worker config (reads config from disk, applies diff)
+# Hot-reload worker config (reads from disk, diffs against running state)
 sudo systemctl reload tunasync-worker
 ```
 
-The `--with-systemd` flag in the service files suppresses timestamps and ANSI colours in log output, since systemd journal already adds timestamps.
+The `--with-systemd` flag suppresses timestamps and ANSI colours since systemd journal adds its own timestamps.
 
 ### Running with SysVinit (init.d)
 
-Scripts for Debian/Ubuntu-style SysVinit are provided in the `initscripts/` directory.
-
 ```bash
 sudo cp initscripts/tunasync-manager.initd /etc/init.d/tunasync-manager
-sudo cp initscripts/tunasync-worker.initd /etc/init.d/tunasync-worker
+sudo cp initscripts/tunasync-worker.initd  /etc/init.d/tunasync-worker
 sudo chmod +x /etc/init.d/tunasync-manager /etc/init.d/tunasync-worker
-
-# Enable and start
-sudo update-rc.d tunasync-manager defaults
-sudo update-rc.d tunasync-worker defaults
-sudo service tunasync-manager start
-sudo service tunasync-worker start
-
-# Hot-reload worker config
-sudo service tunasync-worker reload
+sudo update-rc.d tunasync-manager defaults && sudo service tunasync-manager start
+sudo update-rc.d tunasync-worker  defaults && sudo service tunasync-worker  start
+sudo service tunasync-worker reload   # hot-reload
 ```
 
 ### Running with OpenRC (Alpine, Gentoo)
 
-Scripts for OpenRC are provided in the `initscripts/` directory.
-
 ```bash
 sudo cp initscripts/tunasync-manager.openrc /etc/init.d/tunasync-manager
-sudo cp initscripts/tunasync-worker.openrc /etc/init.d/tunasync-worker
+sudo cp initscripts/tunasync-worker.openrc  /etc/init.d/tunasync-worker
 sudo chmod +x /etc/init.d/tunasync-manager /etc/init.d/tunasync-worker
-
-# Enable and start
-sudo rc-update add tunasync-manager default
-sudo rc-update add tunasync-worker default
-sudo rc-service tunasync-manager start
-sudo rc-service tunasync-worker start
-
-# Hot-reload worker config
-sudo rc-service tunasync-worker reload
+sudo rc-update add tunasync-manager default && sudo rc-service tunasync-manager start
+sudo rc-update add tunasync-worker  default && sudo rc-service tunasync-worker  start
+sudo rc-service tunasync-worker reload   # hot-reload
 ```
 
 ## Building
 
-Requires Rust stable (>= 1.80). See `rust-toolchain.toml`.
+Requires Rust stable (≥ 1.80). See `rust-toolchain.toml`.
 
 ```bash
-# Build release binaries
 cargo build --release
-# Binaries land at: target/release/{tunasync, tunasynctl}
+# Binaries: target/release/{tunasync, tunasynctl}
 
-# Run test suite (including wire-compat conformance)
-cargo test --workspace
-
-# Lint
+cargo test --workspace       # full suite including wire-compat conformance
 cargo clippy --workspace
 cargo fmt --all
 ```
@@ -431,40 +476,38 @@ cargo fmt --all
 
 ```
 crates/
-+-- protocol/    # Wire types -- JSON-compatible with Go's internal/msg.go
-+-- common/      # Logging, HTTP client helpers, config loader
-+-- manager/     # Manager HTTP server (axum), redb/sqlite/redis storage
-+-- worker/      # Worker runtime: scheduler, job state machine, providers, hooks
-+-- tunasync/    # Combined manager+worker dispatcher binary
-+-- tunasynctl/  # CLI control tool
-+-- migrate/     # Go→Rust data migration tool
+├── protocol/    # Wire types — JSON-compatible with Go's internal/msg.go
+├── common/      # Logging, HTTP client helpers, config loader, util
+├── manager/     # Manager HTTP server (axum), redb/sqlite/redis storage
+├── worker/      # Worker runtime: scheduler, job FSM, providers, hooks
+├── tunasync/    # Combined manager+worker dispatcher binary
+├── tunasynctl/  # CLI control tool
+└── migrate/     # Go→Rust data migration tool
 ```
 
 ### Providers
 
 | Provider | Description |
 |----------|-------------|
-| `command` | Arbitrary shell command |
+| `command` | Arbitrary shell command (env vars injected) |
 | `rsync` | Classic rsync mirror |
-| `two-stage-rsync` | Stage-1 (quick list) + Stage-2 (full sync) |
+| `two-stage-rsync` | Stage-1 (quick list) + Stage-2 (full sync), for large repos like Debian |
+
+All three providers support `disk_quota`, `atomic_publish`, `check_upstream`, `upstream_fallback`, `cron`, `timezone`, `blackout`, and `priority`.
 
 ### Mirror sync status
 
-Each mirror job has exactly one status at any point in time. The status is shown by `tunasynctl list` and exposed in the manager HTTP API.
-
 | Status | Wire value | Meaning |
 |--------|-----------|---------|
-| `None` | `"none"` | Job registered but never run (e.g. worker just started) |
-| `PreSyncing` | `"pre-syncing"` | Pre-sync hooks running (before the main sync command starts) |
-| `Syncing` | `"syncing"` | Main sync command running (includes post-exec hooks) |
-| `Success` | `"success"` | Last sync completed successfully |
-| `Failed` | `"failed"` | Last sync failed; `error_msg` contains the reason |
-| `Paused` | `"paused"` | Sync paused by operator (`tunasynctl stop`) |
-| `Disabled` | `"disabled"` | Job disabled (`tunasynctl disable`); will not run until re-enabled |
+| `None` | `"none"` | Registered but never run |
+| `PreSyncing` | `"pre-syncing"` | Pre-sync hooks running |
+| `Syncing` | `"syncing"` | Main sync command running |
+| `Success` | `"success"` | Last sync succeeded |
+| `Failed` | `"failed"` | Last sync failed; `error_msg` has the reason |
+| `Paused` | `"paused"` | Paused by operator (`tunasynctl stop`) |
+| `Disabled` | `"disabled"` | Disabled; will not run until re-enabled |
 
-Normal lifecycle: `None → PreSyncing → Syncing → Success / Failed → (next schedule) → PreSyncing → …`
-
-A `Failed` mirror keeps its `error_msg` until the next successful sync clears it. You can filter by status in `tunasynctl list`:
+Filter by status:
 
 ```bash
 tunasynctl list --status failed
@@ -478,7 +521,7 @@ tunasynctl list --status syncing,pre-syncing
 | `exec_post` | Run command after sync phases |
 | `loglimit` | Rotate / truncate logs |
 | `docker` | Wrap sync inside a Docker container |
-| `cgroup` | Limit CPU/memory via cgroups |
+| `cgroup` | Limit CPU/memory via cgroups (Linux) |
 | `btrfs_snapshot` | Btrfs snapshot before/after sync |
 | `zfs_snapshot` | ZFS snapshot before/after sync |
 
@@ -487,125 +530,61 @@ tunasynctl list --status syncing,pre-syncing
 ### `tunasync`
 
 ```
-tunasync — Mirror job management tool
-
-Usage: tunasync [OPTIONS] <COMMAND>
-
-Commands:
-  manager  Run as a manager server
-  worker   Run as a worker
-
-Options:
-  -v, --verbose       Verbose logging
-      --with-systemd  Suppress timestamps/ANSI for systemd journal
-  -h, --help          Print help
-  -V, --version       Print version
-
 tunasync manager [OPTIONS]
-  -c, --config <CONFIG>    Config file path [default: /etc/tunasync/manager.conf]
+  -c, --config <CONFIG>    Config file [default: /etc/tunasync/manager.conf]
       --addr <ADDR>        Override listen address
-      --port <PORT>        Override listen port (default: 14242)
-      --cert <CERT>        TLS certificate file (enables HTTPS)
-      --key <KEY>          TLS private key file (enables HTTPS)
-      --db-file <DB_FILE>  Override database file path
-      --db-type <DB_TYPE>  Override database type: redb, sqlite, redis
-      --debug              Enable debug-level logging
-      --pidfile <PIDFILE>  PID file [default: /run/tunasync/tunasync.manager.pid]
-      --with-systemd       Suppress timestamps/ANSI for systemd journal
+      --port <PORT>        Override listen port (default 14242)
+      --cert / --key       TLS certificate/key (enables HTTPS)
+      --db-file / --db-type  Override DB path / type
 
 tunasync worker [OPTIONS]
-  -c, --config <CONFIG>    Config file path [default: /etc/tunasync/worker.conf]
-      --pidfile <PIDFILE>  PID file [default: /run/tunasync/tunasync.worker.pid]
-      --with-systemd       Suppress timestamps/ANSI for systemd journal
+  -c, --config <CONFIG>    Config file [default: /etc/tunasync/worker.conf]
 ```
 
 ### `tunasynctl`
 
 ```
-tunasynctl — Control a tunasync manager
-
-Usage: tunasynctl [OPTIONS] <COMMAND>
-
-Commands:
-  list       List all mirror jobs
-  workers    List all registered workers
-  flush      Flush disabled job rows from DB
-  rm-worker  Remove a worker from the manager
-  set-size   Update mirror size (operator override)
-  start      Start a mirror job
-  stop       Stop a running mirror job
-  disable    Disable a mirror job
-  restart    Restart a mirror job
-  reload     Tell a worker to reload config from disk
-
-Global options:
-  -c, --config <CONFIG>     Config file (overrides system/user config)
-  -m, --manager <MANAGER>   Manager host/IP [env: TUNASYNC_MANAGER]
-  -p, --port <PORT>         Manager port [env: TUNASYNC_MANAGER_PORT]
-      --ca-cert <CA_CERT>   CA cert (switches to HTTPS)
-  -v, --verbose             Verbose logging
-
-tunasynctl list [OPTIONS]
-  -w, --worker <WORKER>     Filter by worker
-      --status <STATUS>     Filter by status (comma-separated)
-      --format <FORMAT>     Output format: json (default) or table
-      --all                  Show all workers' jobs
-
-tunasynctl start <MIRROR> [-w <WORKER>] [-f]
-  MIRROR   Mirror name, or "all" to broadcast
-  -f       Force-start (ignore concurrency limit)
-
-tunasynctl stop <MIRROR> [-w <WORKER>]
-tunasynctl disable <MIRROR> [-w <WORKER>]
-tunasynctl restart <MIRROR> [-w <WORKER>]
-
-tunasynctl set-size <MIRROR> <SIZE> [-w <WORKER>]
-  SIZE   Human-readable size, e.g. "1.2T"
-
-tunasynctl rm-worker <WORKER>
-tunasynctl flush
-tunasynctl reload <WORKER>
+tunasynctl list       [--all] [-w WORKER] [--status STATUS] [--format json|table]
+tunasynctl workers
+tunasynctl start      <MIRROR|GLOB> [-w WORKER] [-f]
+tunasynctl stop       <MIRROR|GLOB> [-w WORKER]
+tunasynctl disable    <MIRROR|GLOB> [-w WORKER]
+tunasynctl restart    <MIRROR|GLOB> [-w WORKER]
+tunasynctl reload     <WORKER>
+tunasynctl set-size   <MIRROR> <SIZE> [-w WORKER]
+tunasynctl rm-worker  <WORKER>
+tunasynctl flush      [--stale-only]
+tunasynctl stale      [-w WORKER]
+tunasynctl maintenance enable | disable | status
+tunasynctl completion bash | zsh | fish | powershell
 ```
 
-Config file priority for `tunasynctl`:
+`MIRROR|GLOB` accepts exact names or glob patterns (`*`, `?`, `[…]`). Patterns are expanded by querying the manager; exact names skip the query for zero overhead.
 
-1. `/etc/tunasync/ctl.conf` (system-wide)
-2. `$HOME/.config/tunasync/ctl.conf` (user-specific)
-3. `--config FILE` (explicit override)
-4. CLI flags (`--manager`, `--port`, `--ca-cert`)
+Config file priority: `/etc/tunasync/ctl.conf` → `~/.config/tunasync/ctl.conf` → `--config FILE` → CLI flags.
 
 ### `tunasync-migrate`
 
 ```
-Usage: tunasync-migrate <go-manager-url-or-bolt-file> <sqlite-output-file>
+tunasync-migrate <go-manager-url-or-bolt-file> <sqlite-output-file>
 
-Examples:
-  # Offline: read Go's bolt file directly (Go manager must be stopped)
-  tunasync-migrate /var/lib/tunasync/tunasync.db /var/lib/tunasync/new.db
+# Offline (Go manager stopped)
+tunasync-migrate /var/lib/tunasync/tunasync.db /var/lib/tunasync/new.db
 
-  # Online: pull data from running Go manager
-  tunasync-migrate http://localhost:12345 /var/lib/tunasync/new.db
+# Online (Go manager running)
+tunasync-migrate http://localhost:12345 /var/lib/tunasync/new.db
 ```
-
-## Roadmap
-
-| Stage | Scope | Status |
-|-------|-------|--------|
-| 1 | Workspace, wire-compat protocol types, common utilities | Done |
-| 2 | Manager: HTTP routes, redb + sqlite adapters, worker lifecycle | Done |
-| 3 | Worker: scheduler, job state machine, cmd_provider, manager handshake | Done |
-| 4 | rsync + two-stage rsync providers, exec_post & loglimit hooks | Done |
-| 5 | cgroup, docker, zfs, btrfs hooks | Done |
-| 6 | tunasynctl CLI, CI/release, production hardening | In progress |
 
 ## Wire compatibility
 
-`tunasync-protocol` round-trips every JSON shape Go produces. See `crates/protocol/tests/wire_compat.rs` for the conformance suite. Notable subtleties:
+`tunasync-protocol` round-trips every JSON shape Go produces. See `crates/protocol/tests/wire_compat.rs` for the conformance suite.
 
-- `SyncStatus::PreSyncing` serialises as `"pre-syncing"` (hyphen) -- matches Go.
-- Go's `time.Time{}` zero value (`"0001-01-01T00:00:00Z"`) is preserved by `tunasync_protocol::zero_time()`. Do **not** use `chrono::DateTime::default()` for "unset" timestamps -- that's the Unix epoch, a different sentinel.
-- `MirrorStatus::scheduled` -> `next_schedule` on the wire (matching Go's struct tag).
-- `MirrorSchedule::mirror_name` -> `name` on the wire.
+Notable subtleties:
+
+- `SyncStatus::PreSyncing` serialises as `"pre-syncing"` (hyphen) — matches Go.
+- Go's `time.Time{}` zero value (`"0001-01-01T00:00:00Z"`) is preserved by `tunasync_protocol::zero_time()`. Do **not** use `chrono::DateTime::default()` for "unset" timestamps — that's the Unix epoch.
+- `MirrorStatus::scheduled` → `next_schedule` on the wire (matching Go's struct tag).
+- `MirrorStatus` extension fields (`last_transferred_bytes`, `total_transferred_bytes`, `consecutive_failures`, `stale`) use `#[serde(default, skip_serializing_if = "is_default")]` so a Go manager or worker sees plain Go-compatible JSON when all fields are zero/false.
 
 ### Known differences from Go
 
@@ -614,37 +593,36 @@ Examples:
 | Manager: size update | `&&` instead of Go's buggy `||` | Go bug: condition always true |
 | Manager: heartbeat | Added `POST /workers/:id/heartbeat` | More robust than implicit refresh |
 | Manager: deleteWorker | 400 on invalid ID (Go: 500) | More useful error |
-| Manager: DB | Redis backend added | redb, sqlite, redis all supported |
-| Manager: GET /jobs/:name | Mirror detail with `error_msg` across all workers | New endpoint for frontend |
+| Manager: DB | redb, sqlite, redis | BoltDB/LevelDB/Badger not supported |
+| Manager: GET /jobs/:name | Mirror detail with `error_msg` | New endpoint for frontends |
+| Manager: maintenance mode | `POST/DELETE/GET /maintenance` | No Go equivalent |
+| Worker: scheduling | Cron + timezone + blackout | No Go equivalent |
+| Worker: disk quota | Pre-sync free space check | No Go equivalent |
+| Worker: priority | `PrioritySemaphore` for job ordering | No Go equivalent |
+| Worker: atomic publish | `renameat2(RENAME_EXCHANGE)` swap | No Go equivalent |
+| Worker: upstream probe | Concurrent probe with 15s timeout | No Go equivalent |
+| Default port | 14242 (Go: 12345) | Intentional, avoids conflict |
 
 ## API Reference
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/metrics` | Prometheus metrics (mirror status, size, timestamps, worker count) |
-| GET | `/jobs` | List all mirrors (summary, no `error_msg`) |
-| HEAD | `/jobs` | Check mirror availability (same as GET, no body) |
-| GET | `/jobs/:name` | Mirror detail across all workers (includes `error_msg`, timestamps) |
-| DELETE | `/jobs/disabled` | Flush all disabled mirror rows |
+| GET | `/metrics` | Prometheus metrics |
+| GET | `/jobs` | List all mirrors (summary) |
+| GET | `/jobs/:name` | Mirror detail across all workers (includes `error_msg`) |
+| DELETE | `/jobs/disabled` | Flush disabled mirror rows |
 | GET | `/workers` | List registered workers (tokens redacted) |
-| POST | `/workers` | Register a new worker |
-| DELETE | `/workers/:id` | Delete a worker |
+| POST | `/workers` | Register a worker |
+| DELETE | `/workers/:id` | Remove a worker |
 | POST | `/workers/:id/heartbeat` | Worker heartbeat |
 | GET | `/workers/:id/jobs` | List mirrors of one worker |
-| POST | `/workers/:id/jobs/:job` | Update mirror status (worker → manager) |
+| POST | `/workers/:id/jobs/:job` | Update mirror status |
 | POST | `/workers/:id/jobs/:job/size` | Update mirror size |
 | POST | `/workers/:id/schedules` | Update schedules |
-| POST | `/cmd` | Send control command (start/stop/disable/reload) |
-
-`GET /jobs/:name` returns `Vec<MirrorStatus>` — the full status object including `error_msg`. For example:
-
-```bash
-curl http://localhost:14242/jobs/ubuntu
-# → [ { "name": "ubuntu", "worker": "w1", "status": "failed", "error_msg": "rsync: timeout", ... } ]
-
-curl http://localhost:14242/jobs/nonexistent
-# → []
-```
+| POST | `/cmd` | Control command (start/stop/disable/reload) |
+| POST | `/maintenance` | Enable maintenance mode |
+| DELETE | `/maintenance` | Disable maintenance mode |
+| GET | `/maintenance` | Get maintenance mode status |
 
 ## License
 

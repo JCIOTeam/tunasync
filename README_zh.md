@@ -12,7 +12,7 @@
 
 Linux（x86_64、aarch64、armv7、riscv64、loongarch64、x86_64-musl、aarch64-musl）的预编译二进制文件可在 [GitHub Releases](https://github.com/JCIOTeam/tunasync/releases) 下载。每个压缩包仅包含 `tunasync` 和 `tunasynctl`。
 
-`tunasync-migrate` 不包含在发布包中 — 它是一次性迁移工具，大多数用户在切换到 Rust 版本后不再需要。获取方式：
+`tunasync-migrate` 不包含在发布包中 — 它是一次性迁移工具，大多数用户切换到 Rust 版本后不再需要。获取方式：
 
 1. 从源码构建：`cargo build --release -p tunasync-migrate`
 2. 从任意成功的 release 构建 [CI artifacts](https://github.com/JCIOTeam/tunasync/actions/workflows/release.yml) 中下载
@@ -25,36 +25,31 @@ tunasync-rs 与 Go 实现**线路兼容**：Rust manager 可以驱动 Go worker�
 
 ### 迁移步骤
 
-1. **安装 Rust 二进制** — 从 [Releases](https://github.com/JCIOTeam/tunasync/releases) 下载 `tunasync` 和 `tunasynctl` 或从源码编译，复制到 `/usr/bin/`。如需 `tunasync-migrate`，单独构建：`cargo build --release -p tunasync-migrate`
-2. **保留配置文件** — Rust 版本读取相同 TOML 格式，无需修改
+1. **安装 Rust 二进制** — 从 [Releases](https://github.com/JCIOTeam/tunasync/releases) 下载或从源码编译，复制到 `/usr/bin/`。如需 `tunasync-migrate`，单独构建：`cargo build --release -p tunasync-migrate`
+2. **保留配置文件** — Rust 版本读取相同的 TOML 格式，无需修改
 3. **迁移数据** — Rust 版本默认使用 redb 作为数据库后端（Go 默认 BoltDB）。如果 Go 版本使用 BoltDB（默认），需要通过 `tunasync-migrate` 导出数据。支持两种方式：
 
-   **方式 A — 离线迁移（推荐，无停机时间要求）：**
-   先停止 Go manager，直接读取 bolt 数据库文件：
+   **方式 A — 离线迁移（推荐）：**
    ```bash
    systemctl stop tunasync-manager tunasync-worker
-
-   # 指向 Go 的 bolt 文件（默认路径：/var/lib/tunasync/tunasync.db）
    tunasync-migrate /var/lib/tunasync/tunasync.db /var/lib/tunasync/new.db
    ```
 
    **方式 B — 在线迁移（Go manager 仍在运行）：**
-   适合在 Go 版本继续提供服务的同时准备好新数据库：
    ```bash
-   # Go manager 默认端口为 12345
    tunasync-migrate http://localhost:12345 /var/lib/tunasync/new.db
    ```
 
-   两种方式完成后，修改 Rust manager 配置：
+   完成后修改 Rust manager 配置：
    ```toml
    [files]
    db_type = "sqlite"
    db_file = "/var/lib/tunasync/new.db"
    ```
 
-   **如果 Go 版本使用 Redis**，则无需迁移 — 两个版本可以直接共享同一个 Redis 实例。
+   **如果 Go 版本使用 Redis**，无需迁移 — 两个版本可直接共享同一个 Redis 实例。
 
-4. **停止 Go 服务**（如果尚未停止） — `systemctl stop tunasync-manager tunasync-worker`
+4. **停止 Go 服务**（如尚未停止）— `systemctl stop tunasync-manager tunasync-worker`
 5. **启动 Rust 服务** — `systemctl start tunasync-manager tunasync-worker`
 6. **验证** — `tunasynctl list` 应显示所有镜像及其上次同步时间
 
@@ -62,27 +57,162 @@ tunasync-rs 与 Go 实现**线路兼容**：Rust manager 可以驱动 Go worker�
 
 | 功能 | Go 版本 | Rust 版本 |
 |------|---------|----------|
-| 配置格式 | TOML，相同字段名 | 兼容 |
-| `[include]` 段 | Glob 匹配加载子配置 | 兼容 |
-| `{{.Name}}` 模板 | log_dir 中模板展开 | 兼容 |
-| SIGHUP 热重载 | 重新加载镜像配置 | 兼容 |
-| 数据库后端 | BoltDB、LevelDB、Badger、Redis | redb / sqlite / redis |
-| Docker hook | 容器包装 | 兼容 |
-| Cgroup hook | v1/v2 内存限制 | 兼容 |
-| Btrfs/ZFS hook | 同步前后快照 | 兼容 |
-| 线路协议 | JSON REST API | 完全兼容 |
+| 配置格式 | TOML，相同字段名 | ✅ 兼容 |
+| `[include]` 段 | 基于 glob 的镜像配置 | ✅ 支持 |
+| `{{.Name}}` 日志目录 | 模板展开 | ✅ 支持 |
+| SIGHUP 热重载 | 重载镜像配置 | ✅ 支持 |
+| 数据库后端 | BoltDB、LevelDB、Badger、Redis | redb、sqlite、redis |
+| Docker 钩子 | 容器包装 | ✅ 兼容 |
+| Cgroup 钩子 | v1/v2 内存限制 | ✅ 兼容 |
+| Btrfs/ZFS 钩子 | 快照 | ✅ 兼容 |
+| 线路协议 | JSON REST API | ✅ 完全兼容 |
 | 默认端口 | 12345 | 14242 |
-| `tunasynctl` CLI | 相同命令 | 兼容（支持 `-p`、`-w` 短参数） |
+| `tunasynctl` CLI | 相同命令 | ✅ 兼容 |
+
+## Rust 版本新功能
+
+以下功能是 tunasync-rs 独有的，Go 版本没有对应实现。全部默认关闭、按需配置，现有 Go 配置文件无需修改即可使用。
+
+### 磁盘配额预检
+
+同步前检查磁盘剩余空间，不足则跳过本次同步（镜像保留在队列中，下次到期时重试）：
+
+```toml
+[[mirrors]]
+name = "debian"
+disk_quota = "100G"   # 镜像目录剩余空间 < 100 GiB 时跳过同步
+```
+
+### Cron 调度
+
+用标准 5 字段 cron 表达式替代固定间隔：
+
+```toml
+[[mirrors]]
+name = "kernel"
+cron = "0 3 * * *"   # 每天 03:00（在该镜像生效的时区内）
+```
+
+支持 5 字段 POSIX 格式（`分 时 日 月 周`）和 cron crate 的 6/7 字段格式。无效表达式在 worker 启动时报错。
+
+### 时区感知调度
+
+cron 表达式和 blackout 窗口默认解释为 **UTC 时间**。通过 `timezone` 字段指定本地时间：
+
+```toml
+[global]
+timezone = "Asia/Shanghai"   # 所有镜像默认使用 CST
+
+[[mirrors]]
+name = "euromirror"
+timezone = "Europe/Berlin"   # 单个镜像覆盖全局设置
+cron = "0 3 * * *"           # 在柏林时间 03:00 触发，而非 UTC 03:00
+```
+
+有效值为 IANA 时区名（如 `"Asia/Shanghai"`、`"America/New_York"`、`"Europe/Berlin"`、`"UTC"`）。无效名称在 worker 启动时报错，而非静默产生错误调度。
+
+> **从 Go 迁移注意：** Go worker 隐式使用宿主机本地时区。如果你的 cron/blackout 配置依赖本地时间，切换到 Rust 版本时必须**显式**设置 `timezone`。
+
+### 屏蔽时间窗（Blackout）
+
+在繁忙时段内屏蔽新同步任务的启动。**已在运行的同步不会被中断**，仅阻止新的启动。调度器在 blackout 期间将任务推迟 5 分钟后重试：
+
+```toml
+[[mirrors]]
+name = "debian"
+# 按该镜像生效的时区（见上方）解释，默认 UTC
+blackout = ["08:00-18:00 Mon-Fri", "22:00-04:00"]
+```
+
+格式：`"HH:MM-HH:MM [<天范围>]"`。天范围支持 `Mon-Fri`、`Sat-Sun`、单个工作日、`daily`（等同于不指定）。跨午夜：`"22:00-04:00"` 覆盖 22:00–23:59 和 00:00–04:00。
+
+### 任务优先级
+
+多个任务争抢并发槽时，高优先级镜像优先获得执行机会：
+
+```toml
+[[mirrors]]
+name = "critical"
+priority = 90   # 默认 50；越大越先执行
+```
+
+### 单上游并发限制
+
+独立于全局 `concurrent`，限制同时从同一上游主机同步的镜像数量：
+
+```toml
+[global.per_upstream_concurrent]
+"rsync.kernel.org" = 2
+"ftp.debian.org"   = 1
+```
+
+该配置支持热重载（SIGHUP / `tunasynctl reload`），修改立即生效。全局 `concurrent` 限制仍然有效，`per_upstream_concurrent` 在其基础上叠加约束。
+
+### 上游探测与回退
+
+同步前探测上游可达性。主上游不可达时并发探测回退列表（每个 URL 15 秒超时）；所有 URL 均不可达则跳过本次同步（非永久失败）：
+
+```toml
+[[mirrors]]
+name = "kernel"
+check_upstream = true
+upstream_fallback = ["rsync://mirror.example.com/kernel/"]
+```
+
+回退列表**仅用于健康探测**，实际同步数据源始终是 `upstream`。
+
+### 原子发布
+
+先将 rsync 输出写入暂存目录（`<log_dir>/staging/<name>/`，**不在** nginx 服务根目录下），成功后通过 `renameat2(RENAME_EXCHANGE)` 原子交换，用户始终看到完整的旧版或新版内容，不会出现 publish 路径消失的窗口：
+
+```toml
+[[mirrors]]
+name = "debian"
+atomic_publish = true
+```
+
+**要求：** `log_dir` 与 `mirror_dir` 必须在**同一文件系统**（rename 仅在同一挂载点内是原子的）。worker 在同步前通过 statvfs 检查设备 ID，不一致则拒绝同步。
+
+不支持 `RENAME_EXCHANGE`（Linux 3.15 以下内核或部分 FUSE 挂载）时自动回退到两步 rename（有极短 404 窗口），并打印警告日志。
+
+### 维护模式
+
+将 manager 置于只读状态，所有变更 API（同步更新、控制命令）返回 503，直到关闭维护模式：
+
+```bash
+tunasynctl maintenance enable
+tunasynctl maintenance status
+tunasynctl maintenance disable
+```
+
+### tunasynctl 支持 glob 匹配
+
+`stop`、`disable`、`restart`、`start` 命令支持 glob 模式，一次操作多个镜像：
+
+```bash
+tunasynctl disable "debian-*"
+tunasynctl restart "ubuntu-*" -w worker1
+tunasynctl stop "*"
+```
+
+精确名称不触发 glob 查询（与之前性能一致）。
+
+### 清除 stale 镜像
+
+```bash
+tunasynctl flush --stale-only    # 仅清除被标记为 stale 的镜像
+tunasynctl stale                 # 列出所有 stale 镜像
+```
 
 ## 设计
 
-架构与上游一致，协议映射详见 `docs/wire-compat.md`。
+与上游架构相同，协议映射详见 `docs/wire-compat.md`。
 
 ### 整体架构
 
 ```
 +------------+ +---+                  +---+
-| Client API | |   |    Job Status    |   |    +----------+     +----------+
+| Client API | |   |   Job Status     |   |    +----------+     +----------+
 +------------+ |   +----------------->|   |--->|  mirror  +---->|  mirror  |
 +------------+ |   |                  | w |    |  config  |     | provider |
 | Worker API | | H |                  | o |    +----------+     +----+-----+
@@ -90,12 +220,12 @@ tunasync-rs 与 Go 实现**线路兼容**：Rust manager 可以驱动 Go worker�
 +------------+ | T +----------------->| k |       +------------+     |
 | Job/Status | | P |                  | e |       | mirror job |<----+
 | Management | | S |                  | r |       +------^-----+
-+------------+ |   |   Update Status  |   |    +---------+---------+
++------------+ |   |  Update Status   |   |    +---------+---------+
 +------------+ |   <------------------+   |    |     Scheduler     |
 |  redb /    | |   |                  |   |    +-------------------+
 |  sqlite    | +---+                  +---+
-|  redis     |                          |
-+------------+                          +
+|  redis     |
++------------+
 ```
 
 ### Job 运行流程
@@ -103,12 +233,12 @@ tunasync-rs 与 Go 实现**线路兼容**：Rust manager 可以驱动 Go worker�
 ```
          ┌─────────────────────────────┐
          │       PreSyncing             │
-         │  (pre-job → pre-exec hooks) │
+         │  (pre-job → pre-exec 钩子)  │
          └──────────────┬──────────────┘
                         │
          ┌──────────────▼──────────────┐
          │         Syncing              │
-         │   (job run → post-exec)     │
+         │   (job 运行 → post-exec)    │
          └──────────────┬──────────────┘
                         │
               ┌─────────┴─────────┐
@@ -121,8 +251,6 @@ tunasync-rs 与 Go 实现**线路兼容**：Rust manager 可以驱动 Go worker�
 
 ## 快速入门
 
-创建目录：
-
 ```bash
 mkdir -p ~/tunasync_demo /tmp/tunasync/{log,manager-db}
 ```
@@ -131,144 +259,77 @@ mkdir -p ~/tunasync_demo /tmp/tunasync/{log,manager-db}
 
 ```toml
 [global]
-name = "test_worker"                     # Worker 名称（用作 worker_id）
-log_dir = "/tmp/tunasync/log"            # 默认日志目录
-mirror_dir = "/tmp/tunasync"             # 默认镜像数据目录
-concurrent = 10                          # 最大并发同步数（0 = 不限）
-interval = 120                           # 默认同步间隔（分钟）
-retry = 3                                # 默认失败重试次数
-timeout = 600                            # 默认超时时间（秒，0 = 不限）
-# rsync_options = ["--no-motd"]          # 全局 rsync 选项，追加到每个 rsync 任务
-# exec_on_success = []                   # 全局同步成功后执行的命令
-# exec_on_failure = []                   # 全局同步失败后执行的命令
+name = "test_worker"
+log_dir = "/tmp/tunasync/log"
+mirror_dir = "/tmp/tunasync"
+concurrent = 10
+interval = 120
+retry = 3
+timeout = 600
+
+# 时区设置（可选，默认 UTC）
+# timezone = "Asia/Shanghai"
+
+# 单上游并发限制（可选）
+# [global.per_upstream_concurrent]
+# "rsync.kernel.org" = 2
 
 [manager]
-api_base = "http://localhost:14242"      # Manager URL（单个）
-# api_base_list = [                      # 多个 Manager（覆盖 api_base）
-#     "http://mgr1:14242",
-#     "http://mgr2:14242",
-# ]
-# ca_cert = "/etc/tunasync/ca.crt"       # TLS CA 证书
+api_base = "http://localhost:14242"
 
 [server]
-hostname = "localhost"                   # Worker 公网主机名
-listen_addr = "127.0.0.1"               # Worker HTTP 监听地址
-listen_port = 6000                       # Worker HTTP 监听端口
-# ssl_cert = ""                          # Worker TLS 证书
-# ssl_key = ""                           # Worker TLS 密钥
+hostname = "localhost"
+listen_addr = "127.0.0.1"
+listen_port = 6000
 
-# Docker hook — 在容器内运行同步（与 cgroup 互斥）
-[docker]
-enable = false
-# volumes = ["/data:/data"]              # 全局 Docker 卷映射
-# options = ["--network=host"]           # 全局 Docker 选项
-
-# Cgroup hook — 限制每个任务的 CPU/内存（仅 Linux，与 docker 互斥）
-[cgroup]
-enable = false
-# base_path = "/sys/fs/cgroup"          # Cgroup 挂载路径
-# group = "tunasync"                    # Cgroup slice 名称
-
-# ZFS 快照 hook
-[zfs]
-enable = false
-# zpool = "tank"                        # ZFS 池名
-
-# Btrfs 快照 hook（仅 Linux）
-[btrfs_snapshot]
-enable = false
-# snapshot_path = "/snapshots"          # Btrfs 快照目录
-
-# 通过 Glob 包含额外的镜像配置
-[include]
-# include_mirrors = "/etc/tunasync/mirrors.d/*.conf"   # Go 兼容的 [include] 段
-
-# --- 镜像定义 ---
-# provider 类型: "command"、"rsync"、"two-stage-rsync"
-
-# 简单 rsync 镜像
 [[mirrors]]
 name = "elvish"
 provider = "rsync"
 upstream = "rsync://rsync.elv.sh/elvish/"
 use_ipv4 = true
-# interval = 60                          # 覆盖全局间隔（分钟）
-# retry = 3                              # 覆盖全局重试次数
-# timeout = 600                          # 覆盖全局超时（秒）
-# mirror_dir = "/data/elvish"            # 覆盖全局 mirror_dir
-# log_dir = "/var/log/tunasync/elvish"   # 覆盖全局 log_dir
-# username = "mirror"                    # Rsync 用户名
-# password = "secret"                    # Rsync 密码（环境变量: RSYNC_PASSWORD）
-# exclude_file = "/etc/tunasync/exclude.txt"  # Rsync exclude-from 文件
+# cron = "0 3 * * *"
+# timezone = "Asia/Shanghai"
+# blackout = ["08:00-18:00 Mon-Fri"]
+# disk_quota = "100G"
+# priority = 50
+# check_upstream = false
+# upstream_fallback = []
+# atomic_publish = false
 
-# 命令镜像（执行任意 shell 命令）
 [[mirrors]]
 name = "myrepo"
 provider = "command"
 upstream = "https://example.com/repo/"
 command = "wget -m -np -nd https://example.com/repo/ -P /path/to/mirror"
-# fail_on_match = "error|failed"         # 正则匹配日志则判定失败
-# size_pattern = "Total size: ([\\d.]+[KMG])"  # 从日志提取大小
-# success_exit_codes = [0, 1, 2]         # 将这些退出码视为成功
-# env = { "MY_VAR" = "value" }           # 附加环境变量
-# tunasync 始终注入以下环境变量供命令使用：
-#   TUNASYNC_MIRROR_NAME    镜像名称（即 [[mirrors]] 的 name 字段）
-#   TUNASYNC_WORKING_DIR    镜像数据目录（生效路径）
-#   TUNASYNC_UPSTREAM_URL   upstream 字段值
-#   TUNASYNC_LOG_DIR        日志目录（日志文件的父目录）
-#   TUNASYNC_LOG_FILE       当前日志文件的完整路径
+# 注入的环境变量：
+#   TUNASYNC_MIRROR_NAME, TUNASYNC_WORKING_DIR, TUNASYNC_UPSTREAM_URL,
+#   TUNASYNC_LOG_DIR, TUNASYNC_LOG_FILE
 
-# 两阶段 rsync（适用于 Debian 等大型仓库）
 [[mirrors]]
 name = "debian"
 provider = "two-stage-rsync"
 upstream = "rsync://ftp.debian.org/debian/"
-stage1_profile = "debian"                # "debian" 或 "debian-oldstyle"
+stage1_profile = "debian"
 use_ipv4 = true
-# command = "/usr/local/bin/rsync"       # 自定义 rsync 二进制路径
-
-# Docker 包装的镜像
-# [[mirrors]]
-# name = "docker-mirror"
-# provider = "command"
-# upstream = "https://example.com/"
-# command = "sync-script $TUNASYNC_UPSTREAM_URL"
-# docker_image = "sync-runner:latest"    # Docker 镜像（启用 docker hook）
-# docker_volumes = ["/data:/data"]       # 每个镜像的 Docker 卷映射
-# docker_options = ["--network=host"]    # 每个镜像的 Docker 选项
-# memory_limit = "512M"                  # 内存限制（K/M/G 后缀）
-
-# 自定义角色和钩子的镜像
-# [[mirrors]]
-# name = "slave-mirror"
-# provider = "rsync"
-# upstream = "rsync://master.example.com/mirror/"
-# role = "slave"                         # "master"（默认）或 "slave"
-# exec_on_success = ["curl -s http://notify/success"]
-# exec_on_failure = ["curl -s http://notify/failure"]
 ```
+
+完整注释的参考配置见 [`examples/worker.conf`](examples/worker.conf)。
 
 ### Manager 配置 (`~/tunasync_demo/manager.conf`)
 
 ```toml
 [server]
-addr = "127.0.0.1"                       # 监听地址
-port = 14242                             # 监听端口（默认: 14242）
-# ssl_cert = "/etc/tunasync/server.crt"  # TLS 证书
-# ssl_key = "/etc/tunasync/server.key"   # TLS 密钥
-# debug = true                           # 启用调试日志
+addr = "127.0.0.1"
+port = 14242
 
 [files]
-db_type = "sqlite"                       # "redb"（默认）、"sqlite" 或 "redis"
-db_file = "/tmp/tunasync/manager-db/tunasync.db"  # 数据库文件路径
-# ca_cert = ""                           # Worker TLS 验证的 CA 证书
-# status_file = "/var/lib/tunasync/tunasync.json"
-                                         # 每 30 秒写一次的 JSON 状态快照文件。
-                                         # 父目录不存在时自动跳过。
-                                         # 设为 "" 可禁用。
+db_type = "sqlite"     # "redb"（默认）、"sqlite" 或 "redis"
+db_file = "/tmp/tunasync/manager-db/tunasync.db"
 ```
 
-支持的 `db_type`：`redb`（默认）、`sqlite`、`redis`。使用 Redis 时，`db_file` 应设为 Redis URL（如 `redis://localhost:6379/0`）。数据与 Go 版完全兼容 — 两个版本可以共享同一个 Redis 实例。
+完整注释的参考配置见 [`examples/manager.conf`](examples/manager.conf)。
+
+`db_type` 为 `redis` 时，`db_file` 填写 Redis URL（如 `redis://localhost:6379/0`）。数据格式与 Go 版本兼容，两个版本可共享同一 Redis 实例。
 
 ### tunasynctl 配置 (`~/.config/tunasync/ctl.conf`)
 
@@ -277,7 +338,7 @@ manager_addr = "127.0.0.1"
 manager_port = 14242
 ```
 
-或通过命令行指定：
+也可以通过命令行参数指定：
 
 ```bash
 tunasynctl list --all -p 14242
@@ -288,35 +349,39 @@ tunasynctl start elvish -p 14242 -w test_worker
 
 ```bash
 tunasync manager -c ~/tunasync_demo/manager.conf
-tunasync worker -c ~/tunasync_demo/worker.conf
+tunasync worker  -c ~/tunasync_demo/worker.conf
 ```
 
-镜像数据将同步到 `/tmp/tunasync/`。
+镜像数据同步到 `/tmp/tunasync/`。
 
 ### 控制
 
 ```bash
-# 查看所有镜像状态
+# 列出所有镜像状态
 tunasynctl list --all -p 14242
 
-# 启动 / 停止 / 禁用指定镜像
-tunasynctl start elvish -p 14242
-tunasynctl stop elvish -p 14242
-tunasynctl disable elvish -p 14242
+# 启动 / 停止 / 禁用 / 重启（支持精确名称或 glob）
+tunasynctl start   elvish      -p 14242
+tunasynctl stop    "debian-*"  -p 14242
+tunasynctl disable elvish      -p 14242
+tunasynctl restart "ubuntu-*"  -p 14242
 
-# 热重载 Worker 配置（无需重启）
-# 需要指定 worker ID，即 worker.conf 中 [global] name 字段的值
+# 热重载 worker 配置（从磁盘重读，差量应用）
 tunasynctl reload test_worker -p 14242
+
+# 清除 disabled 镜像；--stale-only 仅清除 stale 镜像
+tunasynctl flush              -p 14242
+tunasynctl flush --stale-only -p 14242
+
+# 维护模式
+tunasynctl maintenance enable  -p 14242
+tunasynctl maintenance status  -p 14242
+tunasynctl maintenance disable -p 14242
 ```
 
 ### Shell 自动补全
 
-`completions/` 目录中提供了预生成的 bash、zsh、fish 补全脚本。当 `jq` 可用且 manager 可访问时，支持动态补全镜像名称和 Worker ID。
-
 ```bash
-# bash（系统级，推荐）
-sudo cp completions/tunasynctl.bash /etc/bash_completion.d/tunasynctl
-
 # bash（当前用户）
 tunasynctl completion bash >> ~/.bashrc && source ~/.bashrc
 
@@ -329,100 +394,65 @@ tunasynctl completion fish > ~/.config/fish/completions/tunasynctl.fish
 
 ### 语言设置
 
-`tunasynctl` 会自动检测系统 locale。当 `LANG`、`LANGUAGE`、`LC_ALL` 或 `LC_MESSAGES` 以 `zh` 开头时，输出中文；否则默认英文。可通过 `TUNASYNCTL_LANG` 强制指定：
+`tunasynctl` 检测系统 locale，当 `LANG` 以 `zh` 开头时输出中文。通过 `TUNASYNCTL_LANG` 强制指定：
 
 ```bash
-TUNASYNCTL_LANG=zh tunasynctl list --format table   # 强制中文
-TUNASYNCTL_LANG=en tunasynctl list --format table   # 强制英文
+TUNASYNCTL_LANG=zh tunasynctl list --format table
+TUNASYNCTL_LANG=en tunasynctl list --format table
 ```
 
 ### 安全
 
-Worker 与 Manager 之间使用 HTTP(S) 通信。如果两者运行在同一台机器上，使用普通 HTTP 即可——Manager 端留空 `ssl_cert` / `ssl_key`，Worker 端留空 `ca_cert`，`api_base` 使用 `http://`。
-
-若需加密通信，Manager 端配置 `ssl_cert` 和 `ssl_key`，Worker 端配置 `ca_cert`，并将 `api_base` 设为 `https://`。
+需要加密通信时，在 manager 设置 `ssl_cert`/`ssl_key`，在 worker 设置 `ca_cert`，`api_base` 使用 `https://`。同机部署使用 HTTP 即可。
 
 ### 以 systemd 服务运行
 
-服务文件位于 `initscripts/` 目录。
+服务文件在 `initscripts/` 目录：
 
 ```bash
-# 创建 tunasync 用户
 sudo useradd -r -s /bin/false tunasync
-
-# 安装二进制
-sudo cp target/release/tunasync /usr/bin/
-sudo cp target/release/tunasynctl /usr/bin/
-
-# 安装配置和服务文件
-sudo mkdir -p /etc/tunasync /var/lib/tunasync
+sudo cp target/release/{tunasync,tunasynctl} /usr/bin/
 sudo cp initscripts/tunasync-manager.service /etc/systemd/system/
-sudo cp initscripts/tunasync-worker.service /etc/systemd/system/
-sudo cp manager.conf /etc/tunasync/
-sudo cp worker.conf /etc/tunasync/
-
-# 启用并启动
+sudo cp initscripts/tunasync-worker.service  /etc/systemd/system/
+sudo cp manager.conf worker.conf /etc/tunasync/
 sudo systemctl daemon-reload
-sudo systemctl enable --now tunasync-manager
-sudo systemctl enable --now tunasync-worker
+sudo systemctl enable --now tunasync-manager tunasync-worker
 
-# 热重载 Worker 配置（从磁盘重新读取配置，应用差异）
+# 热重载 worker 配置
 sudo systemctl reload tunasync-worker
 ```
 
-服务文件中的 `--with-systemd` 参数会抑制日志中的时间戳和 ANSI 颜色，因为 systemd journal 已经自带时间戳。
-
 ### 使用 SysVinit (init.d) 运行
-
-SysVinit 脚本位于 `initscripts/` 目录。
 
 ```bash
 sudo cp initscripts/tunasync-manager.initd /etc/init.d/tunasync-manager
-sudo cp initscripts/tunasync-worker.initd /etc/init.d/tunasync-worker
+sudo cp initscripts/tunasync-worker.initd  /etc/init.d/tunasync-worker
 sudo chmod +x /etc/init.d/tunasync-manager /etc/init.d/tunasync-worker
-
-# 启用并启动
-sudo update-rc.d tunasync-manager defaults
-sudo update-rc.d tunasync-worker defaults
-sudo service tunasync-manager start
-sudo service tunasync-worker start
-
-# 热重载 Worker 配置
-sudo service tunasync-worker reload
+sudo update-rc.d tunasync-manager defaults && sudo service tunasync-manager start
+sudo update-rc.d tunasync-worker  defaults && sudo service tunasync-worker  start
+sudo service tunasync-worker reload   # 热重载
 ```
 
 ### 使用 OpenRC (Alpine、Gentoo) 运行
 
-OpenRC 脚本位于 `initscripts/` 目录。
-
 ```bash
 sudo cp initscripts/tunasync-manager.openrc /etc/init.d/tunasync-manager
-sudo cp initscripts/tunasync-worker.openrc /etc/init.d/tunasync-worker
+sudo cp initscripts/tunasync-worker.openrc  /etc/init.d/tunasync-worker
 sudo chmod +x /etc/init.d/tunasync-manager /etc/init.d/tunasync-worker
-
-# 启用并启动
-sudo rc-update add tunasync-manager default
-sudo rc-update add tunasync-worker default
-sudo rc-service tunasync-manager start
-sudo rc-service tunasync-worker start
-
-# 热重载 Worker 配置
-sudo rc-service tunasync-worker reload
+sudo rc-update add tunasync-manager default && sudo rc-service tunasync-manager start
+sudo rc-update add tunasync-worker  default && sudo rc-service tunasync-worker  start
+sudo rc-service tunasync-worker reload   # 热重载
 ```
 
 ## 编译
 
-需要 Rust stable（>= 1.80），参见 `rust-toolchain.toml`。
+需要 Rust stable（≥ 1.80），见 `rust-toolchain.toml`。
 
 ```bash
-# 编译 release 二进制
 cargo build --release
-# 产出: target/release/{tunasync, tunasynctl}
+# 产物：target/release/{tunasync, tunasynctl}
 
-# 运行测试（含 wire-compat 一致性测试）
-cargo test --workspace
-
-# 代码检查
+cargo test --workspace       # 完整测试套件（含线路兼容性验证）
 cargo clippy --workspace
 cargo fmt --all
 ```
@@ -431,40 +461,38 @@ cargo fmt --all
 
 ```
 crates/
-+-- protocol/    # 线路类型 — JSON 格式与 Go 的 internal/msg.go 兼容
-+-- common/      # 日志、HTTP 客户端、配置加载
-+-- manager/     # Manager HTTP 服务 (axum)、redb/sqlite/redis 存储
-+-- worker/      # Worker 运行时：调度器、任务状态机、provider、hook
-+-- tunasync/    # 合并 manager+worker 的二进制入口
-+-- tunasynctl/  # CLI 控制工具
-+-- migrate/     # Go→Rust 数据迁移工具
+├── protocol/    # 线路类型 — 与 Go 的 internal/msg.go JSON 兼容
+├── common/      # 日志、HTTP 客户端、配置加载、工具函数
+├── manager/     # Manager HTTP 服务器（axum），redb/sqlite/redis 存储
+├── worker/      # Worker 运行时：调度器、任务状态机、provider、hooks
+├── tunasync/    # manager+worker 合并二进制
+├── tunasynctl/  # CLI 控制工具
+└── migrate/     # Go→Rust 数据迁移工具
 ```
 
 ### Provider（同步提供者）
 
 | Provider | 说明 |
 |----------|------|
-| `command` | 执行任意 shell 命令 |
-| `rsync` | 经典 rsync 镜像同步 |
-| `two-stage-rsync` | 两阶段 rsync：第一阶段快速列表，第二阶段完整同步 |
+| `command` | 任意 shell 命令（自动注入环境变量） |
+| `rsync` | 经典 rsync 镜像 |
+| `two-stage-rsync` | 阶段一（快速列表）+ 阶段二（完整同步），适合 Debian 等大型仓库 |
+
+三种 provider 均支持 `disk_quota`、`atomic_publish`、`check_upstream`、`upstream_fallback`、`cron`、`timezone`、`blackout`、`priority`。
 
 ### 镜像同步状态
 
-每个镜像任务在任意时刻只有一种状态，通过 `tunasynctl list` 显示，也可通过 manager HTTP API 查询。
-
 | 状态 | 线路值 | 含义 |
 |------|--------|------|
-| `None` | `"none"` | 任务已注册但从未运行（如 worker 刚启动） |
-| `PreSyncing` | `"pre-syncing"` | 同步前钩子正在运行（主同步命令尚未启动） |
-| `Syncing` | `"syncing"` | 主同步命令正在执行（含 post-exec 钩子） |
-| `Success` | `"success"` | 上次同步成功完成 |
-| `Failed` | `"failed"` | 上次同步失败；`error_msg` 字段包含原因 |
-| `Paused` | `"paused"` | 被运维人员暂停（`tunasynctl stop`） |
-| `Disabled` | `"disabled"` | 任务被禁用（`tunasynctl disable`），重新启用前不会运行 |
+| `None` | `"none"` | 已注册，从未运行 |
+| `PreSyncing` | `"pre-syncing"` | 同步前钩子执行中 |
+| `Syncing` | `"syncing"` | 主同步命令执行中 |
+| `Success` | `"success"` | 上次同步成功 |
+| `Failed` | `"failed"` | 上次同步失败；`error_msg` 含原因 |
+| `Paused` | `"paused"` | 被操作员暂停（`tunasynctl stop`） |
+| `Disabled` | `"disabled"` | 已禁用，不再运行直到重新启用 |
 
-正常生命周期：`None → PreSyncing → Syncing → Success / Failed → （下次调度）→ PreSyncing → …`
-
-`Failed` 状态的镜像会保留 `error_msg`，直到下次同步成功才会清除。可通过 `--status` 过滤：
+按状态过滤：
 
 ```bash
 tunasynctl list --status failed
@@ -473,12 +501,12 @@ tunasynctl list --status syncing,pre-syncing
 
 ### Hook（钩子）
 
-| Hook | 说明 |
+| 钩子 | 说明 |
 |------|------|
-| `exec_post` | 同步阶段结束后执行命令 |
-| `loglimit` | 日志轮转 / 截断 |
-| `docker` | 在 Docker 容器内执行同步 |
-| `cgroup` | 通过 cgroup 限制 CPU/内存 |
+| `exec_post` | 同步阶段完成后执行命令 |
+| `loglimit` | 轮转/截断日志 |
+| `docker` | 在 Docker 容器内包装同步任务 |
+| `cgroup` | 通过 cgroup 限制 CPU/内存（Linux） |
 | `btrfs_snapshot` | 同步前后创建 Btrfs 快照 |
 | `zfs_snapshot` | 同步前后创建 ZFS 快照 |
 
@@ -487,164 +515,99 @@ tunasynctl list --status syncing,pre-syncing
 ### `tunasync`
 
 ```
-tunasync — 镜像同步管理工具
-
-Usage: tunasync [OPTIONS] <COMMAND>
-
-Commands:
-  manager  以 manager 模式运行
-  worker   以 worker 模式运行
-
-Options:
-  -v, --verbose       详细日志
-      --with-systemd  为 systemd 抑制时间戳和 ANSI 颜色
-  -h, --help          显示帮助
-  -V, --version       显示版本
-
 tunasync manager [OPTIONS]
-  -c, --config <CONFIG>    配置文件路径 [default: /etc/tunasync/manager.conf]
+  -c, --config <CONFIG>    配置文件 [默认: /etc/tunasync/manager.conf]
       --addr <ADDR>        覆盖监听地址
-      --port <PORT>        覆盖监听端口（默认: 14242）
-      --cert <CERT>        TLS 证书文件（启用 HTTPS）
-      --key <KEY>          TLS 私钥文件（启用 HTTPS）
-      --db-file <DB_FILE>  覆盖数据库文件路径
-      --db-type <DB_TYPE>  覆盖数据库类型: redb, sqlite, redis
-      --debug              启用 debug 级别日志
-      --pidfile <PIDFILE>  PID 文件 [default: /run/tunasync/tunasync.manager.pid]
-      --with-systemd       为 systemd 抑制时间戳和 ANSI 颜色
+      --port <PORT>        覆盖监听端口（默认 14242）
+      --cert / --key       TLS 证书/密钥（启用 HTTPS）
+      --db-file / --db-type  覆盖数据库路径/类型
 
 tunasync worker [OPTIONS]
-  -c, --config <CONFIG>    配置文件路径 [default: /etc/tunasync/worker.conf]
-      --pidfile <PIDFILE>  PID 文件 [default: /run/tunasync/tunasync.worker.pid]
-      --with-systemd       为 systemd 抑制时间戳和 ANSI 颜色
+  -c, --config <CONFIG>    配置文件 [默认: /etc/tunasync/worker.conf]
 ```
 
 ### `tunasynctl`
 
 ```
-tunasynctl — tunasync manager 控制工具
-
-Usage: tunasynctl [OPTIONS] <COMMAND>
-
-Commands:
-  list       列出所有镜像任务
-  workers    列出所有已注册 worker
-  flush      清除数据库中已禁用的任务记录
-  rm-worker  从 manager 中移除 worker
-  set-size   更新镜像大小（手动覆盖）
-  start      启动镜像同步任务
-  stop       停止正在运行的镜像任务
-  disable    禁用镜像任务
-  restart    重启镜像任务
-  reload     通知 worker 从磁盘重新加载配置
-
-全局选项:
-  -c, --config <CONFIG>     配置文件（覆盖系统/用户配置）
-  -m, --manager <MANAGER>   Manager 主机/IP [env: TUNASYNC_MANAGER]
-  -p, --port <PORT>         Manager 端口 [env: TUNASYNC_MANAGER_PORT]
-      --ca-cert <CA_CERT>   CA 证书（启用 HTTPS）
-  -v, --verbose             详细日志
-
-tunasynctl list [OPTIONS]
-  -w, --worker <WORKER>     指定 worker
-      --status <STATUS>     按状态过滤（逗号分隔）
-      --format <FORMAT>     输出格式: json（默认）或 table
-      --all                  显示所有 worker 的任务
-
-tunasynctl start <MIRROR> [-w <WORKER>] [-f]
-  MIRROR   镜像名称，或 "all" 广播到所有 worker
-  -f       强制启动（忽略并发限制）
-
-tunasynctl stop <MIRROR> [-w <WORKER>]
-tunasynctl disable <MIRROR> [-w <WORKER>]
-tunasynctl restart <MIRROR> [-w <WORKER>]
-
-tunasynctl set-size <MIRROR> <SIZE> [-w <WORKER>]
-  SIZE   可读大小，如 "1.2T"
-
-tunasynctl rm-worker <WORKER>
-tunasynctl flush
-tunasynctl reload <WORKER>
+tunasynctl list       [--all] [-w WORKER] [--status STATUS] [--format json|table]
+tunasynctl workers
+tunasynctl start      <镜像名|GLOB> [-w WORKER] [-f]
+tunasynctl stop       <镜像名|GLOB> [-w WORKER]
+tunasynctl disable    <镜像名|GLOB> [-w WORKER]
+tunasynctl restart    <镜像名|GLOB> [-w WORKER]
+tunasynctl reload     <WORKER>
+tunasynctl set-size   <镜像名> <大小> [-w WORKER]
+tunasynctl rm-worker  <WORKER>
+tunasynctl flush      [--stale-only]
+tunasynctl stale      [-w WORKER]
+tunasynctl maintenance enable | disable | status
+tunasynctl completion bash | zsh | fish | powershell
 ```
 
-`tunasynctl` 配置文件优先级：
+`<镜像名|GLOB>` 支持精确名称或 glob 模式（`*`、`?`、`[…]`）。精确名称不触发查询，无额外开销。
 
-1. `/etc/tunasync/ctl.conf`（系统级）
-2. `$HOME/.config/tunasync/ctl.conf`（用户级）
-3. `--config FILE`（显式指定）
-4. CLI 参数（`--manager`、`--port`、`--ca-cert`）
+配置文件优先级：`/etc/tunasync/ctl.conf` → `~/.config/tunasync/ctl.conf` → `--config FILE` → 命令行参数。
 
 ### `tunasync-migrate`
 
 ```
-Usage: tunasync-migrate <go-manager-url-or-bolt-file> <sqlite-output-file>
+tunasync-migrate <go-manager-url 或 bolt 文件路径> <sqlite 输出路径>
 
-Examples:
-  # 离线：直接读取 Go 的 bolt 文件（Go manager 必须已停止）
-  tunasync-migrate /var/lib/tunasync/tunasync.db /var/lib/tunasync/new.db
+# 离线（Go manager 已停止）
+tunasync-migrate /var/lib/tunasync/tunasync.db /var/lib/tunasync/new.db
 
-  # 在线：从运行中的 Go manager 拉取数据
-  tunasync-migrate http://localhost:12345 /var/lib/tunasync/new.db
+# 在线（Go manager 正在运行）
+tunasync-migrate http://localhost:12345 /var/lib/tunasync/new.db
 ```
-
-## 开发路线
-
-| 阶段 | 范围 | 状态 |
-|------|------|------|
-| 1 | 工作空间、线路协议类型、通用工具 | 已完成 |
-| 2 | Manager：HTTP 路由、redb + sqlite 存储、worker 生命周期 | 已完成 |
-| 3 | Worker：调度器、任务状态机、cmd_provider、manager 注册 | 已完成 |
-| 4 | rsync + 两阶段 rsync provider、exec_post & loglimit hook | 已完成 |
-| 5 | cgroup、docker、zfs、btrfs hook | 已完成 |
-| 6 | tunasynctl CLI、CI/release、生产加固 | 进行中 |
 
 ## 线路兼容性
 
-`tunasync-protocol` 可与 Go 产生的所有 JSON 格式双向转换。一致性测试见 `crates/protocol/tests/wire_compat.rs`。注意要点：
+`tunasync-protocol` 完整往返 Go 产生的每种 JSON 结构。conformance 测试见 `crates/protocol/tests/wire_compat.rs`。
 
-- `SyncStatus::PreSyncing` 序列化为 `"pre-syncing"`（带连字符）——与 Go 一致。
-- Go 的 `time.Time{}` 零值 (`"0001-01-01T00:00:00Z"`) 通过 `tunasync_protocol::zero_time()` 保留。**不要**用 `chrono::DateTime::default()` 表示"未设置"——那是 Unix epoch，是不同的哨兵值。
-- `MirrorStatus::scheduled` 在线路上的字段名为 `next_schedule`（匹配 Go 的 struct tag）。
-- `MirrorSchedule::mirror_name` 在线路上的字段名为 `name`。
+注意事项：
+
+- `SyncStatus::PreSyncing` 序列化为 `"pre-syncing"`（含连字符），与 Go 一致
+- Go 的 `time.Time{}` 零值（`"0001-01-01T00:00:00Z"`）由 `tunasync_protocol::zero_time()` 保留。**不要**用 `chrono::DateTime::default()` 表示"未设置"时间戳 — 那是 Unix 纪元，是不同的哨兵值
+- `MirrorStatus::scheduled` 在线路上为 `next_schedule`（与 Go struct tag 一致）
+- `MirrorStatus` 扩展字段（`last_transferred_bytes`、`total_transferred_bytes`、`consecutive_failures`、`stale`）使用 `#[serde(default, skip_serializing_if = "is_default")]`，全部为零/false 时 JSON 与纯 Go 输出完全一致
 
 ### 与 Go 版本的已知差异
 
-| 区域 | 差异 | 原因 |
+| 方面 | 差异 | 原因 |
 |------|------|------|
-| Manager: size 更新 | 使用 `&&` 而非 Go 的有 bug 的 `||` | Go 的条件永远为 true |
-| Manager: heartbeat | 新增 `POST /workers/:id/heartbeat` | 显式心跳比隐式刷新更可靠 |
-| Manager: deleteWorker | 无效 ID 返回 400（Go 返回 500） | 更有用的错误信息 |
-| Manager: DB | Redis 后端已实现 | 支持 redb、sqlite、redis |
-| Manager: GET /jobs/:name | 镜像详情，含 `error_msg`，跨所有 worker | 前端使用的新端点 |
+| Manager：size 更新 | `&&` 替代 Go 的错误 `\|\|` | Go bug：条件恒为真 |
+| Manager：心跳 | 新增 `POST /workers/:id/heartbeat` | 比隐式刷新更健壮 |
+| Manager：deleteWorker | 无效 ID 返回 400（Go 返回 500） | 更有用的错误信息 |
+| Manager：数据库 | redb、sqlite、redis | 不支持 BoltDB/LevelDB/Badger |
+| Manager：GET /jobs/:name | 含 `error_msg` 的镜像详情 | 前端新接口 |
+| Manager：维护模式 | `POST/DELETE/GET /maintenance` | Go 无此功能 |
+| Worker：调度 | Cron + 时区 + Blackout | Go 无此功能 |
+| Worker：磁盘配额 | 同步前空间检查 | Go 无此功能 |
+| Worker：优先级 | `PrioritySemaphore` 排序 | Go 无此功能 |
+| Worker：原子发布 | `renameat2(RENAME_EXCHANGE)` 交换 | Go 无此功能 |
+| Worker：上游探测 | 并发探测，15 秒硬超时 | Go 无此功能 |
+| 默认端口 | 14242（Go：12345） | 有意区分，避免冲突 |
 
 ## API 参考
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/metrics` | Prometheus 指标（镜像状态、大小、时间戳、worker 数量） |
-| GET | `/jobs` | 列出所有镜像（摘要，不含 `error_msg`） |
-| HEAD | `/jobs` | 检查镜像可用性（同 GET，无响应体） |
-| GET | `/jobs/:name` | 镜像详情，跨所有 worker（含 `error_msg`、时间戳） |
-| DELETE | `/jobs/disabled` | 清除所有已禁用的镜像行 |
-| GET | `/workers` | 列出已注册 worker（token 已脱敏） |
-| POST | `/workers` | 注册新 worker |
+| GET | `/metrics` | Prometheus 指标 |
+| GET | `/jobs` | 列出所有镜像（摘要） |
+| GET | `/jobs/:name` | 跨所有 worker 的镜像详情（含 `error_msg`） |
+| DELETE | `/jobs/disabled` | 清除 disabled 镜像行 |
+| GET | `/workers` | 列出已注册 worker（token 脱敏） |
+| POST | `/workers` | 注册 worker |
 | DELETE | `/workers/:id` | 删除 worker |
-| POST | `/workers/:id/heartbeat` | worker 心跳 |
-| GET | `/workers/:id/jobs` | 列出某个 worker 的镜像 |
-| POST | `/workers/:id/jobs/:job` | 更新镜像状态（worker → manager） |
+| POST | `/workers/:id/heartbeat` | Worker 心跳 |
+| GET | `/workers/:id/jobs` | 列出某 worker 的镜像 |
+| POST | `/workers/:id/jobs/:job` | 更新镜像状态 |
 | POST | `/workers/:id/jobs/:job/size` | 更新镜像大小 |
-| POST | `/workers/:id/schedules` | 更新调度计划 |
-| POST | `/cmd` | 发送控制命令（start/stop/disable/reload） |
-
-`GET /jobs/:name` 返回 `Vec<MirrorStatus>` — 完整状态对象，包含 `error_msg`。示例：
-
-```bash
-curl http://localhost:14242/jobs/ubuntu
-# → [ { "name": "ubuntu", "worker": "w1", "status": "failed", "error_msg": "rsync: timeout", ... } ]
-
-curl http://localhost:14242/jobs/nonexistent
-# → []
-```
+| POST | `/workers/:id/schedules` | 更新调度信息 |
+| POST | `/cmd` | 控制命令（start/stop/disable/reload） |
+| POST | `/maintenance` | 启用维护模式 |
+| DELETE | `/maintenance` | 关闭维护模式 |
+| GET | `/maintenance` | 获取维护模式状态 |
 
 ## 许可证
 
