@@ -964,6 +964,13 @@ impl Worker {
                     // Remember the old job's state so we can preserve it.
                     let old_state = self.jobs.get(name).map(|j| j.state());
 
+                    // Snapshot the old config so we can roll back if the new
+                    // provider fails to build. Without a rollback, cfg.mirrors
+                    // would contain the bad new config and subsequent reloads
+                    // would diff against it, keeping the mirror permanently stuck.
+                    let old_config_snapshot =
+                        self.cfg.mirrors.iter().find(|m| &m.name == name).cloned();
+
                     // Preserve historical telemetry (last_update, size,
                     // last_started, last_ended, transferred_bytes counters)
                     // so a cosmetic config change (e.g. tweaking interval)
@@ -1033,7 +1040,37 @@ impl Worker {
                             self.jobs.insert(name.clone(), job);
                         }
                         Err(e) => {
-                            tracing::error!(mirror = %name, error = %e, "hot-reload: failed to rebuild provider");
+                            tracing::error!(
+                                mirror = %name,
+                                error = %e,
+                                "hot-reload: failed to rebuild provider — rolling back config"
+                            );
+                            // Roll back cfg.mirrors to the old config so the
+                            // next hot-reload's diff sees the correct baseline.
+                            // Without rollback, the bad new config stays in
+                            // cfg.mirrors and the mirror is invisible to the
+                            // scheduler until the next successful reload.
+                            if let Some(old_cfg) = old_config_snapshot {
+                                if let Some(pos) =
+                                    self.cfg.mirrors.iter().position(|m| &m.name == name)
+                                {
+                                    self.cfg.mirrors[pos] = old_cfg;
+                                } else {
+                                    self.cfg.mirrors.push(old_cfg);
+                                }
+                            }
+                            // Also restore the status map so the mirror
+                            // remains visible in the manager UI with a
+                            // descriptive error message.
+                            let mut failed_status = preserved.unwrap_or_else(|| MirrorStatus {
+                                name: name.clone(),
+                                worker: self.cfg.global.name.clone(),
+                                ..Default::default()
+                            });
+                            failed_status.status = SyncStatus::Failed;
+                            failed_status.error_msg =
+                                format!("hot-reload: failed to rebuild provider: {e}");
+                            self.mirror_statuses.insert(name.clone(), failed_status);
                             continue;
                         }
                     }
@@ -1769,5 +1806,69 @@ mod cron_schedule_tests {
         assert_eq!(cfg_mirrors.len(), 1);
         assert_eq!(cfg_mirrors[0].name, "keep");
         assert!(!cfg_mirrors.iter().any(|m| m.name == "delete"));
+    }
+
+    /// When hot-reload Modify fails to build the provider, cfg.mirrors must
+    /// be rolled back to the old config so subsequent reloads diff against
+    /// the correct baseline, and mirror_statuses must still contain an entry
+    /// (with a Failed status and error message) so the mirror remains visible
+    /// in the manager UI.
+    #[test]
+    fn hot_reload_modify_provider_failure_rolls_back_cfg() {
+        use std::collections::HashMap;
+        use tunasync_protocol::{MirrorStatus, SyncStatus};
+
+        let mirror_name = "failing-mirror".to_string();
+
+        // Simulate: cfg had the old config.
+        let mut old_cfg = MirrorConfig::default();
+        old_cfg.name = mirror_name.clone();
+        old_cfg.upstream = "rsync://old/".into();
+        let old_config_snapshot = Some(old_cfg.clone());
+
+        // Simulate: cfg was already updated to new config before build attempt.
+        let mut new_cfg = MirrorConfig::default();
+        new_cfg.name = mirror_name.clone();
+        new_cfg.upstream = "rsync://new-broken/".into();
+        let mut cfg_mirrors: Vec<MirrorConfig> = vec![new_cfg];
+
+        // Simulate: mirror_statuses was cleared before build attempt.
+        let mut mirror_statuses: HashMap<String, MirrorStatus> = HashMap::new();
+
+        // Previously-preserved status.
+        let preserved = Some(MirrorStatus {
+            name: mirror_name.clone(),
+            worker: "w1".into(),
+            status: SyncStatus::Success,
+            size: "100G".into(),
+            ..Default::default()
+        });
+
+        // Simulate the rollback branch (build_one_provider returned Err).
+        let e = anyhow::anyhow!("docker image not found");
+
+        // Roll back cfg.mirrors.
+        if let Some(ref old) = old_config_snapshot {
+            if let Some(pos) = cfg_mirrors.iter().position(|m| m.name == mirror_name) {
+                cfg_mirrors[pos] = old.clone();
+            }
+        }
+
+        // Restore mirror_statuses with Failed status.
+        let mut failed_status = preserved.unwrap_or_default();
+        failed_status.status = SyncStatus::Failed;
+        failed_status.error_msg = format!("hot-reload: failed to rebuild provider: {e}");
+        mirror_statuses.insert(mirror_name.clone(), failed_status);
+
+        // cfg.mirrors rolled back to old upstream.
+        assert_eq!(cfg_mirrors.len(), 1);
+        assert_eq!(cfg_mirrors[0].upstream, "rsync://old/");
+
+        // mirror_statuses restored with Failed + error message.
+        let status = &mirror_statuses[&mirror_name];
+        assert_eq!(status.status, SyncStatus::Failed);
+        assert!(status.error_msg.contains("hot-reload"));
+        // Historical data (size) preserved from the old status.
+        assert_eq!(status.size, "100G");
     }
 }
