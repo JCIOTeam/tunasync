@@ -136,6 +136,30 @@ pub async fn run(config_path: std::path::PathBuf) -> Result<()> {
         }
     }
 
+    // Validate IANA timezone names at startup so silently-wrong schedules
+    // can't happen. Empty string = use global default (also validated) =
+    // UTC. Validate global first so a bad per-mirror override doesn't mask
+    // a bad global setting.
+    if !cfg.global.timezone.is_empty() {
+        if let Err(e) = cfg.global.timezone.parse::<chrono_tz::Tz>() {
+            anyhow::bail!(
+                "global.timezone {:?} is not a valid IANA timezone name: {e}",
+                cfg.global.timezone
+            );
+        }
+    }
+    for mc in &cfg.mirrors {
+        if !mc.timezone.is_empty() {
+            if let Err(e) = mc.timezone.parse::<chrono_tz::Tz>() {
+                anyhow::bail!(
+                    "mirror {:?}: timezone {:?} is not a valid IANA timezone name: {e}",
+                    mc.name,
+                    mc.timezone
+                );
+            }
+        }
+    }
+
     tracing::info!(
         worker = %cfg.global.name,
         mirrors = cfg.mirrors.len(),

@@ -235,3 +235,22 @@ The Rust manager fires a fire-and-forget `{"text": "…"}` POST to
 - Consecutive failures reaches `notify.alert_after_failures`
 - Recovery from consecutive failures (first success after failures)
 - Mirror transitions to/from the `stale` state
+
+## Timezone semantics for cron and blackout
+
+The Rust port introduces two new optional config fields for time-of-day
+scheduling: `[global].timezone` and `[[mirrors]].timezone`. Both take IANA
+timezone names (e.g. `"Asia/Shanghai"`, `"America/New_York"`, `"UTC"`).
+
+**Default is UTC.** When both fields are empty, all cron expressions and
+blackout windows are evaluated in UTC. This is a deliberate, documented
+choice — implicit "use the host's local timezone" defaults are convenient
+on a single-admin system but a footgun in a multi-region deployment.
+
+Operators upgrading from the Go `tunasync` worker (which uses local time
+implicitly) and relying on local-time cron/blackout schedules MUST set
+`timezone` explicitly in `[global]` or per-mirror in `[[mirrors]]`.
+
+Validation happens at startup: an invalid IANA name fails the worker with
+a clear message, rather than silently falling back and producing the wrong
+schedule.

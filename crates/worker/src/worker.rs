@@ -77,7 +77,20 @@ fn next_run_for(
     let interval = mc.effective_interval(global);
 
     if let Some(sched) = cached_cron {
-        if let Some(next_utc) = sched.upcoming(chrono::Utc).next() {
+        // Interpret the cron expression in the mirror's configured timezone.
+        // `sched.upcoming(tz)` returns DateTime<Tz>; we convert to UTC for the
+        // returned schedule timestamp and convert the delta to an Instant.
+        //
+        // Why this matters: a cron of "0 3 * * *" in Asia/Shanghai must fire
+        // at 03:00 CST = 19:00 UTC the previous day, not at 03:00 UTC. The
+        // global default is UTC so existing UTC-based configs keep working.
+        let tz_name = mc.effective_timezone(global);
+        // tz_name has been validated at config load — parse error here would
+        // mean someone hot-reloaded with a bad value past startup validation;
+        // fall back to UTC defensively rather than panicking.
+        let tz: chrono_tz::Tz = tz_name.parse().unwrap_or(chrono_tz::UTC);
+        if let Some(next_in_tz) = sched.upcoming(tz).next() {
+            let next_utc = next_in_tz.with_timezone(&chrono::Utc);
             let delta = (next_utc - now_utc).to_std().unwrap_or(interval);
             return (now_instant + delta, next_utc);
         }
@@ -120,6 +133,36 @@ fn build_cron_cache(mirrors: &[crate::config::MirrorConfig]) -> HashMap<String, 
             parse_cron_lenient(&mc.cron)
                 .ok()
                 .map(|s| (mc.name.clone(), s))
+        })
+        .collect()
+}
+
+/// Build the per-mirror IANA timezone cache.
+///
+/// Every mirror has an effective timezone (per-mirror → global → UTC default).
+/// We resolve and parse it once here so the scheduler hot path can convert
+/// `Utc::now()` to the mirror's local time without re-parsing the string each
+/// tick. Invalid names fall back to UTC defensively — the canonical
+/// validation happens at startup in `lib.rs::run`, which fails the worker
+/// outright on a bad timezone name (so this branch should be unreachable in
+/// practice except after a hot-reload with a bad value).
+fn build_timezone_cache(
+    mirrors: &[crate::config::MirrorConfig],
+    global: &crate::config::GlobalConfig,
+) -> HashMap<String, chrono_tz::Tz> {
+    mirrors
+        .iter()
+        .map(|mc| {
+            let name = mc.effective_timezone(global);
+            let tz: chrono_tz::Tz = name.parse().unwrap_or_else(|_| {
+                tracing::warn!(
+                    mirror = %mc.name,
+                    timezone = %name,
+                    "invalid timezone after hot-reload; falling back to UTC"
+                );
+                chrono_tz::UTC
+            });
+            (mc.name.clone(), tz)
         })
         .collect()
 }
@@ -180,6 +223,11 @@ pub struct Worker {
     /// non-empty `cron` field). Cached because `cron::Schedule::parse` is
     /// non-trivial and the scheduler computes next_run frequently.
     crons_by_mirror: HashMap<String, cron::Schedule>,
+    /// Precomputed IANA timezone per mirror name (every mirror has one,
+    /// defaulting to UTC). Cached so the scheduler doesn't reparse the
+    /// timezone string on every tick when evaluating blackout windows
+    /// and cron schedules. Built once at startup and rebuilt on hot-reload.
+    timezones_by_mirror: HashMap<String, chrono_tz::Tz>,
     /// Function to build a single mirror's provider+hooks pair.
     /// Used at startup and on hot-reload for new/modified mirrors.
     #[allow(clippy::type_complexity)]
@@ -278,9 +326,10 @@ impl Worker {
 
         let mirror_names = Arc::new(RwLock::new(jobs.keys().cloned().collect()));
 
-        // Precompute blackout and cron caches.
+        // Precompute blackout, cron and timezone caches.
         let blackouts_by_mirror = build_blackout_cache(&cfg.mirrors);
         let crons_by_mirror = build_cron_cache(&cfg.mirrors);
+        let timezones_by_mirror = build_timezone_cache(&cfg.mirrors, &cfg.global);
 
         Self {
             cfg,
@@ -298,6 +347,7 @@ impl Worker {
             mirror_names,
             blackouts_by_mirror,
             crons_by_mirror,
+            timezones_by_mirror,
             build_one_provider: crate::build_one_provider,
         }
     }
@@ -582,13 +632,25 @@ impl Worker {
                     // Blackout check: if this mirror is inside a blackout window,
                     // push it back by 5 minutes instead of starting it.
                     // In-progress syncs are never interrupted — only new starts are gated.
-                    // Uses precomputed cache so we don't re-parse the TOML
-                    // strings every scheduler tick.
+                    // Uses precomputed caches so we don't re-parse the TOML
+                    // strings or timezone name on every scheduler tick.
+                    //
+                    // The blackout windows are interpreted in the mirror's
+                    // effective timezone (`MirrorConfig::timezone` or
+                    // `GlobalConfig::timezone`, falling back to UTC). We
+                    // convert `Utc::now()` to that timezone before passing
+                    // it to `is_active_at`, which is itself generic over Tz.
                     let in_blackout = self
                         .blackouts_by_mirror
                         .get(&entry.name)
                         .map(|windows| {
-                            crate::blackout::is_in_blackout(windows, &chrono::Utc::now())
+                            let tz = self
+                                .timezones_by_mirror
+                                .get(&entry.name)
+                                .copied()
+                                .unwrap_or(chrono_tz::UTC);
+                            let now_local = chrono::Utc::now().with_timezone(&tz);
+                            crate::blackout::is_in_blackout(windows, &now_local)
                         })
                         .unwrap_or(false);
 
@@ -1125,10 +1187,12 @@ impl Worker {
             }
         }
 
-        // Rebuild the precomputed blackout and cron caches against the new
-        // mirror list so scheduler decisions reflect the hot-reloaded config.
+        // Rebuild the precomputed blackout, cron and timezone caches against
+        // the new mirror list so scheduler decisions reflect the hot-reloaded
+        // config.
         self.blackouts_by_mirror = build_blackout_cache(&self.cfg.mirrors);
         self.crons_by_mirror = build_cron_cache(&self.cfg.mirrors);
+        self.timezones_by_mirror = build_timezone_cache(&self.cfg.mirrors, &self.cfg.global);
     }
 }
 
@@ -1471,5 +1535,112 @@ mod cron_schedule_tests {
         assert_eq!(removed, vec!["removed-host".to_string()]);
         assert!(!sems.contains_key("removed-host"));
         assert!(sems.is_empty());
+    }
+
+    // ── Timezone-aware cron tests ────────────────────────────────────────
+
+    /// effective_timezone falls back from per-mirror to global to UTC.
+    #[test]
+    fn effective_timezone_falls_back() {
+        let mut global = GlobalConfig::default();
+        let mut mc = MirrorConfig::default();
+
+        // Both empty → UTC.
+        assert_eq!(mc.effective_timezone(&global), "UTC");
+
+        // Only global set.
+        global.timezone = "Asia/Shanghai".into();
+        assert_eq!(mc.effective_timezone(&global), "Asia/Shanghai");
+
+        // Mirror overrides global.
+        mc.timezone = "America/New_York".into();
+        assert_eq!(mc.effective_timezone(&global), "America/New_York");
+
+        // Mirror unset, global unset → UTC.
+        mc.timezone = String::new();
+        global.timezone = String::new();
+        assert_eq!(mc.effective_timezone(&global), "UTC");
+    }
+
+    /// `cron = "0 3 * * *"` with `timezone = "Asia/Shanghai"` must fire at
+    /// 03:00 in Shanghai, which is 19:00 UTC the previous day. With UTC
+    /// it would fire at 03:00 UTC. The returned DateTime is in UTC; we
+    /// convert it to Shanghai time and check the hour/minute.
+    #[test]
+    fn cron_respects_per_mirror_timezone() {
+        let global = GlobalConfig::default();
+        let mut mc = MirrorConfig::default();
+        mc.name = "tz-test".into();
+        mc.provider = ProviderKind::Rsync;
+        mc.upstream = "rsync://localhost/test/".into();
+        mc.cron = "0 3 * * *".into();
+        mc.timezone = "Asia/Shanghai".into();
+
+        let sched = super::parse_cron_lenient(&mc.cron).expect("cron parses");
+        let (_inst, next_utc) = super::next_run_for(&mc, &global, Some(&sched));
+
+        // Convert the returned UTC time into Shanghai and check 03:00 local.
+        let tz: chrono_tz::Tz = "Asia/Shanghai".parse().unwrap();
+        let next_local = next_utc.with_timezone(&tz);
+        use chrono::Timelike;
+        assert_eq!(next_local.hour(), 3, "cron must fire at 03:00 local time");
+        assert_eq!(next_local.minute(), 0);
+    }
+
+    /// `cron = "0 3 * * *"` without any timezone override defaults to UTC.
+    /// Converting back to UTC should still show hour=3, minute=0.
+    #[test]
+    fn cron_defaults_to_utc_when_unset() {
+        let global = GlobalConfig::default();
+        let mut mc = MirrorConfig::default();
+        mc.name = "utc-default".into();
+        mc.provider = ProviderKind::Rsync;
+        mc.upstream = "rsync://localhost/test/".into();
+        mc.cron = "0 3 * * *".into();
+
+        let sched = super::parse_cron_lenient(&mc.cron).expect("cron parses");
+        let (_inst, next_utc) = super::next_run_for(&mc, &global, Some(&sched));
+
+        use chrono::Timelike;
+        assert_eq!(next_utc.hour(), 3);
+        assert_eq!(next_utc.minute(), 0);
+    }
+
+    /// Global `timezone` applies to mirrors that don't set their own.
+    #[test]
+    fn cron_uses_global_timezone_when_mirror_unset() {
+        let mut global = GlobalConfig::default();
+        global.timezone = "Asia/Shanghai".into();
+
+        let mut mc = MirrorConfig::default();
+        mc.name = "uses-global".into();
+        mc.provider = ProviderKind::Rsync;
+        mc.upstream = "rsync://localhost/test/".into();
+        mc.cron = "0 3 * * *".into();
+        // mc.timezone left empty → inherit from global.
+
+        let sched = super::parse_cron_lenient(&mc.cron).expect("cron parses");
+        let (_inst, next_utc) = super::next_run_for(&mc, &global, Some(&sched));
+
+        let tz: chrono_tz::Tz = "Asia/Shanghai".parse().unwrap();
+        let next_local = next_utc.with_timezone(&tz);
+        use chrono::Timelike;
+        assert_eq!(next_local.hour(), 3);
+    }
+
+    /// build_timezone_cache populates a Tz for every mirror, defaulting to UTC.
+    #[test]
+    fn build_timezone_cache_populates_every_mirror() {
+        let global = GlobalConfig::default();
+        let mut a = MirrorConfig::default();
+        a.name = "a".into();
+        a.timezone = "Asia/Tokyo".into();
+        let mut b = MirrorConfig::default();
+        b.name = "b".into();
+        // b.timezone empty → UTC default.
+
+        let cache = super::build_timezone_cache(&[a, b], &global);
+        assert_eq!(cache["a"], chrono_tz::Asia::Tokyo);
+        assert_eq!(cache["b"], chrono_tz::UTC);
     }
 }

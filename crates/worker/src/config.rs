@@ -236,6 +236,23 @@ pub struct GlobalConfig {
     /// ```
     #[serde(default)]
     pub per_upstream_concurrent: std::collections::HashMap<String, usize>,
+
+    /// IANA timezone name used as the default for cron and blackout windows.
+    ///
+    /// When empty, `UTC` is used — preserving the existing wire/schedule
+    /// behaviour. Individual mirrors can override this via `MirrorConfig::timezone`.
+    ///
+    /// Valid examples:
+    /// - `""` (default, treated as UTC)
+    /// - `"UTC"`
+    /// - `"Asia/Shanghai"`
+    /// - `"America/New_York"`
+    /// - `"Europe/Berlin"`
+    ///
+    /// Invalid names cause the worker to fail at startup so misconfiguration
+    /// is caught immediately rather than producing silently-wrong schedules.
+    #[serde(default)]
+    pub timezone: String,
 }
 
 impl GlobalConfig {
@@ -504,6 +521,21 @@ pub struct MirrorConfig {
     #[serde(default)]
     pub blackout: Vec<String>,
 
+    /// IANA timezone name used to interpret this mirror's `cron` expression
+    /// and `blackout` windows. When empty, the worker falls back to the
+    /// global `timezone` field; when that's also empty, UTC is used.
+    ///
+    /// Valid examples: `"Asia/Shanghai"`, `"America/New_York"`,
+    /// `"Europe/Berlin"`, `"UTC"`. Invalid names cause the worker to fail
+    /// at startup.
+    ///
+    /// Cron expressions like `cron = "0 3 * * *"` and blackout windows like
+    /// `blackout = ["08:00-18:00 Mon-Fri"]` are interpreted in this timezone.
+    /// For example, with `timezone = "Asia/Shanghai"` and `cron = "0 3 * * *"`,
+    /// syncs fire at 03:00 CST (= 19:00 UTC the previous day).
+    #[serde(default)]
+    pub timezone: String,
+
     /// Job priority (higher = more important, default 50).
     /// Higher-priority jobs get to run first when the semaphore is contended.
     #[serde(default = "default_priority")]
@@ -771,6 +803,11 @@ fn merge_mirror(parent: MirrorConfig, child: MirrorConfig) -> MirrorConfig {
         } else {
             child.blackout
         },
+        timezone: if child.timezone.is_empty() {
+            parent.timezone
+        } else {
+            child.timezone
+        },
         priority: if child.priority == default_priority() {
             parent.priority
         } else {
@@ -827,6 +864,21 @@ impl MirrorConfig {
         } else {
             Some(Duration::from_secs(secs))
         }
+    }
+
+    /// Effective IANA timezone name for this mirror's cron / blackout windows.
+    /// Falls back to the global `timezone`; if both are empty, returns `"UTC"`.
+    /// The returned string is guaranteed non-empty but is NOT validated here —
+    /// callers should `.parse::<chrono_tz::Tz>()` and handle errors. Validation
+    /// happens once at config load time in `lib.rs::run`.
+    pub fn effective_timezone(&self, global: &GlobalConfig) -> String {
+        if !self.timezone.is_empty() {
+            return self.timezone.clone();
+        }
+        if !global.timezone.is_empty() {
+            return global.timezone.clone();
+        }
+        "UTC".to_owned()
     }
 
     /// Resolved mirror storage directory.

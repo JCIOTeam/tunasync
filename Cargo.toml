@@ -52,6 +52,7 @@ toml        = "0.8"
 
 # Time
 chrono      = { version = "0.4", features = ["serde"] }
+chrono-tz   = "0.10"
 humantime         = "2"
 humantime-serde   = "1"
 cron        = "0.12"
