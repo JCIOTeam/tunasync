@@ -5,9 +5,29 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::status::SyncStatus;
+
+/// Deserialise `null` as `T::default()` instead of erroring.
+///
+/// Go's `encoding/json` marshals `nil` slices and maps as JSON `null`, not
+/// `[]` / `{}`. With plain `#[serde(default)]` we accept *absent* fields but
+/// not explicit `null`, so a Go worker/manager sending `"args": null` would
+/// fail to deserialise on the Rust side.
+///
+/// Apply this with:
+/// ```ignore
+/// #[serde(default, deserialize_with = "deserialize_null_default")]
+/// pub args: Vec<String>,
+/// ```
+pub(crate) fn deserialize_null_default<'de, D, T>(des: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Option::<T>::deserialize(des).map(|o| o.unwrap_or_default())
+}
 
 // Status messages (worker → manager → client)
 
@@ -121,6 +141,10 @@ pub struct WorkerStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MirrorSchedules {
     /// Per-mirror next-run schedule.
+    ///
+    /// Go marshals `nil` slices as JSON `null`, so we tolerate either an absent
+    /// field, `[]`, or `null` here for full wire-compat.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub schedules: Vec<MirrorSchedule>,
 }
 
@@ -184,6 +208,8 @@ impl std::fmt::Display for CmdVerb {
 ///
 /// Go's struct allows `args` and `options` to be omitted; we mirror that with
 /// `#[serde(default)]` so payloads without those fields decode cleanly.
+/// We also tolerate explicit `null` for both fields because Go's
+/// `encoding/json` marshals `nil` slices and maps as `null`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerCmd {
     /// Action to perform.
@@ -191,10 +217,10 @@ pub struct WorkerCmd {
     /// Target mirror ID (empty when the command is worker-wide, e.g. `reload`).
     pub mirror_id: String,
     /// Optional positional arguments.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub args: Vec<String>,
     /// Optional boolean flags (e.g. `force: true`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub options: HashMap<String, bool>,
 }
 
@@ -218,10 +244,10 @@ pub struct ClientCmd {
     /// Target worker ID (empty for "all workers" or when looking up by mirror).
     pub worker_id: String,
     /// Optional positional arguments.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub args: Vec<String>,
     /// Optional boolean flags.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub options: HashMap<String, bool>,
 }
 
@@ -275,5 +301,55 @@ mod tests {
             cmd_with_args.to_string(),
             r#"restart (ubuntu, ["--force"])"#
         );
+    }
+
+    // ── Wire-compat: Go marshals nil slice/map as JSON null ────────────────
+
+    /// Go's `encoding/json` writes `nil` slices and maps as JSON `null`.
+    /// `#[serde(default)]` alone accepts an *absent* field but rejects
+    /// explicit `null`, so we need `deserialize_null_default` for parity.
+    #[test]
+    fn worker_cmd_accepts_null_args_and_options() {
+        let json = r#"{"cmd":"start","mirror_id":"ubuntu","args":null,"options":null}"#;
+        let cmd: WorkerCmd = serde_json::from_str(json).expect("null collections must decode");
+        assert_eq!(cmd.cmd, CmdVerb::Start);
+        assert_eq!(cmd.mirror_id, "ubuntu");
+        assert!(cmd.args.is_empty());
+        assert!(cmd.options.is_empty());
+    }
+
+    #[test]
+    fn client_cmd_accepts_null_args_and_options() {
+        let json = r#"{"cmd":"start","mirror_id":"ubuntu","worker_id":"w1","args":null,"options":null}"#;
+        let cmd: ClientCmd = serde_json::from_str(json).expect("null collections must decode");
+        assert_eq!(cmd.worker_id, "w1");
+        assert!(cmd.args.is_empty());
+        assert!(cmd.options.is_empty());
+    }
+
+    /// Go's MirrorSchedules with no entries marshals as `{"schedules":null}`.
+    #[test]
+    fn mirror_schedules_accepts_null_schedules() {
+        let json = r#"{"schedules":null}"#;
+        let s: MirrorSchedules = serde_json::from_str(json).expect("null schedules must decode");
+        assert!(s.schedules.is_empty());
+    }
+
+    /// Sanity: present-but-empty arrays still work.
+    #[test]
+    fn collections_accept_empty_arrays() {
+        let json = r#"{"cmd":"start","mirror_id":"x","args":[],"options":{}}"#;
+        let cmd: WorkerCmd = serde_json::from_str(json).expect("empty arrays decode");
+        assert!(cmd.args.is_empty());
+        assert!(cmd.options.is_empty());
+    }
+
+    /// Sanity: absent fields still default correctly.
+    #[test]
+    fn collections_accept_absent_fields() {
+        let json = r#"{"cmd":"start","mirror_id":"x"}"#;
+        let cmd: WorkerCmd = serde_json::from_str(json).expect("absent fields decode");
+        assert!(cmd.args.is_empty());
+        assert!(cmd.options.is_empty());
     }
 }
