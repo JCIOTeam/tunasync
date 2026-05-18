@@ -441,12 +441,20 @@ async fn probe_url(url: &str) -> anyhow::Result<()> {
         return super::rsync_provider::probe_rsync_url(url).await;
     }
     if url.starts_with("http://") || url.starts_with("https://") {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()
-            .map_err(|e| anyhow::anyhow!("build http client: {e}"))?;
-        let resp = client
+        // Share a single reqwest::Client across all probe calls. Each Client
+        // maintains its own connection pool; rebuilding it on every probe
+        // throws away DNS cache and TLS sessions unnecessarily, adding latency
+        // on each call. once_cell::sync::Lazy gives us a zero-cost static
+        // initialiser that is safe to call from async context.
+        use once_cell::sync::Lazy;
+        static HTTP_PROBE_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::limited(5))
+                .build()
+                .expect("build static http probe client")
+        });
+        let resp = HTTP_PROBE_CLIENT
             .head(url)
             .send()
             .await

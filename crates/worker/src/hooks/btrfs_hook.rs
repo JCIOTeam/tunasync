@@ -60,6 +60,17 @@ impl BtrfsSnapshotHook {
 
     /// `btrfs subvolume create {path}`
     async fn create_subvolume(path: &PathBuf) -> Result<()> {
+        // btrfs subvolume create requires the *parent* directory to exist;
+        // it won't create intermediate directories itself. Pre-create the
+        // parent so that a fresh deployment (e.g. mirror_dir doesn't exist
+        // yet) doesn't fail with a confusing "No such file or directory".
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .with_context(|| format!("create parent dir {}", parent.display()))?;
+            }
+        }
         let status = Command::new("btrfs")
             .args(["subvolume", "create"])
             .arg(path)

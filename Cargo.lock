@@ -2494,6 +2494,7 @@ dependencies = [
  "hostname",
  "libc",
  "nix",
+ "once_cell",
  "os_pipe",
  "parking_lot",
  "regex",
@@ -2516,6 +2517,7 @@ name = "tunasynctl"
 version = "0.1.5"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "clap_complete",
  "futures",

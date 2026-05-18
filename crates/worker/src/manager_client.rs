@@ -221,7 +221,13 @@ impl ManagerClient {
         let mut last_err = anyhow::anyhow!("no manager URLs configured");
         for base in &self.bases {
             let url = format!("{base}{path}");
-            match self.client.get(&url).send().await {
+            match self
+                .client
+                .get(&url)
+                .timeout(Duration::from_secs(30))
+                .send()
+                .await
+            {
                 Err(e) => {
                     last_err = e.into();
                 }

@@ -16,6 +16,7 @@ tunasync-protocol = { workspace = true }
 tunasync-common   = { workspace = true }
 
 anyhow        = { workspace = true }
+chrono        = { workspace = true }
 clap          = { workspace = true }
 clap_complete = { workspace = true }
 reqwest       = { workspace = true }

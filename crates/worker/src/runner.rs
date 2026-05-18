@@ -148,9 +148,22 @@ pub async fn terminate_process_group(pid: u32) {
         tracing::debug!(pid, "SIGTERM to process group failed (already dead?)");
         return;
     }
-    // Give the process a grace period to shut down gracefully.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    // If still alive, SIGKILL the process group.
+    // Give the process a grace period to shut down cleanly. Poll up to 2s
+    // in 50ms increments so a fast-exiting process doesn't pay the full
+    // 2-second penalty (which was unconditional before this fix).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Check if the process group is still alive by sending signal 0.
+        if kill(pgid, None).is_err() {
+            tracing::debug!(pid, "process group exited cleanly after SIGTERM");
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+    // If still alive after 2s, escalate to SIGKILL.
     if kill(pgid, Signal::SIGKILL).is_err() {
         tracing::debug!(pid, "SIGKILL to process group failed (already dead)");
     }

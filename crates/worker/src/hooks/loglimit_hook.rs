@@ -53,8 +53,16 @@ impl LogLimitHook {
         let log_dir = &self.log_dir;
         let name = &self.mirror_name;
 
-        // Ensure log dir exists.
-        tokio::fs::create_dir_all(log_dir).await.ok();
+        // Ensure log dir exists. Log a warning on failure rather than silently
+        // ignoring it — the error will surface again when read_dir fails below,
+        // but logging here gives a clearer root cause in the mirror's log.
+        if let Err(e) = tokio::fs::create_dir_all(log_dir).await {
+            tracing::warn!(
+                path = %log_dir.display(),
+                error = %e,
+                "loglimit: failed to create log directory"
+            );
+        }
 
         // List and sort files by modification time (oldest first for pruning).
         let mut matched: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();

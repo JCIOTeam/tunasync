@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use chrono::DateTime;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use clap_complete::Shell;
 use futures::future::join_all;
@@ -525,6 +526,20 @@ fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
     Ok(())
 }
 
+/// Format a datetime for display, replacing Go's zero-time
+/// (`0001-01-01T00:00:00Z`) with a human-readable "(never)" / "(从未)".
+fn fmt_time(dt: &DateTime<chrono::Utc>) -> String {
+    if tunasync_protocol::is_zero_time(dt) {
+        if is_zh() {
+            "(从未)".to_string()
+        } else {
+            "(never)".to_string()
+        }
+    } else {
+        dt.format("%Y-%m-%d %H:%M:%S").to_string()
+    }
+}
+
 fn print_table_jobs(jobs: &[WebMirrorStatus]) {
     let (h_name, h_status, h_update, h_size) = if is_zh() {
         ("名称", "状态", "最后更新", "大小")
@@ -541,7 +556,7 @@ fn print_table_jobs(jobs: &[WebMirrorStatus]) {
             "{:<30} {:<12} {:<20} {}",
             j.name,
             j.status.to_string(),
-            j.last_update.format("%Y-%m-%d %H:%M:%S"),
+            fmt_time(&j.last_update),
             j.size,
         );
     }
@@ -743,7 +758,7 @@ async fn main() -> Result<()> {
                         continue;
                     }
                     let status_lc = j.status.to_string().to_ascii_lowercase();
-                    let last_update = j.last_update.format("%Y-%m-%d %H:%M UTC").to_string();
+                    let last_update = fmt_time(&j.last_update);
                     let entry = (j.name.clone(), w.id.clone(), last_update);
                     if status_lc == "disabled" {
                         stale_disabled.push(entry);

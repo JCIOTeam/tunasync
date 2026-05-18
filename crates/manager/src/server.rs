@@ -718,7 +718,21 @@ pub(crate) fn render_metrics(mirrors: &[MirrorStatus], worker_count: usize) -> S
 
     let epoch = tunasync_protocol::zero_time();
     for m in mirrors {
-        let labels = format!("mirror=\"{}\",worker=\"{}\"", m.name, m.worker);
+        // Prometheus text format requires label values to escape backslashes,
+        // double-quotes, and newlines (Exposition Format spec §3.3).
+        // Mirror and worker names are typically alphanumeric slugs, but we
+        // escape defensively to avoid producing malformed output if someone
+        // creates a mirror named e.g. `foo"bar` or `line\nbreak`.
+        let escape = |s: &str| {
+            s.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+        };
+        let labels = format!(
+            "mirror=\"{}\",worker=\"{}\"",
+            escape(&m.name),
+            escape(&m.worker)
+        );
         let code = status_code(m.status);
 
         // status
@@ -778,14 +792,23 @@ fn parse_size_bytes(s: &str) -> i64 {
     if s.is_empty() || s.eq_ignore_ascii_case("unknown") {
         return -1;
     }
-    // Strip trailing 'B' if present (e.g. "1.5GB" → "1.5G")
-    let s = s.strip_suffix('B').unwrap_or(s);
+    // Strip trailing 'B'/'b' if present (e.g. "1.5GB" → "1.5G", "1.5gb" → "1.5g"),
+    // then trim any whitespace between number and unit (e.g. "1.5 G").
+    let s = if s.ends_with('B') || s.ends_with('b') {
+        &s[..s.len() - 1]
+    } else {
+        s
+    };
+    let s = s.trim();
     let (num_str, multiplier) = match s.chars().last() {
-        Some('K') | Some('k') => (&s[..s.len() - 1], 1_024i64),
-        Some('M') | Some('m') => (&s[..s.len() - 1], 1_024 * 1_024),
-        Some('G') | Some('g') => (&s[..s.len() - 1], 1_024 * 1_024 * 1_024),
-        Some('T') | Some('t') => (&s[..s.len() - 1], 1_024 * 1_024 * 1_024 * 1_024),
-        Some('P') | Some('p') => (&s[..s.len() - 1], 1_024 * 1_024 * 1_024 * 1_024 * 1_024),
+        Some('K') | Some('k') => (s[..s.len() - 1].trim_end(), 1_024i64),
+        Some('M') | Some('m') => (s[..s.len() - 1].trim_end(), 1_024 * 1_024),
+        Some('G') | Some('g') => (s[..s.len() - 1].trim_end(), 1_024 * 1_024 * 1_024),
+        Some('T') | Some('t') => (s[..s.len() - 1].trim_end(), 1_024 * 1_024 * 1_024 * 1_024),
+        Some('P') | Some('p') => (
+            s[..s.len() - 1].trim_end(),
+            1_024 * 1_024 * 1_024 * 1_024 * 1_024,
+        ),
         _ => (s, 1i64),
     };
     num_str
@@ -836,5 +859,49 @@ mod metrics_tests {
         assert!(out.contains("tunasync_mirror_size_bytes{mirror=\"ubuntu\",worker=\"w1\"}"));
         assert!(out.contains("tunasync_mirrors_total{status=\"success\"} 1"));
         assert!(out.contains("tunasync_mirrors_total{status=\"failed\"} 0"));
+    }
+
+    /// L5: parse_size_bytes should handle space between number and unit
+    #[test]
+    fn parse_size_bytes_with_space() {
+        assert_eq!(
+            parse_size_bytes("1.5 G"),
+            (1.5 * 1024.0 * 1024.0 * 1024.0) as i64
+        );
+        assert_eq!(parse_size_bytes("100 M"), 100 * 1024 * 1024);
+        assert_eq!(parse_size_bytes("2 TB"), 2 * 1024 * 1024 * 1024 * 1024);
+        assert_eq!(
+            parse_size_bytes("1.5gb"),
+            (1.5 * 1024.0 * 1024.0 * 1024.0) as i64
+        );
+    }
+
+    /// L1: Prometheus label values with special chars must be escaped
+    #[test]
+    fn render_metrics_escapes_special_chars_in_labels() {
+        use tunasync_protocol::SyncStatus;
+        let mirrors = vec![MirrorStatus {
+            name: "tricky\"name".into(),
+            worker: "work\\er".into(),
+            is_master: true,
+            status: SyncStatus::Success,
+            last_update: chrono::Utc::now(),
+            ..Default::default()
+        }];
+        let out = render_metrics(&mirrors, 1);
+        // Quote and backslash must be escaped.
+        assert!(
+            out.contains(r#"mirror="tricky\"name""#),
+            "double-quote in mirror name not escaped: {out}"
+        );
+        assert!(
+            out.contains(r#"worker="work\\er""#),
+            "backslash in worker name not escaped: {out}"
+        );
+        // No raw unescaped quote sequence in a label value.
+        assert!(
+            !out.contains(r#"mirror="tricky"name""#),
+            "unescaped quote slipped through: {out}"
+        );
     }
 }
