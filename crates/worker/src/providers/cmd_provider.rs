@@ -476,6 +476,7 @@ async fn probe_url(url: &str) -> anyhow::Result<()> {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     //! Unit tests for CmdProvider's new extension fields.
     //!

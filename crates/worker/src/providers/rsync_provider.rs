@@ -475,13 +475,11 @@ impl MirrorProvider for RsyncProvider {
 
 // ── Atomic publish helpers ──────────────────────────────────────────────────
 
-/// Compute the staging directory path for atomic publish.
-///
-/// Stored under `<log_dir>/staging/<mirror_name>/` rather than inside the
-/// mirror tree so that operators serving `mirror_dir` directly via nginx
-/// do not inadvertently expose half-synced contents.
-///
-/// Exposed for tests; the public function is in the trait impl.
+/// Legacy fallback path: `<log_dir>/staging/<mirror_name>`. Used by tests
+/// to verify the fallback behaviour; production code paths now route through
+/// `MirrorConfig::effective_staging_dir()`, which checks per-mirror and
+/// global `staging_dir` overrides first.
+#[cfg(test)]
 pub(crate) fn atomic_staging_path_for(log_dir: &std::path::Path, mirror_name: &str) -> PathBuf {
     log_dir.join("staging").join(mirror_name)
 }

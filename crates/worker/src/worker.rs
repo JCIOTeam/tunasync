@@ -1339,6 +1339,7 @@ async fn run_http_server(
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod cron_schedule_tests {
     //! Unit tests for `next_run_for` — cron vs interval scheduling.
 
@@ -1836,13 +1837,13 @@ mod cron_schedule_tests {
         let mut mirror_statuses: HashMap<String, MirrorStatus> = HashMap::new();
 
         // Previously-preserved status.
-        let preserved = Some(MirrorStatus {
+        let preserved = MirrorStatus {
             name: mirror_name.clone(),
             worker: "w1".into(),
             status: SyncStatus::Success,
             size: "100G".into(),
             ..Default::default()
-        });
+        };
 
         // Simulate the rollback branch (build_one_provider returned Err).
         let e = anyhow::anyhow!("docker image not found");
@@ -1854,8 +1855,9 @@ mod cron_schedule_tests {
             }
         }
 
-        // Restore mirror_statuses with Failed status.
-        let mut failed_status = preserved.unwrap_or_default();
+        // Restore mirror_statuses with Failed status (mirrors what the
+        // production code does when `preserved` is Some).
+        let mut failed_status = preserved;
         failed_status.status = SyncStatus::Failed;
         failed_status.error_msg = format!("hot-reload: failed to rebuild provider: {e}");
         mirror_statuses.insert(mirror_name.clone(), failed_status);

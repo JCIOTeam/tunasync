@@ -468,6 +468,7 @@ impl TwoStageRsyncProvider {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     //! Unit tests for TwoStageRsyncProvider's new extension fields.
 
