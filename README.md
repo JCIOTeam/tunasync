@@ -168,7 +168,7 @@ The fallback list is for health-checking only — the actual sync data source is
 
 ### Atomic publish
 
-Rsync into a staging directory (`<log_dir>/staging/<name>/`) first, then atomically swap it with the publish directory using `renameat2(RENAME_EXCHANGE)`. Users always see either the old or new content; there is no window where the publish path is missing.
+Rsync into a staging directory first, then atomically swap it with the publish directory using `renameat2(RENAME_EXCHANGE)`. Users always see either the complete old or complete new content; there is no window where the publish path is missing or half-synced.
 
 ```toml
 [[mirrors]]
@@ -176,7 +176,36 @@ name = "debian"
 atomic_publish = true
 ```
 
-**Requirement:** `log_dir` and `mirror_dir` must be on the **same filesystem** (rename is only atomic within a single mount). The worker checks device IDs at startup and refuses to sync if they differ.
+**Staging directory location**, resolved in this order:
+
+1. `[[mirrors]].staging_dir` (per-mirror override)
+2. `[global].staging_dir` (worker-wide base)
+3. `<log_dir>/staging/<name>` (legacy fallback, requires `log_dir` and `mirror_dir` to share a filesystem)
+
+For options 1 and 2, the mirror name is appended automatically (so `staging_dir = "/srv/mirrors/.staging"` produces `/srv/mirrors/.staging/<name>/` per mirror).
+
+**Requirement:** the staging directory and the publish directory (`mirror_dir`) must be on the **same filesystem** — `rename(2)` is only atomic within a single mount. The worker checks device IDs at sync time and refuses to start if they differ.
+
+Most production deployments put logs on the OS disk and mirror data on a separate data disk, so the legacy fallback under `<log_dir>` doesn't work. Set `[global].staging_dir` to a path on the same filesystem as `mirror_dir`:
+
+```toml
+[global]
+log_dir     = "/var/log/tunasync"      # OS disk
+mirror_dir  = "/srv/mirrors"           # data disk
+staging_dir = "/srv/mirrors/.staging"  # same fs as mirror_dir
+```
+
+The leading dot in `.staging` blocks nginx's default auto-index from serving in-progress contents; for stricter setups use a sibling path outside the document root entirely.
+
+For mirrors served from a different data disk, override per-mirror:
+
+```toml
+[[mirrors]]
+name        = "huge-archive"
+mirror_dir  = "/data2/archive"
+staging_dir = "/data2/staging"   # follows the data disk
+atomic_publish = true
+```
 
 Falls back to a two-step rename (brief 404 window) only on kernels/filesystems that don't support `RENAME_EXCHANGE` (pre-3.15 kernels or some FUSE mounts); a warning is logged.
 
@@ -278,6 +307,12 @@ timeout = 600                            # Default timeout in seconds (0 = no ti
 # Defaults to UTC when unset. Use IANA names: "Asia/Shanghai", "Europe/Berlin", etc.
 # timezone = "UTC"
 
+# Base staging directory for mirrors with atomic_publish = true.
+# Must share a filesystem with mirror_dir. When unset, falls back to
+# <log_dir>/staging/<name>. Most production deployments need this set
+# explicitly because logs and mirror data are usually on different disks.
+# staging_dir = "/srv/mirrors/.staging"
+
 # Per-upstream host concurrency limits (optional).
 # [global.per_upstream_concurrent]
 # "rsync.kernel.org" = 2
@@ -306,6 +341,7 @@ use_ipv4 = true
 # check_upstream = false  # probe upstream before syncing
 # upstream_fallback = []  # fallback URLs for the probe (health-check only)
 # atomic_publish = false  # use staging dir + renameat2 swap
+# staging_dir = ""        # per-mirror staging override (else uses [global].staging_dir)
 
 [[mirrors]]
 name = "myrepo"

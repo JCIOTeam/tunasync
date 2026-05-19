@@ -163,7 +163,7 @@ upstream_fallback = ["rsync://mirror.example.com/kernel/"]
 
 ### 原子发布
 
-先将 rsync 输出写入暂存目录（`<log_dir>/staging/<name>/`，**不在** nginx 服务根目录下），成功后通过 `renameat2(RENAME_EXCHANGE)` 原子交换，用户始终看到完整的旧版或新版内容，不会出现 publish 路径消失的窗口：
+先将 rsync 输出写入**暂存目录**，成功后通过 `renameat2(RENAME_EXCHANGE)` 原子交换到 publish 目录，用户始终看到完整的旧版或新版内容，不会出现 publish 路径消失或半同步状态的窗口：
 
 ```toml
 [[mirrors]]
@@ -171,7 +171,36 @@ name = "debian"
 atomic_publish = true
 ```
 
-**要求：** `log_dir` 与 `mirror_dir` 必须在**同一文件系统**（rename 仅在同一挂载点内是原子的）。worker 在同步前通过 statvfs 检查设备 ID，不一致则拒绝同步。
+**暂存目录的解析顺序：**
+
+1. `[[mirrors]].staging_dir` （单镜像覆盖）
+2. `[global].staging_dir` （worker 级默认）
+3. `<log_dir>/staging/<name>` （遗留回退，要求 log_dir 与 mirror_dir 同文件系统）
+
+前两种情况会自动在路径后追加镜像名（例如 `staging_dir = "/srv/mirrors/.staging"` 实际为每个镜像生成 `/srv/mirrors/.staging/<name>/`）。
+
+**要求：** 暂存目录与 publish 目录（即镜像的 `mirror_dir`）必须在**同一文件系统**（`rename(2)` 仅在同一挂载点内是原子的）。worker 在同步前通过 statvfs 检查设备 ID，不一致则拒绝同步。
+
+大多数生产部署的日志放在系统盘、镜像数据放在独立数据盘，遗留回退路径 `<log_dir>/staging/` 通常无法满足同文件系统要求。设置 `[global].staging_dir` 为与 `mirror_dir` 同文件系统的路径即可：
+
+```toml
+[global]
+log_dir     = "/var/log/tunasync"      # 系统盘
+mirror_dir  = "/srv/mirrors"           # 数据盘
+staging_dir = "/srv/mirrors/.staging"  # 与 mirror_dir 同盘
+```
+
+`.staging` 前导点可以阻止 nginx 默认 autoindex 暴露半同步内容；如果需要更严格隔离，建议用 nginx 服务根目录之外的兄弟路径（如 `/srv/staging`）。
+
+对于跨数据盘的镜像，可在单镜像级别覆盖：
+
+```toml
+[[mirrors]]
+name        = "huge-archive"
+mirror_dir  = "/data2/archive"
+staging_dir = "/data2/staging"   # 跟随数据盘
+atomic_publish = true
+```
 
 不支持 `RENAME_EXCHANGE`（Linux 3.15 以下内核或部分 FUSE 挂载）时自动回退到两步 rename（有极短 404 窗口），并打印警告日志。
 
@@ -270,6 +299,11 @@ timeout = 600
 # 时区设置（可选，默认 UTC）
 # timezone = "Asia/Shanghai"
 
+# 原子发布暂存目录基路径（可选）。
+# 必须与 mirror_dir 同文件系统。未设置时回退到 <log_dir>/staging/<name>。
+# 大多数生产环境因日志盘与数据盘分离，需要显式设置。
+# staging_dir = "/srv/mirrors/.staging"
+
 # 单上游并发限制（可选）
 # [global.per_upstream_concurrent]
 # "rsync.kernel.org" = 2
@@ -295,6 +329,7 @@ use_ipv4 = true
 # check_upstream = false
 # upstream_fallback = []
 # atomic_publish = false
+# staging_dir = ""        # 单镜像暂存路径覆盖（否则使用 [global].staging_dir）
 
 [[mirrors]]
 name = "myrepo"

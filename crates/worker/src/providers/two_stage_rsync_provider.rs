@@ -74,6 +74,8 @@ pub struct TwoStageRsyncProvider {
     pub upstream_fallback: Vec<String>,
     /// Whether to swap staging↔publish atomically via renameat2 after sync.
     pub atomic_publish_enabled: bool,
+    /// Resolved staging directory for atomic publish.
+    pub atomic_staging_path: PathBuf,
     data_size: Mutex<String>,
     current_pid: Arc<Mutex<Option<u32>>>,
     docker_container_name: Option<String>,
@@ -218,6 +220,7 @@ impl TwoStageRsyncProvider {
             check_upstream: mc.check_upstream,
             upstream_fallback: mc.upstream_fallback.clone(),
             atomic_publish_enabled: mc.atomic_publish,
+            atomic_staging_path: mc.effective_staging_dir(global),
             data_size: Mutex::new(String::new()),
             current_pid: Arc::new(Mutex::new(None)),
             docker_container_name: None,
@@ -309,7 +312,7 @@ impl MirrorProvider for TwoStageRsyncProvider {
         // Determine destination (staging or publish dir).
         let publish_dir = self.working_dir.clone();
         let dest = if self.atomic_publish_enabled {
-            super::rsync_provider::atomic_staging_path_for(&self.log_dir, &self.name)
+            self.atomic_staging_path.clone()
         } else {
             publish_dir.clone()
         };

@@ -42,6 +42,9 @@ pub struct CmdProvider {
     pub upstream_fallback: Vec<String>,
     /// Whether to swap staging↔publish atomically via renameat2 after sync.
     pub atomic_publish_enabled: bool,
+    /// Resolved staging directory for atomic publish (per mirror / global /
+    /// fallback chain — see `MirrorConfig::effective_staging_dir`).
+    pub atomic_staging_path: PathBuf,
     data_size: Mutex<String>,
     /// PID of the currently running child process (set before wait, cleared after).
     current_pid: Arc<Mutex<Option<u32>>>,
@@ -131,6 +134,7 @@ impl CmdProvider {
             check_upstream: mc.check_upstream,
             upstream_fallback: mc.upstream_fallback.clone(),
             atomic_publish_enabled: mc.atomic_publish,
+            atomic_staging_path: mc.effective_staging_dir(global),
             data_size: Mutex::new(String::new()),
             current_pid: Arc::new(Mutex::new(None)),
             docker_container_name: None,
@@ -196,7 +200,7 @@ impl MirrorProvider for CmdProvider {
         // Determine sync destination (staging or publish dir).
         let publish_dir = self.working_dir.clone();
         let sync_target = if self.atomic_publish_enabled {
-            super::rsync_provider::atomic_staging_path_for(&self.log_dir, &self.name)
+            self.atomic_staging_path.clone()
         } else {
             publish_dir.clone()
         };

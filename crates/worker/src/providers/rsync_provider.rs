@@ -42,6 +42,10 @@ pub struct RsyncProvider {
     /// success the staging directory is atomically renamed into the
     /// publish dir.  Only works when both dirs share the same filesystem.
     pub atomic_publish_enabled: bool,
+    /// Resolved staging directory for atomic publish.
+    /// Computed at from_config time from MirrorConfig::staging_dir →
+    /// GlobalConfig::staging_dir → `<log_dir>/staging/<name>` (legacy).
+    pub atomic_staging_path: PathBuf,
     pub success_exit_codes: Vec<i32>,
     data_size: Mutex<String>,
     transferred_bytes: Mutex<u64>,
@@ -169,6 +173,7 @@ impl RsyncProvider {
             check_upstream: mc.check_upstream,
             upstream_fallback: mc.upstream_fallback.clone(),
             atomic_publish_enabled: mc.atomic_publish,
+            atomic_staging_path: mc.effective_staging_dir(global),
             data_size: Mutex::new(String::new()),
             transferred_bytes: Mutex::new(0),
             current_pid: Arc::new(Mutex::new(None)),
@@ -253,7 +258,7 @@ impl MirrorProvider for RsyncProvider {
         //   combine atomic_publish with --link-dest.
         let publish_dir = self.working_dir.clone();
         let sync_target = if self.atomic_publish_enabled {
-            atomic_staging_path_for(&self.log_dir, &self.name)
+            self.atomic_staging_path.clone()
         } else {
             publish_dir.clone()
         };

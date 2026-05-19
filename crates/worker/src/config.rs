@@ -253,6 +253,36 @@ pub struct GlobalConfig {
     /// is caught immediately rather than producing silently-wrong schedules.
     #[serde(default)]
     pub timezone: String,
+
+    /// Base directory for atomic-publish staging, used when a mirror has
+    /// `atomic_publish = true` set.
+    ///
+    /// When set, each mirror's staging directory is `<staging_dir>/<name>`.
+    /// When empty (default), staging falls back to `<log_dir>/staging/<name>`
+    /// — which only works when `log_dir` and `mirror_dir` are on the same
+    /// filesystem. Most production deployments put logs on the OS disk and
+    /// mirror data on a separate large data disk, so this fallback fails
+    /// the same-filesystem check; setting `staging_dir` explicitly is the
+    /// right answer for those layouts.
+    ///
+    /// REQUIREMENT: the staging directory must be on the same filesystem
+    /// as `mirror_dir` (rename(2) is only atomic within a single mount).
+    /// The worker checks device IDs at sync time and refuses to start if
+    /// they differ. Individual mirrors can override with
+    /// `MirrorConfig::staging_dir`.
+    ///
+    /// Recommended layout:
+    /// ```toml
+    /// [global]
+    /// mirror_dir  = "/srv/mirrors"
+    /// staging_dir = "/srv/mirrors/.staging"   # hidden from nginx by leading dot
+    /// ```
+    /// Note: anything under `mirror_dir` is served by nginx by default;
+    /// a leading dot in the directory name (`.staging`) blocks the default
+    /// nginx auto-index, but for stricter setups consider a sibling path
+    /// outside the document root entirely.
+    #[serde(default)]
+    pub staging_dir: String,
 }
 
 impl GlobalConfig {
@@ -546,6 +576,17 @@ pub struct MirrorConfig {
     #[serde(default)]
     pub atomic_publish: bool,
 
+    /// Per-mirror override for the atomic-publish staging directory.
+    ///
+    /// When non-empty, this mirror's staging path is `<staging_dir>/<name>`,
+    /// overriding `GlobalConfig::staging_dir` for this mirror only. Useful
+    /// when a single worker serves mirrors across multiple data filesystems.
+    ///
+    /// When empty, falls back to `[global].staging_dir`; when *that* is also
+    /// empty, falls back to `<log_dir>/staging/<name>`.
+    #[serde(default)]
+    pub staging_dir: String,
+
     /// Fallback upstream URLs for health probing. Does NOT change the
     /// actual sync data source — only used for pre-sync connectivity checks.
     #[serde(default)]
@@ -818,6 +859,11 @@ fn merge_mirror(parent: MirrorConfig, child: MirrorConfig) -> MirrorConfig {
         } else {
             child.atomic_publish
         },
+        staging_dir: if child.staging_dir.is_empty() {
+            parent.staging_dir
+        } else {
+            child.staging_dir
+        },
         upstream_fallback: if child.upstream_fallback.is_empty() {
             parent.upstream_fallback
         } else {
@@ -898,6 +944,30 @@ impl MirrorConfig {
             // Neither set: join global/name.
             PathBuf::from(&global.mirror_dir).join(&self.name)
         }
+    }
+
+    /// Resolved atomic-publish staging directory for this mirror.
+    ///
+    /// Resolution order:
+    ///   1. `MirrorConfig::staging_dir` (this mirror's per-mirror override)
+    ///   2. `GlobalConfig::staging_dir` (the worker-wide base)
+    ///   3. `<log_dir>/staging/<name>` (legacy fallback)
+    ///
+    /// For options 1 and 2, the mirror name is appended; option 3 produces a
+    /// complete per-mirror path on its own. Returns `None` when atomic_publish
+    /// is disabled — callers should handle that case before calling.
+    pub fn effective_staging_dir(&self, global: &GlobalConfig) -> PathBuf {
+        if !self.staging_dir.is_empty() {
+            return PathBuf::from(&self.staging_dir).join(&self.name);
+        }
+        if !global.staging_dir.is_empty() {
+            return PathBuf::from(&global.staging_dir).join(&self.name);
+        }
+        // Legacy fallback: under log_dir. Only works when log_dir and
+        // mirror_dir share a filesystem.
+        PathBuf::from(&global.log_dir)
+            .join("staging")
+            .join(&self.name)
     }
 
     /// Whether this worker acts as master for the mirror.
@@ -1172,5 +1242,86 @@ snapshot_path = "/snapshots/override"
             overridden.snapshot_path, "/snapshots/override",
             "child with explicit snapshot_path should override parent's"
         );
+    }
+
+    // ── effective_staging_dir resolution ──────────────────────────────────
+
+    /// Per-mirror staging_dir takes precedence over the global one.
+    #[test]
+    fn effective_staging_dir_mirror_overrides_global() {
+        let mut g = GlobalConfig::default();
+        g.staging_dir = "/srv/global-staging".into();
+        g.log_dir = "/var/log/tunasync".into();
+        g.mirror_dir = "/srv/mirrors".into();
+
+        let mut mc = MirrorConfig::default();
+        mc.name = "debian".into();
+        mc.staging_dir = "/srv/mirror-specific-staging".into();
+
+        assert_eq!(
+            mc.effective_staging_dir(&g),
+            std::path::PathBuf::from("/srv/mirror-specific-staging/debian")
+        );
+    }
+
+    /// When per-mirror is empty, fall back to global.
+    #[test]
+    fn effective_staging_dir_falls_back_to_global() {
+        let mut g = GlobalConfig::default();
+        g.staging_dir = "/srv/mirrors/.staging".into();
+        g.log_dir = "/var/log/tunasync".into();
+        g.mirror_dir = "/srv/mirrors".into();
+
+        let mut mc = MirrorConfig::default();
+        mc.name = "ubuntu".into();
+
+        assert_eq!(
+            mc.effective_staging_dir(&g),
+            std::path::PathBuf::from("/srv/mirrors/.staging/ubuntu")
+        );
+    }
+
+    /// When both are empty, fall back to legacy <log_dir>/staging/<name>.
+    #[test]
+    fn effective_staging_dir_legacy_fallback() {
+        let mut g = GlobalConfig::default();
+        g.log_dir = "/var/log/tunasync".into();
+        g.mirror_dir = "/srv/mirrors".into();
+
+        let mut mc = MirrorConfig::default();
+        mc.name = "arch".into();
+
+        assert_eq!(
+            mc.effective_staging_dir(&g),
+            std::path::PathBuf::from("/var/log/tunasync/staging/arch")
+        );
+    }
+
+    /// Verify staging_dir flows through child-mirror inheritance via merge_mirror.
+    #[test]
+    fn staging_dir_inherited_through_merge() {
+        let toml = r#"
+[[mirrors]]
+name = "parent"
+provider = "rsync"
+staging_dir = "/data/staging"
+
+[[mirrors.mirrors]]
+name = "child-inherit"
+upstream = "rsync://example.com/c/"
+
+[[mirrors.mirrors]]
+name = "child-override"
+upstream = "rsync://example.com/o/"
+staging_dir = "/other/staging"
+"#;
+        let cfg: WorkerConfig = tunasync_common::config::parse_toml(toml).unwrap();
+        let flat = flatten_mirrors(&cfg.mirrors_conf);
+
+        let inherit = flat.iter().find(|m| m.name == "child-inherit").unwrap();
+        assert_eq!(inherit.staging_dir, "/data/staging");
+
+        let overridden = flat.iter().find(|m| m.name == "child-override").unwrap();
+        assert_eq!(overridden.staging_dir, "/other/staging");
     }
 }
