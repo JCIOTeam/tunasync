@@ -266,7 +266,7 @@ fn build_command() -> clap::Command {
         })
         .mut_arg("manager", |a| a.help("Manager 主机地址或 IP"))
         .mut_arg("port", |a| a.help("Manager 端口"))
-        .mut_arg("ca-cert", |a| a.help("TLS CA 证书（启用 HTTPS）"))
+        .mut_arg("ca_cert", |a| a.help("TLS CA 证书（启用 HTTPS）"))
         .mut_arg("verbose", |a| a.help("详细日志输出"));
 
     cmd = cmd
@@ -1003,4 +1003,101 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod cli_tests {
+    //! Tests for the clap command builder.
+    //!
+    //! `Command::mut_arg(id, …)` panics at runtime (not at compile time) if
+    //! `id` doesn't match a real arg ID. clap uses snake_case IDs from the
+    //! derived field names — so `ca_cert: Option<PathBuf>` becomes arg ID
+    //! `"ca_cert"`, NOT `"ca-cert"`. A typo like `.mut_arg("ca_cert", …)`
+    //! compiles cleanly but panics on the very first invocation:
+    //!
+    //!     thread 'main' panicked at clap_builder/.../command.rs:252:32:
+    //!     Argument `ca-cert` is undefined
+    //!
+    //! That bug shipped in v0.2.x and reached users. To prevent recurrence,
+    //! this test simply invokes the command builder and `.get_matches_from`
+    //! with `--help` — exactly the path that triggers the mut_arg lookups.
+    //! Any future typo in a mut_arg ID will fail this test instantly.
+
+    use super::*;
+
+    /// Force the Chinese-locale branch of `build_command` for the duration
+    /// of the test — that's the branch that calls `mut_arg`, and where the
+    /// original ca-cert / ca_cert typo lived. Without setting this env var,
+    /// the test environment's locale determines the path taken, and tests
+    /// pass on en_US systems even when broken on zh_CN ones.
+    fn set_zh_locale() {
+        // SAFETY: test-only; no other thread touches this env var.
+        std::env::set_var("TUNASYNCTL_LANG", "zh");
+    }
+
+    #[test]
+    fn build_command_does_not_panic_on_help() {
+        set_zh_locale();
+        let cmd = build_command();
+        let result = cmd.try_get_matches_from(["tunasynctl", "--help"]);
+        assert!(
+            result.is_err(),
+            "--help should produce a DisplayHelp error, got {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::DisplayHelp,
+            "expected DisplayHelp, got {:?}",
+            err.kind()
+        );
+    }
+
+    /// Each subcommand's --help must also succeed (catches mut_arg typos in
+    /// per-subcommand mut_subcommand blocks).
+    #[test]
+    fn every_subcommand_help_does_not_panic() {
+        set_zh_locale();
+        for sub in [
+            "list",
+            "workers",
+            "flush",
+            "stale",
+            "rm-worker",
+            "start",
+            "stop",
+            "disable",
+            "restart",
+            "reload",
+            "set-size",
+            "maintenance",
+            "completion",
+        ] {
+            let cmd = build_command();
+            let result = cmd.try_get_matches_from(["tunasynctl", sub, "--help"]);
+            assert!(result.is_err(), "{sub} --help should produce DisplayHelp");
+            assert_eq!(
+                result.unwrap_err().kind(),
+                clap::error::ErrorKind::DisplayHelp,
+                "{sub} --help should be DisplayHelp"
+            );
+        }
+    }
+
+    /// Building the command with no args at all (which is what 'tunasynctl'
+    /// alone does — clap prints help and exits) must not panic from a
+    /// missing mut_arg ID.
+    #[test]
+    fn build_command_with_no_args_does_not_panic() {
+        set_zh_locale();
+        let cmd = build_command();
+        // Empty argv would hit clap's "missing subcommand" error, which is
+        // a DisplayUsage / MissingSubcommand error kind, not a panic.
+        let result = cmd.try_get_matches_from(["tunasynctl"]);
+        assert!(result.is_err());
+        // Any non-panic outcome is fine — the bug was a panic during
+        // mut_arg resolution before we even got to subcommand dispatch.
+    }
 }
