@@ -93,12 +93,32 @@ impl ScheduleQueue {
         self.latest.remove(name);
     }
 
+    /// Returns true when there are no live entries to schedule.
+    ///
+    /// Filters out stale entries (heap entries whose name has been
+    /// re-scheduled or removed via `latest`). Without this filter the
+    /// method would report non-empty for a queue containing only stale
+    /// entries that `pop()` would silently skip. Currently only the
+    /// test suite calls this; production code uses `peek()` / `pop()`,
+    /// both of which already filter correctly.
     pub fn is_empty(&self) -> bool {
-        self.heap.is_empty()
+        self.heap.iter().all(|e| {
+            self.latest
+                .get(&e.name)
+                .map(|&latest| latest != e.next_run)
+                .unwrap_or(true)
+        })
     }
 
+    /// Number of live (non-stale) entries in the queue.
+    ///
+    /// Like `is_empty`, this filters stale entries so the result matches
+    /// what an exhaustive `pop()` loop would yield. O(n) — not a hot path.
     pub fn len(&self) -> usize {
-        self.heap.len()
+        self.heap
+            .iter()
+            .filter(|e| self.latest.get(&e.name) == Some(&e.next_run))
+            .count()
     }
 }
 
@@ -204,12 +224,33 @@ mod tests {
         q.push("a".into(), at(1));
         q.push("b".into(), at(2));
         assert!(!q.is_empty());
-        // Heap len counts raw entries (including stale), len() reflects heap size.
-        assert!(q.len() >= 2);
+        // Both entries are the latest for their names → both live.
+        assert_eq!(q.len(), 2);
 
         q.pop();
         q.pop();
         // After popping all valid entries the heap should drain stale ones too.
+        assert!(q.peek().is_none());
+    }
+
+    /// is_empty() and len() must filter stale entries — i.e. they should
+    /// agree with what pop() / peek() see, not the raw heap size. Before
+    /// this fix, a queue containing only stale entries reported len() > 0
+    /// and is_empty() = false, misleading callers.
+    #[test]
+    fn is_empty_and_len_skip_stale_entries() {
+        let mut q = ScheduleQueue::new();
+        // Push two entries for "a"; the first becomes stale.
+        q.push("a".into(), at(10));
+        q.push("a".into(), at(20));
+        // Heap holds 2 entries but only 1 is live (at=20).
+        assert_eq!(q.len(), 1, "stale entry must not count in len");
+        assert!(!q.is_empty());
+
+        // Remove "a" entirely — both heap entries are now stale.
+        q.remove("a");
+        assert_eq!(q.len(), 0, "all-stale queue must report len=0");
+        assert!(q.is_empty(), "all-stale queue must report empty");
         assert!(q.peek().is_none());
     }
 

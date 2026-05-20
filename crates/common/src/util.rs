@@ -53,8 +53,15 @@ pub fn translate_rsync_error_code(exit_code: i32) -> (i32, String) {
 /// Returns the **last** occurrence — matches Go's `ExtractSizeFromLog` which
 /// does `matches[len(matches)-1][1]` (last element of `FindAllSubmatch`).
 pub fn extract_size_from_rsync_log(log_content: &str) -> String {
-    let re =
-        regex::Regex::new(r"(?m)^Total file size: ([0-9.]+[KMGTP]?) bytes").expect("static regex");
+    // Accept the same digit-group forms that `extract_transferred_bytes_from_rsync_log`
+    // accepts:
+    //   "Total file size: 1234567 bytes"
+    //   "Total file size: 1,234,567 bytes"       (some locales / rsync configs)
+    //   "Total file size: 1.23G bytes"            (with --human-readable)
+    // The previous regex `[0-9.]+[KMGTP]?` rejected the comma form and produced
+    // an empty result on those logs (mirror size shown as blank in the UI).
+    let re = regex::Regex::new(r"(?m)^Total file size:\s+([0-9][0-9,.]*[KMGTP]?) bytes")
+        .expect("static regex");
     re.captures_iter(log_content)
         .last()
         .and_then(|c| c.get(1))
@@ -232,6 +239,23 @@ mod tests {
     #[test]
     fn extract_rsync_size_empty() {
         assert_eq!(extract_size_from_rsync_log("no size here"), "");
+    }
+
+    /// Regression: rsync 3.x with certain --info / locale settings produces
+    /// comma-separated digit groups in "Total file size". The original regex
+    /// rejected this form and the mirror's size column in the UI went blank
+    /// after a successful sync.
+    #[test]
+    fn extract_rsync_size_handles_commas() {
+        let log = "Total file size: 1,234,567,890 bytes\n";
+        assert_eq!(extract_size_from_rsync_log(log), "1,234,567,890");
+    }
+
+    /// Plain integer (no commas, no suffix) still works.
+    #[test]
+    fn extract_rsync_size_handles_plain_integer() {
+        let log = "Total file size: 42 bytes\n";
+        assert_eq!(extract_size_from_rsync_log(log), "42");
     }
 
     #[test]

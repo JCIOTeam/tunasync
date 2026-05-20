@@ -271,8 +271,21 @@ impl MirrorProvider for RsyncProvider {
         let argv = self.build_argv_for_dest(&sync_target);
         // When Docker wrapping is active, the argv is wrapped with `docker run …`
         // and env vars go through `-e` flags. The host process doesn't need them.
+        //
+        // CRITICAL: when atomic_publish is on, the container must see the
+        // staging dir (not the publish dir) as its working directory and
+        // TUNASYNC_WORKING_DIR. A user-supplied post-exec hook (e.g. an
+        // mkindex script) running inside the container would otherwise
+        // write into publish_dir and bypass the atomic swap. The fix in
+        // commit 3889ce2 (M7) added wrap_argv_for for CmdProvider but
+        // missed this call site and the TwoStageRsyncProvider one.
+        let wd_override = if self.atomic_publish_enabled {
+            Some(sync_target.as_path())
+        } else {
+            None
+        };
         let (argv, spawn_env) = if let Some(docker) = &self.docker_config {
-            (docker.wrap_argv(&argv), HashMap::new())
+            (docker.wrap_argv_for(&argv, wd_override), HashMap::new())
         } else {
             (argv, self.rsync_env.clone())
         };
@@ -500,11 +513,8 @@ pub(crate) fn ensure_atomic_publish_dirs(
     use std::os::unix::fs::MetadataExt;
 
     // Always ensure staging exists before any device-id check, so the
-    // device check has a real path to stat.
-    if let Some(parent) = staging.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create staging parent {}", parent.display()))?;
-    }
+    // device check has a real path to stat. create_dir_all is recursive,
+    // so a single call also creates any missing parent directories.
     if !staging.exists() {
         std::fs::create_dir_all(staging)
             .with_context(|| format!("create staging {}", staging.display()))?;

@@ -44,22 +44,43 @@ use crate::manager_client::ManagerClient;
 use crate::provider::MirrorProvider;
 use crate::schedule::ScheduleQueue;
 
-/// Extract the hostname from an upstream URL for per-upstream concurrency keying.
+/// Extract the upstream host from a sync URL, for per-upstream concurrency.
 ///
-/// Handles:
-/// - `rsync://host/module` or `http://host/path` → URL parse → host_str
-/// - rsync daemon syntax `host::module` → split on `::`
-/// - bare paths or anything else → returns `None` (no per-host limit applied)
+/// Handles three forms:
+///   * `rsync://host/module/path`      — scheme form, parsed by `url`
+///   * `host::module/path`             — legacy rsync daemon shorthand
+///   * `rsync://host::module/path`     — rare mixed form; `url` crate fails
+///     here ("invalid port number") because the second `:` looks like a
+///     port separator. We detect this and fall back to splitting on `::`.
+///
+/// Returns `None` for unrecognised formats (`file://`, plain paths, etc).
 fn upstream_host(upstream: &str) -> Option<String> {
-    if upstream.contains("://") {
-        url::Url::parse(upstream)
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_owned))
-    } else if upstream.contains("::") {
-        upstream.split("::").next().map(str::to_owned)
-    } else {
-        None
+    // Try URL parsing first. Succeeds for canonical scheme URLs.
+    if let Ok(u) = url::Url::parse(upstream) {
+        if let Some(host) = u.host_str() {
+            // Sanity check: a parsed host should never itself contain "::".
+            // If it does, the input was something exotic — fall through to
+            // the `::` heuristic below.
+            if !host.contains("::") {
+                return Some(host.to_owned());
+            }
+        }
     }
+    // URL parse failed (e.g. `rsync://host::module/`) or returned a weird
+    // host. Use rsync's `host::module` shorthand: everything before the
+    // first `::` is the host. Strip any scheme prefix if present.
+    if upstream.contains("::") {
+        let after_scheme = upstream
+            .find("://")
+            .map(|i| &upstream[i + 3..])
+            .unwrap_or(upstream);
+        return after_scheme
+            .split("::")
+            .next()
+            .filter(|h| !h.is_empty())
+            .map(str::to_owned);
+    }
+    None
 }
 
 /// Compute the next `Instant` a mirror should run.
@@ -1872,5 +1893,58 @@ mod cron_schedule_tests {
         assert!(status.error_msg.contains("hot-reload"));
         // Historical data (size) preserved from the old status.
         assert_eq!(status.size, "100G");
+    }
+
+    // ── upstream_host parsing ──────────────────────────────────────────────
+
+    #[test]
+    fn upstream_host_handles_scheme_form() {
+        assert_eq!(
+            super::upstream_host("rsync://ftp.debian.org/debian/"),
+            Some("ftp.debian.org".into())
+        );
+        assert_eq!(
+            super::upstream_host("https://mirror.example.com/path/"),
+            Some("mirror.example.com".into())
+        );
+        assert_eq!(
+            super::upstream_host("rsync://user@host:873/mod/"),
+            Some("host".into())
+        );
+    }
+
+    #[test]
+    fn upstream_host_handles_legacy_double_colon() {
+        // rsync daemon shorthand without a scheme.
+        assert_eq!(
+            super::upstream_host("ftp.debian.org::debian/"),
+            Some("ftp.debian.org".into())
+        );
+        // Also accepts no trailing slash / path.
+        assert_eq!(super::upstream_host("host::module"), Some("host".into()));
+    }
+
+    /// Regression test for the bug audit's claim 2.1.
+    /// `rsync://host::module/` previously matched the `://` branch first,
+    /// failed url::Url::parse with "invalid port number", and returned
+    /// None — never reaching the `::` fallback.
+    #[test]
+    fn upstream_host_handles_mixed_scheme_and_double_colon() {
+        assert_eq!(
+            super::upstream_host("rsync://ftp.debian.org::debian/"),
+            Some("ftp.debian.org".into())
+        );
+        // Same with no trailing slash.
+        assert_eq!(
+            super::upstream_host("rsync://host::module"),
+            Some("host".into())
+        );
+    }
+
+    #[test]
+    fn upstream_host_returns_none_for_unrecognised() {
+        assert_eq!(super::upstream_host("/local/path"), None);
+        assert_eq!(super::upstream_host(""), None);
+        assert_eq!(super::upstream_host("file:///srv/mirror/"), None);
     }
 }

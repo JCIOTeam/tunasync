@@ -246,8 +246,19 @@ impl TwoStageRsyncProvider {
         };
         let argv = self.build_argv(opts, dest);
         // When Docker wrapping is active, wrap argv and use empty env.
+        //
+        // Under atomic_publish, `dest` is the staging directory (see the
+        // caller in run() below). Pass it through as the Docker working_dir
+        // override so the container's $PWD, -v mount, and TUNASYNC_WORKING_DIR
+        // all match where rsync is writing — preventing user post-exec
+        // scripts from bypassing the atomic swap.
+        let wd_override = if self.atomic_publish_enabled {
+            Some(dest)
+        } else {
+            None
+        };
         let (argv, spawn_env) = if let Some(docker) = &self.docker_config {
-            (docker.wrap_argv(&argv), HashMap::new())
+            (docker.wrap_argv_for(&argv, wd_override), HashMap::new())
         } else {
             (argv, self.rsync_env.clone())
         };
