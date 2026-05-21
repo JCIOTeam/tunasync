@@ -835,7 +835,13 @@ fn parse_size_bytes(s: &str) -> i64 {
         ),
         _ => (s, 1i64),
     };
-    num_str
+    // Strip thousands separators. extract_size_from_rsync_log preserves
+    // commas in the raw form (e.g. "1,234,567" for the UI), but f64::parse
+    // rejects them. Without this strip, the Prometheus /metrics endpoint
+    // reports -1 ("unknown") for any mirror whose rsync produced
+    // comma-separated digit groups, while the UI shows the correct value.
+    let cleaned = num_str.replace(',', "");
+    cleaned
         .parse::<f64>()
         .map(|n| (n * multiplier as f64).round() as i64)
         .unwrap_or(-1)
@@ -927,6 +933,23 @@ mod metrics_tests {
         assert_eq!(
             parse_size_bytes("1.5gb"),
             (1.5 * 1024.0 * 1024.0 * 1024.0) as i64
+        );
+    }
+
+    /// N2 (audit 2026-05-21): parse_size_bytes must strip thousands
+    /// separators. extract_size_from_rsync_log was changed in v0.2.2 to
+    /// accept comma-separated digit groups, but parse_size_bytes still
+    /// called f64::parse() which fails on commas — the Prometheus /metrics
+    /// endpoint returned -1 ("unknown") for mirrors whose rsync stats came
+    /// out with commas, while the UI showed the real value. Now consistent.
+    #[test]
+    fn parse_size_bytes_strips_thousands_separators() {
+        assert_eq!(parse_size_bytes("1,234,567"), 1_234_567);
+        assert_eq!(parse_size_bytes("1,234,567,890"), 1_234_567_890);
+        // With a unit suffix.
+        assert_eq!(
+            parse_size_bytes("1,234.5K"),
+            (1234.5_f64 * 1024.0).round() as i64
         );
     }
 

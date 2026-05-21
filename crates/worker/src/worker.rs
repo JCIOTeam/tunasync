@@ -47,28 +47,34 @@ use crate::schedule::ScheduleQueue;
 /// Extract the upstream host from a sync URL, for per-upstream concurrency.
 ///
 /// Handles three forms:
-///   * `rsync://host/module/path`      — scheme form, parsed by `url`
+///   * `rsync://host/module/path`      — scheme form (`url` crate parses)
+///   * `rsync://[::1]/mod/`            — IPv6 in brackets, also fine for `url`
 ///   * `host::module/path`             — legacy rsync daemon shorthand
 ///   * `rsync://host::module/path`     — rare mixed form; `url` crate fails
-///     here ("invalid port number") because the second `:` looks like a
-///     port separator. We detect this and fall back to splitting on `::`.
+///     here ("invalid port number") because the second `:` looks like a port
+///     separator. We detect the failure and fall back to `::` splitting.
 ///
 /// Returns `None` for unrecognised formats (`file://`, plain paths, etc).
 fn upstream_host(upstream: &str) -> Option<String> {
-    // Try URL parsing first. Succeeds for canonical scheme URLs.
+    // Try URL parsing first. If it succeeds AND yields a host_str we trust
+    // it — even when the host contains `::`, since that's a valid bracketed
+    // IPv6 literal like `[::1]` or `[2001:db8::1]`. Filtering those out
+    // would break per-upstream concurrency for IPv6 mirrors.
+    //
+    // Note that `url::Url::parse("host::module/")` can SUCCEED but yield
+    // `host_str() == None` (the parser thinks `host` is a scheme). Treat
+    // that the same as a parse failure and fall through to the `::` split.
     if let Ok(u) = url::Url::parse(upstream) {
         if let Some(host) = u.host_str() {
-            // Sanity check: a parsed host should never itself contain "::".
-            // If it does, the input was something exotic — fall through to
-            // the `::` heuristic below.
-            if !host.contains("::") {
-                return Some(host.to_owned());
-            }
+            return Some(host.to_owned());
         }
     }
-    // URL parse failed (e.g. `rsync://host::module/`) or returned a weird
-    // host. Use rsync's `host::module` shorthand: everything before the
-    // first `::` is the host. Strip any scheme prefix if present.
+
+    // URL parse failed or produced no host. Two real cases land here:
+    //   1. `host::module/path` — pure legacy form, no scheme. The host is
+    //      everything before the first `::`.
+    //   2. `rsync://host::module/` — mixed form (the parser fails on the
+    //      port number). Strip the scheme prefix first, then split on `::`.
     if upstream.contains("::") {
         let after_scheme = upstream
             .find("://")
@@ -1028,14 +1034,21 @@ impl Worker {
                             // that wasn't in our map for some reason — e.g.
                             // first-time reload before initial status report),
                             // fall back to a zero-value status.
+                            //
+                            // N3: scheduled must be reset to now(). The
+                            // Modify branch enqueues with Instant::now()
+                            // below, so the next sync fires immediately —
+                            // preserving the stale scheduled value from the
+                            // previous status would make the manager UI
+                            // show a future or past time that bears no
+                            // relation to reality. All other historical
+                            // telemetry (last_update, size, transferred
+                            // bytes, etc.) is preserved as designed.
+                            let now_utc = Utc::now();
                             let merged = if let Some(mut prev) = preserved {
                                 prev.upstream = upstream;
                                 prev.is_master = is_master;
-                                // Name and worker are immutable identifiers
-                                // — keep them. Everything else (status,
-                                // last_*, size, error_msg, scheduled,
-                                // transferred_bytes, consecutive_failures,
-                                // stale) is preserved as-is.
+                                prev.scheduled = now_utc;
                                 prev
                             } else {
                                 MirrorStatus {
@@ -1043,6 +1056,7 @@ impl Worker {
                                     worker: self.cfg.global.name.clone(),
                                     is_master,
                                     upstream,
+                                    scheduled: now_utc,
                                     ..Default::default()
                                 }
                             };
@@ -1771,6 +1785,7 @@ mod cron_schedule_tests {
             last_update: chrono::Utc::now() - chrono::Duration::hours(2),
             last_started: chrono::Utc::now() - chrono::Duration::hours(3),
             last_ended: chrono::Utc::now() - chrono::Duration::hours(2),
+            scheduled: chrono::Utc::now() - chrono::Duration::hours(1),
             size: "120G".into(),
             last_transferred_bytes: 5_368_709_120,    // 5 GiB
             total_transferred_bytes: 100_000_000_000, // 100 GB cumulative
@@ -1783,10 +1798,13 @@ mod cron_schedule_tests {
         let new_upstream = "rsync://new-upstream/".to_string();
         let new_is_master = true;
 
-        // Apply the same merge logic the Modify branch uses.
+        // Apply the same merge logic the Modify branch uses (including
+        // the N3 scheduled-reset behaviour).
+        let now_utc = chrono::Utc::now();
         let mut merged = prev.clone();
         merged.upstream = new_upstream.clone();
         merged.is_master = new_is_master;
+        merged.scheduled = now_utc;
 
         // Identity preserved.
         assert_eq!(merged.name, "ubuntu");
@@ -1801,6 +1819,13 @@ mod cron_schedule_tests {
         assert_eq!(merged.last_update, prev.last_update);
         assert_eq!(merged.last_started, prev.last_started);
         assert_eq!(merged.last_ended, prev.last_ended);
+        // N3: scheduled MUST advance to "now" because the Modify branch
+        // re-enqueues with Instant::now(). The old scheduled would be
+        // misleading (could be hours past or future).
+        assert!(
+            merged.scheduled > prev.scheduled,
+            "scheduled must move forward to now() since the job fires immediately after Modify"
+        );
     }
 
     /// Hot-reload Delete must also remove the mirror from cfg.mirrors;
@@ -1946,5 +1971,33 @@ mod cron_schedule_tests {
         assert_eq!(super::upstream_host("/local/path"), None);
         assert_eq!(super::upstream_host(""), None);
         assert_eq!(super::upstream_host("file:///srv/mirror/"), None);
+    }
+
+    /// Regression test for N1 (audit 2026-05-21).
+    /// IPv6 literals in URLs are kept by `url::Url::host_str` in their
+    /// bracketed form (`[::1]`, `[2001:db8::1]`). The previous fix's
+    /// `!host.contains("::")` guard was meant to detect the
+    /// `rsync://host::module/` mixed-form parse failure mode but it
+    /// erroneously also rejected IPv6 hosts (which always contain `::`).
+    /// Per-upstream concurrency keys for IPv6 mirrors got mangled to "["
+    /// or empty strings.
+    #[test]
+    fn upstream_host_preserves_ipv6_literals() {
+        assert_eq!(
+            super::upstream_host("rsync://[::1]/mod/"),
+            Some("[::1]".into())
+        );
+        assert_eq!(
+            super::upstream_host("rsync://[2001:db8::1]/mod/"),
+            Some("[2001:db8::1]".into())
+        );
+        assert_eq!(
+            super::upstream_host("http://[::1]:8080/path"),
+            Some("[::1]".into())
+        );
+        assert_eq!(
+            super::upstream_host("https://[2001:db8::1]/repo/"),
+            Some("[2001:db8::1]".into())
+        );
     }
 }
