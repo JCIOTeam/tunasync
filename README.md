@@ -660,6 +660,58 @@ Notable subtleties:
 | DELETE | `/maintenance` | Disable maintenance mode |
 | GET | `/maintenance` | Get maintenance mode status |
 
+### Prometheus metrics (`GET /metrics`)
+
+The manager exposes a Prometheus-format scrape endpoint at `/metrics`. All per-mirror metrics carry `mirror="<name>",worker="<worker_id>"` labels.
+
+| Metric | Type | Description |
+|---|---|---|
+| `tunasync_workers_total` | gauge | Number of currently registered workers |
+| `tunasync_mirrors_total{status="..."}` | gauge | Count of mirrors in each status. The `status` label is one of `none`, `pre-syncing`, `syncing`, `success`, `failed`, `paused`, `disabled` |
+| `tunasync_mirror_status{mirror,worker}` | gauge | Sync status code per mirror: `0=none 1=pre-syncing 2=syncing 3=success 4=failed 5=paused 6=disabled` |
+| `tunasync_mirror_size_bytes{mirror,worker}` | gauge | Mirror size in bytes (parsed from rsync stats; `-1` if unknown/unparseable) |
+| `tunasync_mirror_last_success_timestamp_seconds{mirror,worker}` | gauge | Unix timestamp of the last `last_update` write. `0` if the mirror has never reported a successful sync |
+| `tunasync_mirror_last_sync_duration_seconds{mirror,worker}` | gauge | `last_ended - last_started` for the most recent completed sync (`0` if never run) |
+| `tunasync_mirror_last_transferred_bytes{mirror,worker}` | gauge | Bytes transferred during the most recent sync (`0` if unknown). Resets on each new sync |
+| `tunasync_mirror_total_transferred_bytes{mirror,worker}` | counter | Cumulative bytes transferred across all syncs of this `(mirror, worker)` pair. Monotonically non-decreasing — use `rate()` for traffic-per-second |
+
+#### Recipes
+
+Traffic over the last hour (bytes / sec):
+```promql
+rate(tunasync_mirror_total_transferred_bytes[1h])
+```
+
+Per-mirror sync duration percentile:
+```promql
+quantile by (mirror) (0.95, tunasync_mirror_last_sync_duration_seconds)
+```
+
+Mirrors that have failed at least one consecutive sync (the manager flips `mirror_status` from `3=success` to `4=failed` while preserving `last_success_timestamp_seconds`):
+```promql
+tunasync_mirror_status == 4
+```
+
+Mirrors which have not synced in 48 hours (use the timestamp metric and the Prometheus server's `time()`):
+```promql
+time() - tunasync_mirror_last_success_timestamp_seconds > 48 * 3600
+```
+
+#### How `total_transferred_bytes` accumulates
+
+The worker reads `Total transferred file size` from each rsync `--stats` log (`extract_transferred_bytes_from_rsync_log` in `crates/common/src/util.rs`) and reports it as `last_transferred_bytes` in the status update. On the manager side (`update_job_of_worker` in `crates/manager/src/server.rs`), whenever `last_started` changes and `last_transferred_bytes > 0` the manager adds the new value to the running total:
+
+```rust
+if incoming.last_transferred_bytes > 0 && incoming.last_started != cur.last_started {
+    incoming.total_transferred_bytes =
+        cur.total_transferred_bytes + incoming.last_transferred_bytes;
+}
+```
+
+This means the counter advances exactly once per completed sync. It does **not** include hook-uploaded data (e.g. `exec_post` scripts that publish to a CDN), and it does **not** reset when you `flush` a disabled mirror — the row is deleted entirely and the counter starts at zero if the mirror is later re-registered.
+
+Non-rsync providers (`command`, `two-stage-rsync`) only report `last_transferred_bytes` when their `exec_log_file` matches the rsync stats format; otherwise both gauges stay at `0`.
+
 ## License
 
 GPL-3.0-or-later, same as upstream.

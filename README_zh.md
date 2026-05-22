@@ -644,6 +644,58 @@ tunasync-migrate http://localhost:12345 /var/lib/tunasync/new.db
 | DELETE | `/maintenance` | 关闭维护模式 |
 | GET | `/maintenance` | 获取维护模式状态 |
 
+### Prometheus 指标 (`GET /metrics`)
+
+manager 在 `/metrics` 暴露 Prometheus 文本格式的指标。所有按镜像统计的指标都带 `mirror="<名称>",worker="<worker_id>"` 标签。
+
+| 指标名 | 类型 | 说明 |
+|---|---|---|
+| `tunasync_workers_total` | gauge | 当前已注册的 worker 数量 |
+| `tunasync_mirrors_total{status="..."}` | gauge | 按状态分组的镜像数量。`status` 取值：`none`、`pre-syncing`、`syncing`、`success`、`failed`、`paused`、`disabled` |
+| `tunasync_mirror_status{mirror,worker}` | gauge | 单个镜像的状态码：`0=none 1=pre-syncing 2=syncing 3=success 4=failed 5=paused 6=disabled` |
+| `tunasync_mirror_size_bytes{mirror,worker}` | gauge | 镜像数据大小（字节）。从 rsync `--stats` 输出解析得来；无法识别时为 `-1` |
+| `tunasync_mirror_last_success_timestamp_seconds{mirror,worker}` | gauge | 最近一次成功同步（`last_update`）的 Unix 时间戳；从未成功则为 `0` |
+| `tunasync_mirror_last_sync_duration_seconds{mirror,worker}` | gauge | 最近一次完成的同步耗时秒数（`last_ended - last_started`），从未运行则为 `0` |
+| `tunasync_mirror_last_transferred_bytes{mirror,worker}` | gauge | 最近一次同步传输的字节数；未知时为 `0`。每次新同步会重置 |
+| `tunasync_mirror_total_transferred_bytes{mirror,worker}` | counter | 该 `(mirror, worker)` 累计同步传输字节数，单调不减，配合 `rate()` 即可获得带宽 |
+
+#### 常用查询
+
+近 1 小时的传输速率（字节/秒）：
+```promql
+rate(tunasync_mirror_total_transferred_bytes[1h])
+```
+
+镜像同步耗时的 95 分位：
+```promql
+quantile by (mirror) (0.95, tunasync_mirror_last_sync_duration_seconds)
+```
+
+当前处于失败状态的镜像（manager 将 `mirror_status` 从 `3=success` 翻到 `4=failed` 但保留 `last_success_timestamp_seconds`）：
+```promql
+tunasync_mirror_status == 4
+```
+
+48 小时未成功同步的镜像（用时间戳和 Prometheus 的 `time()`）：
+```promql
+time() - tunasync_mirror_last_success_timestamp_seconds > 48 * 3600
+```
+
+#### `total_transferred_bytes` 累加逻辑
+
+worker 从每次 rsync `--stats` 日志解析 `Total transferred file size`（`crates/common/src/util.rs` 中的 `extract_transferred_bytes_from_rsync_log`），作为 `last_transferred_bytes` 上报。manager 端（`crates/manager/src/server.rs` 的 `update_job_of_worker`）每当 `last_started` 变化且 `last_transferred_bytes > 0` 时，把新值累加到运行总数：
+
+```rust
+if incoming.last_transferred_bytes > 0 && incoming.last_started != cur.last_started {
+    incoming.total_transferred_bytes =
+        cur.total_transferred_bytes + incoming.last_transferred_bytes;
+}
+```
+
+也就是说每完成一次同步累加一次。这个数字**不**包含 hook 脚本（如 `exec_post`）上传到 CDN 的流量；执行 `flush` 清除已 disabled 的镜像时整行被删除，重新注册同名镜像时计数器从 0 开始。
+
+非 rsync 类 provider（`command`、`two-stage-rsync`）只有在 `exec_log_file` 输出格式与 rsync stats 兼容时才会汇报 `last_transferred_bytes`，否则两项指标都保持 `0`。
+
 ## 许可证
 
 GPL-3.0-or-later，与上游相同。

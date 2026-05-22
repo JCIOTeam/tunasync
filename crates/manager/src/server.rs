@@ -715,6 +715,18 @@ pub(crate) fn render_metrics(mirrors: &[MirrorStatus], worker_count: usize) -> S
         "Duration of the most recent completed sync in seconds (0 if never run).\n",
         "# TYPE tunasync_mirror_last_sync_duration_seconds gauge\n",
     ));
+    out.push_str(concat!(
+        "# HELP tunasync_mirror_last_transferred_bytes ",
+        "Bytes transferred during the most recent sync (0 if unknown or never run).\n",
+        "# TYPE tunasync_mirror_last_transferred_bytes gauge\n",
+    ));
+    out.push_str(concat!(
+        "# HELP tunasync_mirror_total_transferred_bytes ",
+        "Cumulative bytes transferred across all syncs of this mirror. ",
+        "Monotonically non-decreasing per (mirror, worker) — use Prometheus rate() ",
+        "for traffic-per-second.\n",
+        "# TYPE tunasync_mirror_total_transferred_bytes counter\n",
+    ));
 
     let epoch = tunasync_protocol::zero_time();
     for m in mirrors {
@@ -763,6 +775,18 @@ pub(crate) fn render_metrics(mirrors: &[MirrorStatus], worker_count: usize) -> S
             };
         out.push_str(&format!(
             "tunasync_mirror_last_sync_duration_seconds{{{labels}}} {duration}\n"
+        ));
+
+        // Last and total transferred bytes (worker fills last_transferred_bytes
+        // from the rsync log; manager accumulates total_transferred_bytes
+        // across syncs). Both are reset to 0 when the mirror is recreated.
+        out.push_str(&format!(
+            "tunasync_mirror_last_transferred_bytes{{{labels}}} {}\n",
+            m.last_transferred_bytes
+        ));
+        out.push_str(&format!(
+            "tunasync_mirror_total_transferred_bytes{{{labels}}} {}\n",
+            m.total_transferred_bytes
         ));
     }
 
@@ -851,6 +875,8 @@ mod metrics_tests {
             last_ended: chrono::Utc::now(),
             upstream: "rsync://example.com/".into(),
             size: "1.5G".into(),
+            last_transferred_bytes: 5_368_709_120,
+            total_transferred_bytes: 100_000_000_000,
             ..Default::default()
         }];
         let out = render_metrics(&mirrors, 2);
@@ -859,6 +885,34 @@ mod metrics_tests {
         assert!(out.contains("tunasync_mirror_size_bytes{mirror=\"ubuntu\",worker=\"w1\"}"));
         assert!(out.contains("tunasync_mirrors_total{status=\"success\"} 1"));
         assert!(out.contains("tunasync_mirrors_total{status=\"failed\"} 0"));
+        // Traffic stats — also emitted now.
+        assert!(out.contains(
+            "tunasync_mirror_last_transferred_bytes{mirror=\"ubuntu\",worker=\"w1\"} 5368709120"
+        ));
+        assert!(out.contains(
+            "tunasync_mirror_total_transferred_bytes{mirror=\"ubuntu\",worker=\"w1\"} 100000000000"
+        ));
+    }
+
+    /// Verifies the type metadata for the traffic metrics — last_* is
+    /// a gauge (resets on a fresh sync), total_* is a counter
+    /// (monotonically non-decreasing).
+    #[test]
+    fn render_metrics_traffic_has_correct_help_and_type() {
+        use tunasync_protocol::SyncStatus;
+        let mirrors = vec![MirrorStatus {
+            name: "x".into(),
+            worker: "w".into(),
+            status: SyncStatus::Success,
+            last_update: chrono::Utc::now(),
+            ..Default::default()
+        }];
+        let out = render_metrics(&mirrors, 1);
+        assert!(out.contains("# TYPE tunasync_mirror_last_transferred_bytes gauge"));
+        assert!(out.contains("# TYPE tunasync_mirror_total_transferred_bytes counter"));
+        // Both HELP lines present.
+        assert!(out.contains("# HELP tunasync_mirror_last_transferred_bytes"));
+        assert!(out.contains("# HELP tunasync_mirror_total_transferred_bytes"));
     }
 
     /// L5: parse_size_bytes should handle space between number and unit
