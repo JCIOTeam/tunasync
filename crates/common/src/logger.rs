@@ -7,6 +7,10 @@
 //! When `systemd_mode` is true (i.e. `--with-systemd` flag), the log layer
 //! omits timestamps and ANSI colours since systemd journal already prefixes
 //! timestamps — matching Go's `--with-systemd` behaviour.
+//!
+//! When `ansi` is false, ANSI colour codes are suppressed in log output.
+//! CLI tools like `tunasynctl` should pass `ansi = false` to avoid terminal
+//! rendering issues (e.g. white backgrounds on URL values).
 
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -14,9 +18,11 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 ///
 /// `verbose` raises the default level from `info` to `debug`. `systemd_mode`
 /// suppresses timestamps and ANSI colours (journald adds its own timestamps).
+/// `ansi` controls ANSI colour output; pass `false` for CLI tools that should
+/// not emit colour codes.
 ///
 /// `RUST_LOG` (if set) takes precedence over both.
-pub fn init(verbose: bool, systemd_mode: bool) {
+pub fn init(verbose: bool, systemd_mode: bool, ansi: bool) {
     let default_level = if verbose { "debug" } else { "info" };
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
@@ -42,7 +48,8 @@ pub fn init(verbose: bool, systemd_mode: bool) {
                 tracing_subscriber::fmt::layer()
                     .with_target(true)
                     .with_thread_ids(false)
-                    .with_line_number(false),
+                    .with_line_number(false)
+                    .with_ansi(ansi),
             )
             .try_init();
     }

@@ -173,6 +173,7 @@ enum Command {
     /// Remove a worker from the manager.
     RmWorker {
         /// Worker ID.
+        #[arg(short, long)]
         worker: String,
     },
     /// Update the size of a mirror (operator override).
@@ -217,6 +218,7 @@ enum Command {
     /// Tell a worker to reload its config from disk.
     Reload {
         /// Worker ID.
+        #[arg(short, long)]
         worker: String,
     },
     /// Generate shell completion script.
@@ -280,7 +282,15 @@ fn build_command() -> clap::Command {
                 .mut_arg("all", |a| a.help("显示所有 Worker 的任务"))
         })
         .mut_subcommand("workers", |s| s.about("列出所有已注册的 Worker"))
-        .mut_subcommand("flush", |s| s.about("从 manager 数据库中清除所有 disabled 任务记录"))
+        .mut_subcommand("flush", |s| {
+            s.about("从 manager 数据库中清除所有 disabled 任务记录")
+                .mut_arg("stale_only", |a| {
+                    a.help("安全守卫：仅当存在既 stale 又 disabled 的镜像时才清除")
+                })
+        })
+        .mut_subcommand("stale", |s| {
+            s.about("列出 manager 标记为 stale 的镜像（只读，不清除也不修改）")
+        })
         .mut_subcommand("rm-worker", |s| {
             s.about("从 manager 中移除一个 Worker")
                 .mut_arg("worker", |a| a.help("Worker ID"))
@@ -322,6 +332,12 @@ fn build_command() -> clap::Command {
                     "用法示例：\n  tunasynctl completion bash >> ~/.bashrc\n  tunasynctl completion zsh  >> ~/.zshrc",
                 )
                 .mut_arg("shell", |a| a.help("Shell 类型"))
+        })
+        .mut_subcommand("maintenance", |s| {
+            s.about("管理 manager 全局维护模式")
+                .mut_subcommand("enable", |s| s.about("启用维护模式"))
+                .mut_subcommand("disable", |s| s.about("禁用维护模式"))
+                .mut_subcommand("status", |s| s.about("查看维护模式状态"))
         });
 
     cmd
@@ -355,12 +371,12 @@ impl Client {
             .get(self.url(path))
             .send()
             .await
-            .context("GET request failed")?
+            .context(t!("GET request failed", "GET 请求失败"))?
             .error_for_status()
-            .context("server returned error")?
+            .context(t!("server returned error", "服务器返回错误"))?
             .json::<T>()
             .await
-            .context("decode response JSON")
+            .context(t!("decode response JSON", "解析响应 JSON"))
     }
 
     async fn post<B: serde::Serialize, T: serde::de::DeserializeOwned>(
@@ -373,12 +389,12 @@ impl Client {
             .json(body)
             .send()
             .await
-            .context("POST request failed")?
+            .context(t!("POST request failed", "POST 请求失败"))?
             .error_for_status()
-            .context("server returned error")?
+            .context(t!("server returned error", "服务器返回错误"))?
             .json::<T>()
             .await
-            .context("decode response JSON")
+            .context(t!("decode response JSON", "解析响应 JSON"))
     }
 
     async fn delete<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
@@ -386,12 +402,12 @@ impl Client {
             .delete(self.url(path))
             .send()
             .await
-            .context("DELETE request failed")?
+            .context(t!("DELETE request failed", "DELETE 请求失败"))?
             .error_for_status()
-            .context("server returned error")?
+            .context(t!("server returned error", "服务器返回错误"))?
             .json::<T>()
             .await
-            .context("decode response JSON")
+            .context(t!("decode response JSON", "解析响应 JSON"))
     }
 
     async fn list_all_jobs(&self) -> Result<Vec<WebMirrorStatus>> {
@@ -472,7 +488,13 @@ async fn resolve_worker(
             return Ok(w.id.clone());
         }
     }
-    anyhow::bail!("mirror {mirror:?} not found on any worker; use --worker / --worker 指定")
+    anyhow::bail!(
+        "{}",
+        t!(
+            format!("mirror {mirror:?} not found on any worker; use --worker to specify"),
+            format!("在所有 Worker 上未找到镜像 {mirror:?}；请使用 --worker 指定")
+        )
+    )
 }
 
 /// Expand a mirror name that may contain glob metacharacters (`*`, `?`, `[`)
@@ -492,8 +514,12 @@ async fn expand_glob(
         return Ok(vec![(pattern.to_owned(), wid)]);
     }
 
-    let pat = glob::Pattern::new(pattern)
-        .with_context(|| format!("invalid glob pattern: {pattern:?}"))?;
+    let pat = glob::Pattern::new(pattern).with_context(|| {
+        t!(
+            format!("invalid glob pattern: {pattern:?}"),
+            format!("无效的 glob 模式：{pattern:?}")
+        )
+    })?;
 
     // Fetch from all workers (or just the explicit one).
     let workers = client.list_workers().await?;
@@ -513,7 +539,13 @@ async fn expand_glob(
     }
 
     if matched.is_empty() {
-        anyhow::bail!("glob pattern {pattern:?} matched no mirrors");
+        anyhow::bail!(
+            "{}",
+            t!(
+                format!("glob pattern {pattern:?} matched no mirrors"),
+                format!("glob 模式 {pattern:?} 未匹配到任何镜像")
+            )
+        );
     }
     Ok(matched)
 }
@@ -521,9 +553,25 @@ async fn expand_glob(
 fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
     println!(
         "{}",
-        serde_json::to_string_pretty(v).context("serialize output")?
+        serde_json::to_string_pretty(v).context(t!("serialize output", "序列化输出"))?
     );
     Ok(())
+}
+
+/// Translate a sync status string for table display.
+fn fmt_status(status: &tunasync_protocol::SyncStatus) -> String {
+    if !is_zh() {
+        return status.to_string();
+    }
+    match status {
+        tunasync_protocol::SyncStatus::None => "无".to_string(),
+        tunasync_protocol::SyncStatus::PreSyncing => "预同步".to_string(),
+        tunasync_protocol::SyncStatus::Syncing => "同步中".to_string(),
+        tunasync_protocol::SyncStatus::Success => "成功".to_string(),
+        tunasync_protocol::SyncStatus::Failed => "失败".to_string(),
+        tunasync_protocol::SyncStatus::Paused => "暂停".to_string(),
+        tunasync_protocol::SyncStatus::Disabled => "已禁用".to_string(),
+    }
 }
 
 /// Format a datetime for display, replacing Go's zero-time
@@ -555,7 +603,7 @@ fn print_table_jobs(jobs: &[WebMirrorStatus]) {
         println!(
             "{:<30} {:<12} {:<20} {}",
             j.name,
-            j.status.to_string(),
+            fmt_status(&j.status),
             fmt_time(&j.last_update),
             j.size,
         );
@@ -574,7 +622,7 @@ async fn main() -> Result<()> {
     let matches = build_command().get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
-    tunasync_common::logger::init(cli.verbose, false);
+    tunasync_common::logger::init(cli.verbose, false, false);
 
     // Handle completion before any network activity.
     if let Command::Completion { shell } = &cli.command {
@@ -632,7 +680,7 @@ async fn main() -> Result<()> {
                     .split(',')
                     .map(|s| s.trim().parse())
                     .collect::<Result<_, _>>()
-                    .context("parse --status filter")?;
+                    .context(t!("parse --status filter", "解析 --status 过滤器"))?;
                 jobs.into_iter()
                     .filter(|j| allowed.contains(&j.status))
                     .collect()
@@ -1082,6 +1130,26 @@ mod cli_tests {
                 result.unwrap_err().kind(),
                 clap::error::ErrorKind::DisplayHelp,
                 "{sub} --help should be DisplayHelp"
+            );
+        }
+    }
+
+    /// The maintenance sub-subcommands (enable/disable/status) must also not
+    /// panic when their mut_subcommand IDs are resolved.
+    #[test]
+    fn maintenance_subcommand_help_does_not_panic() {
+        set_zh_locale();
+        for sub in ["enable", "disable", "status"] {
+            let cmd = build_command();
+            let result = cmd.try_get_matches_from(["tunasynctl", "maintenance", sub, "--help"]);
+            assert!(
+                result.is_err(),
+                "maintenance {sub} --help should produce DisplayHelp"
+            );
+            assert_eq!(
+                result.unwrap_err().kind(),
+                clap::error::ErrorKind::DisplayHelp,
+                "maintenance {sub} --help should be DisplayHelp"
             );
         }
     }

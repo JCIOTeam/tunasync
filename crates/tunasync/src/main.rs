@@ -113,7 +113,7 @@ async fn main() -> Result<()> {
             pidfile,
         } => {
             // debug flag elevates to trace-level; we pass it to the logger.
-            tunasync_common::logger::init(cli.verbose || *debug, cli.with_systemd);
+            tunasync_common::logger::init(cli.verbose || *debug, cli.with_systemd, true);
             tracing::info!(?config, "starting tunasync manager");
 
             // Load config file, then apply CLI overrides — mirrors Go's LoadConfig
@@ -159,7 +159,7 @@ async fn main() -> Result<()> {
         }
 
         Command::Worker { config, pidfile } => {
-            tunasync_common::logger::init(cli.verbose, cli.with_systemd);
+            tunasync_common::logger::init(cli.verbose, cli.with_systemd, true);
             tracing::info!(?config, "starting tunasync worker");
 
             // Write PID file if requested (best-effort, non-fatal).
