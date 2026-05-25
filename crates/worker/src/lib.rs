@@ -12,6 +12,7 @@ pub mod diff_config;
 pub mod hooks;
 pub mod http_server;
 pub mod job;
+pub mod log_stream;
 pub mod manager_client;
 pub mod priority_semaphore;
 pub mod provider;

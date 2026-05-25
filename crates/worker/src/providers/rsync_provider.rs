@@ -59,6 +59,11 @@ pub struct RsyncProvider {
     /// process is placed inside the cgroup before execution begins.
     #[cfg(target_os = "linux")]
     cgroup_hook: Option<std::sync::Arc<crate::hooks::CgroupHook>>,
+    /// Per-mirror live-log publisher — set by the worker via
+    /// `set_log_publisher`. Passed into `runner::spawn` so every stdout/
+    /// stderr line is pushed into the replay buffer + broadcast channel
+    /// powering the streaming HTTP API.
+    log_publisher: Option<crate::log_stream::LogPublisher>,
 }
 
 impl RsyncProvider {
@@ -181,6 +186,7 @@ impl RsyncProvider {
             docker_config: None,
             #[cfg(target_os = "linux")]
             cgroup_hook: None,
+            log_publisher: None,
         })
     }
 
@@ -297,9 +303,15 @@ impl MirrorProvider for RsyncProvider {
             Some(log_file.as_path())
         };
 
-        let proc = runner::spawn(&argv, &sync_target, &spawn_env, log_path)
-            .await
-            .with_context(|| format!("spawn rsync for {}", self.name))?;
+        let proc = runner::spawn(
+            &argv,
+            &sync_target,
+            &spawn_env,
+            log_path,
+            self.log_publisher.clone(),
+        )
+        .await
+        .with_context(|| format!("spawn rsync for {}", self.name))?;
 
         if let Some(pid) = proc.pid() {
             *self.current_pid.lock().unwrap() = Some(pid);
@@ -478,6 +490,10 @@ impl MirrorProvider for RsyncProvider {
 
     fn set_log_path_shared(&mut self, path: Arc<Mutex<PathBuf>>) {
         self.log_path_shared = path;
+    }
+
+    fn set_log_publisher(&mut self, p: crate::log_stream::LogPublisher) {
+        self.log_publisher = Some(p);
     }
 
     #[cfg(target_os = "linux")]

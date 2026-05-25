@@ -27,6 +27,7 @@ serde_json  = { workspace = true }
 thiserror   = { workspace = true }
 tokio       = { workspace = true }
 tokio-util  = { workspace = true }
+tokio-stream = { version = "0.1", features = ["sync"] }
 tracing     = { workspace = true }
 shell-words = { workspace = true }
 hostname    = { workspace = true }

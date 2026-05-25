@@ -84,7 +84,7 @@ impl ExecPostHook {
         );
         env.insert("TUNASYNC_JOB_EXIT_STATUS".into(), exit_status.into());
 
-        let proc = runner::spawn(&self.command, &self.working_dir, &env, None).await?;
+        let proc = runner::spawn(&self.command, &self.working_dir, &env, None, None).await?;
         proc.wait(&[]).await
     }
 }

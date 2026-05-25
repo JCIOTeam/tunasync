@@ -84,6 +84,8 @@ pub struct TwoStageRsyncProvider {
     /// CgroupHook reference — set on Linux when cgroup is active.
     #[cfg(target_os = "linux")]
     cgroup_hook: Option<std::sync::Arc<crate::hooks::CgroupHook>>,
+    /// Per-mirror live-log broadcast sender (powers the streaming log API).
+    log_publisher: Option<crate::log_stream::LogPublisher>,
 }
 
 impl TwoStageRsyncProvider {
@@ -227,6 +229,7 @@ impl TwoStageRsyncProvider {
             docker_config: None,
             #[cfg(target_os = "linux")]
             cgroup_hook: None,
+            log_publisher: None,
         })
     }
 
@@ -272,7 +275,7 @@ impl TwoStageRsyncProvider {
         } else {
             Some(log_file.as_path())
         };
-        let proc = runner::spawn(&argv, dest, &spawn_env, lp)
+        let proc = runner::spawn(&argv, dest, &spawn_env, lp, self.log_publisher.clone())
             .await
             .with_context(|| format!("spawn rsync stage {stage} for {}", self.name))?;
 
@@ -399,6 +402,10 @@ impl MirrorProvider for TwoStageRsyncProvider {
 
     fn set_log_path_shared(&mut self, path: Arc<Mutex<PathBuf>>) {
         self.log_path_shared = path;
+    }
+
+    fn set_log_publisher(&mut self, p: crate::log_stream::LogPublisher) {
+        self.log_publisher = Some(p);
     }
 
     #[cfg(target_os = "linux")]

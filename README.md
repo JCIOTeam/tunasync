@@ -637,6 +637,7 @@ Notable subtleties:
 | Worker: priority | `PrioritySemaphore` for job ordering | No Go equivalent |
 | Worker: atomic publish | `renameat2(RENAME_EXCHANGE)` swap | No Go equivalent |
 | Worker: upstream probe | Concurrent probe with 15s timeout | No Go equivalent |
+| Worker: live log SSE | `GET /jobs/:mirror/log/stream` | No Go equivalent |
 | Default port | 14242 (Go: 12345) | Intentional, avoids conflict |
 
 ## API Reference
@@ -711,6 +712,51 @@ if incoming.last_transferred_bytes > 0 && incoming.last_started != cur.last_star
 This means the counter advances exactly once per completed sync. It does **not** include hook-uploaded data (e.g. `exec_post` scripts that publish to a CDN), and it does **not** reset when you `flush` a disabled mirror — the row is deleted entirely and the counter starts at zero if the mirror is later re-registered.
 
 Non-rsync providers (`command`, `two-stage-rsync`) only report `last_transferred_bytes` when their `exec_log_file` matches the rsync stats format; otherwise both gauges stay at `0`.
+
+## Worker streaming log API
+
+The worker exposes a Server-Sent Events endpoint that streams stdout/stderr lines of a mirror's running sync in real time, with **automatic replay of the current sync's recent output** so the UI is never empty when a client connects mid-sync:
+
+```
+GET http://<worker-host>:<worker-port>/jobs/<mirror-name>/log/stream
+```
+
+Response: `text/event-stream`. On connect, the most recent ~10 lines of the **current** sync are replayed as ordinary SSE `data:` events, then the connection seamlessly continues into live mode. The replay buffer is cleared at the start of every new sync, so the client never sees stale content from a previous run. (The buffer is intentionally small — just enough so the UI isn't blank when you open the page mid-sync. For longer history, read the rotated log file under `log_dir`.)
+
+Other guarantees:
+
+- **Atomic snapshot+subscribe**: a line emitted during the handshake lands on the stream exactly once — never duplicated, never missed.
+- **15s keep-alive comments** so idle connections survive proxy timeouts.
+- **Lag protection**: if a subscriber falls behind by more than 1024 lines on the live channel, a single `event: lag` notification is emitted and streaming resumes from the newest line.
+- **Out-of-scope history**: lines older than the small replay buffer (or from previous syncs) live only in the rotated log file under `log_dir`, not in the stream.
+
+`404` is returned for unknown mirror names.
+
+Example:
+
+```sh
+curl -N http://localhost:14242/jobs/debian/log/stream
+```
+
+```
+: subscribed
+data: receiving incremental file list
+
+data: pool/main/a/apt/apt_2.7.14_amd64.deb
+data:      2,047,438 100%   23.50MB/s    0:00:00 (xfr#1, ir-chk=1023/4096)
+...
+: keep-alive
+```
+
+In the browser:
+
+```js
+const es = new EventSource("/jobs/debian/log/stream");
+es.onmessage = e => console.log(e.data);             // replay + live use the same event
+es.addEventListener("lag", e => console.warn("lagged:", e.data));
+```
+
+The endpoint lives on the worker, not the manager — point it at the worker that owns the mirror (use `GET /workers/:id/jobs` on the manager to discover ownership).
 
 ## License
 
