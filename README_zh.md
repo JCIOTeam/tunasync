@@ -621,6 +621,7 @@ tunasync-migrate http://localhost:12345 /var/lib/tunasync/new.db
 | Worker：优先级 | `PrioritySemaphore` 排序 | Go 无此功能 |
 | Worker：原子发布 | `renameat2(RENAME_EXCHANGE)` 交换 | Go 无此功能 |
 | Worker：上游探测 | 并发探测，15 秒硬超时 | Go 无此功能 |
+| Worker：实时日志 SSE | `GET /jobs/:mirror/log/stream` | Go 无此功能 |
 | 默认端口 | 14242（Go：12345） | 有意区分，避免冲突 |
 
 ## API 参考
@@ -695,6 +696,90 @@ if incoming.last_transferred_bytes > 0 && incoming.last_started != cur.last_star
 也就是说每完成一次同步累加一次。这个数字**不**包含 hook 脚本（如 `exec_post`）上传到 CDN 的流量；执行 `flush` 清除已 disabled 的镜像时整行被删除，重新注册同名镜像时计数器从 0 开始。
 
 非 rsync 类 provider（`command`、`two-stage-rsync`）只有在 `exec_log_file` 输出格式与 rsync stats 兼容时才会汇报 `last_transferred_bytes`，否则两项指标都保持 `0`。
+
+## Worker 同步日志流式接口
+
+worker 暴露了一个 Server-Sent Events（SSE）接口，可以**实时**流式输出某个镜像当前同步的 stdout/stderr，并在客户端连入时**自动回放最近若干行**，避免页面刚打开时一片空白：
+
+```
+GET http://<worker-host>:<worker-port>/jobs/<mirror-name>/log/stream
+```
+
+响应 `Content-Type: text/event-stream`。客户端连接时，**当前**同步最近 ~10 行会作为普通的 SSE `data:` 事件先回放出来，然后无缝接上实时流。回放缓冲区在每次新同步开始时清空，所以**只会看到本次同步**的内容，看不到上一次的残留。（回放缓冲故意做得很小——只是为了「中途打开页面不空白」，不是历史日志。要看更多历史请直接读 `log_dir` 下轮转的日志文件。）
+
+其它行为：
+
+- **原子性的快照 + 订阅**：握手期间产生的日志行只会到达流一次——不会重复，也不会丢失。
+- **15 秒一次的 keep-alive 注释**：用于穿透代理/浏览器的空闲超时。
+- **慢消费者保护**：如果订阅者在实时通道上落后超过 1024 行，会收到一个 `event: lag` 通知，然后从最新行继续。
+- **超出范围的历史**：早于回放缓冲、或属于上一次同步的内容只在 `log_dir` 下的轮转日志文件里，不在流里。
+
+未知的镜像名返回 `404`。
+
+### 接口输出示例
+
+`curl` 命令行：
+
+```sh
+curl -N http://localhost:14242/jobs/debian/log/stream
+```
+
+输出（每条 `data:` 行就是 rsync 子进程的一行 stdout/stderr）：
+
+```
+: subscribed
+
+data: receiving incremental file list
+data: pool/main/a/apt/apt_2.7.14_amd64.deb
+data:      2,047,438 100%   23.50MB/s    0:00:00 (xfr#1, ir-chk=1023/4096)
+data: pool/main/a/apt/apt_2.7.14_amd64.changes
+data:          1,234 100%    1.20KB/s    0:00:00 (xfr#2, ir-chk=1022/4096)
+
+data: sent 32.42K bytes  received 19.85M bytes  4.42M bytes/sec
+data: total size is 124.36G  speedup is 6249.18
+
+: keep-alive
+
+: keep-alive
+```
+
+说明：
+- 第一行 `: subscribed` 是 SSE 注释（以 `:` 开头），用于让客户端立刻确认连接已建立。
+- 中间的 `data: ...` 行就是回放缓冲 + 实时输出，回放和实时在线协议层没有区别，前端 `onmessage` 一个回调处理即可。
+- 空行（每个事件之间的 `\n\n`）是 SSE 协议的事件分隔符。
+- 隔 15 秒一次的 `: keep-alive` 是注释（不会触发 `onmessage`），仅用来保活，前端可以忽略。
+
+如果同步过程很慢，订阅者读得跟不上，会出现：
+
+```
+event: lag
+data: dropped 47 line(s); subscriber too slow
+```
+
+这种事件可以单独监听（见下方前端示例）。
+
+### 浏览器 `EventSource` 用法
+
+```js
+const es = new EventSource("/jobs/debian/log/stream");
+
+// 回放和实时两类都通过 onmessage 触发，前端不用分支
+es.onmessage = (e) => {
+  appendLine(e.data);   // e.data 就是 rsync 输出的一行原文
+};
+
+// 跟不上时的提示
+es.addEventListener("lag", (e) => {
+  console.warn("跟不上了:", e.data);
+});
+
+// 连接掉了浏览器会自动重连——不需要业务侧处理
+es.onerror = (e) => {
+  console.warn("SSE 连接中断，浏览器会自动重连");
+};
+```
+
+> 这个接口在 worker 上，不在 manager 上。一台 manager 后面挂多台 worker 的话，需要通过 manager 的 `GET /workers/:id/jobs` 找到镜像所在的 worker，然后再去连那台 worker 的 `/jobs/:name/log/stream`。
 
 ## 许可证
 
