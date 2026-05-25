@@ -40,6 +40,7 @@ use crate::config::WorkerConfig;
 use crate::hooks::JobHook;
 use crate::http_server::{build_router, cmd_to_ctrl, WorkerHttpState};
 use crate::job::{CtrlAction, JobMessage, JobState, MirrorJob};
+use crate::log_stream::LogBroadcaster;
 use crate::manager_client::ManagerClient;
 use crate::provider::MirrorProvider;
 use crate::schedule::ScheduleQueue;
@@ -242,6 +243,12 @@ pub struct Worker {
     /// Shared mirror name set — kept in sync with `self.jobs` so the HTTP
     /// handler can validate mirror_id before accepting a command.
     mirror_names: Arc<RwLock<HashSet<String>>>,
+    /// Per-mirror live-log broadcast registry. Created once at startup and
+    /// reused across hot-reloads — each provider gets its corresponding
+    /// `broadcast::Sender<String>` via `set_log_broadcast`, and the HTTP
+    /// server subscribes via the same registry to power
+    /// `GET /jobs/<mirror>/log/stream`.
+    log_broadcaster: Arc<LogBroadcaster>,
     /// Precomputed blackout windows per mirror name. Built once at startup
     /// and rebuilt on hot-reload. Cached because the scheduler hot path
     /// (every pop) would otherwise re-parse the TOML string list every tick.
@@ -300,6 +307,10 @@ impl Worker {
         let mut jobs = HashMap::new();
         let mut mirror_statuses = HashMap::new();
 
+        // Live-log broadcast registry — wired to every provider below so the
+        // HTTP server can stream sync output in real time.
+        let log_broadcaster = LogBroadcaster::new();
+
         // Build per-upstream semaphores from config.
         let per_upstream_semaphores: HashMap<String, Arc<Semaphore>> = cfg
             .global
@@ -308,10 +319,14 @@ impl Worker {
             .map(|(host, &limit)| (host.clone(), Arc::new(Semaphore::new(limit.max(1)))))
             .collect();
 
-        for (provider, hooks) in provider_list {
+        for (mut provider, hooks) in provider_list {
             let name = provider.name().to_owned();
             let upstream = provider.upstream().to_owned();
             let is_master = provider.is_master();
+
+            // Hand the provider its per-mirror live-log broadcast sender so
+            // `runner::spawn` can fan out each stdout/stderr line.
+            provider.set_log_broadcast(log_broadcaster.sender_for(&name));
 
             // Initial zero-value status.
             mirror_statuses.insert(
@@ -372,6 +387,7 @@ impl Worker {
             schedule,
             mirror_statuses,
             mirror_names,
+            log_broadcaster,
             blackouts_by_mirror,
             crons_by_mirror,
             timezones_by_mirror,
@@ -391,6 +407,7 @@ impl Worker {
             cmd_tx: self.cmd_tx.clone(),
             worker_name: worker_id.clone(),
             mirror_names: Arc::clone(&self.mirror_names),
+            log_broadcaster: Arc::clone(&self.log_broadcaster),
         };
         let bind_addr = self.cfg.server.bind_addr();
         tokio::spawn(run_http_server(
@@ -879,7 +896,10 @@ impl Worker {
                             if let Some(job_cfg) = self.cfg.mirrors.iter().find(|m| m.name == *name)
                             {
                                 match (self.build_one_provider)(job_cfg, &self.cfg) {
-                                    Ok((provider, hooks)) => {
+                                    Ok((mut provider, hooks)) => {
+                                        provider.set_log_broadcast(
+                                            self.log_broadcaster.sender_for(name),
+                                        );
                                         let upstream_sem = upstream_host(provider.upstream())
                                             .and_then(|h| {
                                                 self.per_upstream_semaphores.get(&h).cloned()
@@ -1024,7 +1044,8 @@ impl Worker {
 
                     // Build new provider + hooks and spawn a new MirrorJob.
                     match (self.build_one_provider)(&trans.config, &self.cfg) {
-                        Ok((provider, hooks)) => {
+                        Ok((mut provider, hooks)) => {
+                            provider.set_log_broadcast(self.log_broadcaster.sender_for(name));
                             let upstream = provider.upstream().to_owned();
                             let is_master = provider.is_master();
 
@@ -1137,7 +1158,8 @@ impl Worker {
 
                     // Build provider + hooks and spawn new MirrorJob.
                     match (self.build_one_provider)(&trans.config, &self.cfg) {
-                        Ok((provider, hooks)) => {
+                        Ok((mut provider, hooks)) => {
+                            provider.set_log_broadcast(self.log_broadcaster.sender_for(name));
                             let upstream = provider.upstream().to_owned();
                             let is_master = provider.is_master();
 

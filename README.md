@@ -637,6 +637,7 @@ Notable subtleties:
 | Worker: priority | `PrioritySemaphore` for job ordering | No Go equivalent |
 | Worker: atomic publish | `renameat2(RENAME_EXCHANGE)` swap | No Go equivalent |
 | Worker: upstream probe | Concurrent probe with 15s timeout | No Go equivalent |
+| Worker: live log SSE | `GET /jobs/:mirror/log/stream` | No Go equivalent |
 | Default port | 14242 (Go: 12345) | Intentional, avoids conflict |
 
 ## API Reference
@@ -711,6 +712,44 @@ if incoming.last_transferred_bytes > 0 && incoming.last_started != cur.last_star
 This means the counter advances exactly once per completed sync. It does **not** include hook-uploaded data (e.g. `exec_post` scripts that publish to a CDN), and it does **not** reset when you `flush` a disabled mirror — the row is deleted entirely and the counter starts at zero if the mirror is later re-registered.
 
 Non-rsync providers (`command`, `two-stage-rsync`) only report `last_transferred_bytes` when their `exec_log_file` matches the rsync stats format; otherwise both gauges stay at `0`.
+
+## Worker streaming log API
+
+The worker exposes a Server-Sent Events endpoint that streams stdout/stderr lines of a mirror's running sync in real time:
+
+```
+GET http://<worker-host>:<worker-port>/jobs/<mirror-name>/log/stream
+```
+
+Response: `text/event-stream`. Each output line of the child process is delivered as one SSE `data:` event. A keep-alive comment is sent every 15 seconds so idle connections survive proxy timeouts during quiescent periods. If the subscriber falls behind by more than 1024 lines, a single `event: lag` notification is emitted and streaming resumes from the newest line.
+
+Subscription is "from now on" — historical content lives in the rotated log file under `log_dir`, not in the stream. `404` is returned for unknown mirror names.
+
+Example:
+
+```sh
+curl -N http://localhost:14242/jobs/debian/log/stream
+```
+
+```
+: subscribed to debian
+data: receiving incremental file list
+
+data: pool/main/a/apt/apt_2.7.14_amd64.deb
+data:      2,047,438 100%   23.50MB/s    0:00:00 (xfr#1, ir-chk=1023/4096)
+...
+: keep-alive
+```
+
+In the browser:
+
+```js
+const es = new EventSource("/jobs/debian/log/stream");
+es.onmessage = e => console.log(e.data);
+es.addEventListener("lag", e => console.warn("lagged:", e.data));
+```
+
+The endpoint lives on the worker, not the manager — point it at the worker that owns the mirror (use `GET /workers/:id/jobs` on the manager to discover ownership).
 
 ## License
 
