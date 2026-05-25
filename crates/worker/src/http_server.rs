@@ -178,23 +178,22 @@ async fn list_jobs(State(state): State<Arc<WorkerHttpState>>) -> impl IntoRespon
 }
 
 /// `GET /jobs/:mirror/log/stream` — stream stdout/stderr lines of the
-/// currently running (or next-to-run) sync as Server-Sent Events.
+/// currently running (or just-finished) sync as Server-Sent Events.
 ///
 /// # Behaviour
 ///
 /// - Returns `404` with a JSON body when `mirror` is not a known mirror name.
-/// - Otherwise opens an `text/event-stream` response and forwards every
-///   line published into the per-mirror broadcast channel as one SSE
-///   `data:` event. The subscription is "from now on" — lines emitted
-///   before the client connected are *not* replayed (use the rotated log
-///   file for history).
+/// - On connect, the most recent ~1024 lines of the *current* sync are
+///   replayed as ordinary SSE `data:` events, then the connection seamlessly
+///   continues into live mode and forwards each new line as it appears.
+///   The replay buffer is cleared at the start of every sync, so the client
+///   never sees stale content from a previous run.
 /// - A keep-alive comment is sent every 15 s so intermediaries that drop
 ///   idle connections (proxies, load balancers, browser defaults) keep
 ///   the stream open during long quiescent periods between rsync output.
 /// - If the subscriber falls behind by more than the broadcast channel
 ///   capacity, a single `event: lag` notification is emitted and the
-///   stream resumes from the newest line (matching `BroadcastStream`'s
-///   default behaviour).
+///   stream resumes from the newest line.
 async fn stream_log(
     State(state): State<Arc<WorkerHttpState>>,
     Path(mirror): Path<String>,
@@ -213,16 +212,24 @@ async fn stream_log(
         }
     }
 
-    let rx = state.log_broadcaster.subscribe(&mirror);
+    // Atomic snapshot+subscribe: any line published between these two
+    // operations is guaranteed to land on `rx` (never both, never neither).
+    let (history, rx) = state.log_broadcaster.snapshot_and_subscribe(&mirror);
 
-    // Send an initial "subscribed" comment so the client immediately knows
-    // the connection is alive even before the next line arrives. Useful for
-    // curl / browser EventSource diagnostics.
+    // Preamble: an SSE comment confirming the subscription (so `curl -N`
+    // shows something immediately), followed by every buffered line as
+    // an ordinary `data:` event. Replay events use the same shape as
+    // live events so client code doesn't need a separate code path.
     let preamble = stream::once(async move {
-        Ok::<_, Infallible>(Event::default().comment(format!("subscribed to {mirror}")))
+        Ok::<_, Infallible>(Event::default().comment("subscribed"))
     });
+    let replay = stream::iter(
+        history
+            .into_iter()
+            .map(|line| Ok::<_, Infallible>(Event::default().data(line))),
+    );
 
-    let lines = BroadcastStream::new(rx).map(|item| -> Result<Event, Infallible> {
+    let live = BroadcastStream::new(rx).map(|item| -> Result<Event, Infallible> {
         match item {
             Ok(line) => Ok(Event::default().data(line)),
             Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
@@ -233,7 +240,7 @@ async fn stream_log(
         }
     });
 
-    let stream = preamble.chain(lines);
+    let stream = preamble.chain(replay).chain(live);
 
     Sse::new(stream)
         .keep_alive(
@@ -341,9 +348,8 @@ mod sse_tests {
         // Give axum a beat to fully wire up the subscription, then publish.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         broadcaster
-            .sender_for("debian")
-            .send("hello world".to_owned())
-            .unwrap();
+            .publisher_for("debian")
+            .push("hello world".to_owned());
 
         // SSE bodies are sent over chunked transfer-encoding. Reading line-
         // by-line works because each "data: ...\n\n" sits inside its own
@@ -361,5 +367,48 @@ mod sse_tests {
             }
         }
         assert!(found, "expected to see broadcast line on SSE stream");
+    }
+
+    #[tokio::test]
+    async fn mid_sync_client_sees_buffered_replay() {
+        let (addr, broadcaster) = start_server().await;
+
+        // Pre-populate the buffer with two lines — simulates rsync output
+        // produced before the client managed to connect.
+        let publisher = broadcaster.publisher_for("debian");
+        publisher.push("line-before-1".into());
+        publisher.push("line-before-2".into());
+
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"GET /jobs/debian/log/stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut buf = BufReader::new(s);
+        // Skip response headers.
+        loop {
+            let mut line = String::new();
+            buf.read_line(&mut line).await.unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+
+        // Both buffered lines should arrive without us pushing anything new.
+        let mut seen1 = false;
+        let mut seen2 = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline && !(seen1 && seen2) {
+            let mut line = String::new();
+            tokio::select! {
+                r = buf.read_line(&mut line) => {
+                    if r.unwrap() == 0 { break; }
+                    if line.contains("line-before-1") { seen1 = true; }
+                    if line.contains("line-before-2") { seen2 = true; }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            }
+        }
+        assert!(seen1 && seen2, "expected both buffered lines to be replayed");
     }
 }

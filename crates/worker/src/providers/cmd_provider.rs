@@ -56,7 +56,7 @@ pub struct CmdProvider {
     #[cfg(target_os = "linux")]
     cgroup_hook: Option<std::sync::Arc<crate::hooks::CgroupHook>>,
     /// Per-mirror live-log broadcast sender (powers the streaming log API).
-    log_broadcast: Option<tokio::sync::broadcast::Sender<String>>,
+    log_publisher: Option<crate::log_stream::LogPublisher>,
 }
 
 impl CmdProvider {
@@ -143,7 +143,7 @@ impl CmdProvider {
             docker_config: None,
             #[cfg(target_os = "linux")]
             cgroup_hook: None,
-            log_broadcast: None,
+            log_publisher: None,
         })
     }
 
@@ -243,7 +243,7 @@ impl MirrorProvider for CmdProvider {
             Some(log_file.as_path())
         };
 
-        let proc = runner::spawn(&argv, &sync_target, &spawn_env, log_path, self.log_broadcast.clone()).await?;
+        let proc = runner::spawn(&argv, &sync_target, &spawn_env, log_path, self.log_publisher.clone()).await?;
 
         // Store PID so terminate() can send SIGTERM.
         if let Some(pid) = proc.pid() {
@@ -421,8 +421,8 @@ impl MirrorProvider for CmdProvider {
         self.log_path_shared = path;
     }
 
-    fn set_log_broadcast(&mut self, sender: tokio::sync::broadcast::Sender<String>) {
-        self.log_broadcast = Some(sender);
+    fn set_log_publisher(&mut self, p: crate::log_stream::LogPublisher) {
+        self.log_publisher = Some(p);
     }
 
     #[cfg(target_os = "linux")]

@@ -245,8 +245,8 @@ pub struct Worker {
     mirror_names: Arc<RwLock<HashSet<String>>>,
     /// Per-mirror live-log broadcast registry. Created once at startup and
     /// reused across hot-reloads — each provider gets its corresponding
-    /// `broadcast::Sender<String>` via `set_log_broadcast`, and the HTTP
-    /// server subscribes via the same registry to power
+    /// `LogPublisher` via `set_log_publisher`, and the HTTP server
+    /// subscribes via the same registry to power
     /// `GET /jobs/<mirror>/log/stream`.
     log_broadcaster: Arc<LogBroadcaster>,
     /// Precomputed blackout windows per mirror name. Built once at startup
@@ -324,9 +324,9 @@ impl Worker {
             let upstream = provider.upstream().to_owned();
             let is_master = provider.is_master();
 
-            // Hand the provider its per-mirror live-log broadcast sender so
-            // `runner::spawn` can fan out each stdout/stderr line.
-            provider.set_log_broadcast(log_broadcaster.sender_for(&name));
+            // Hand the provider its per-mirror live-log publisher so the runner
+            // can fan out each stdout/stderr line and keep a replay buffer.
+            provider.set_log_publisher(log_broadcaster.publisher_for(&name));
 
             // Initial zero-value status.
             mirror_statuses.insert(
@@ -897,8 +897,8 @@ impl Worker {
                             {
                                 match (self.build_one_provider)(job_cfg, &self.cfg) {
                                     Ok((mut provider, hooks)) => {
-                                        provider.set_log_broadcast(
-                                            self.log_broadcaster.sender_for(name),
+                                        provider.set_log_publisher(
+                                            self.log_broadcaster.publisher_for(name),
                                         );
                                         let upstream_sem = upstream_host(provider.upstream())
                                             .and_then(|h| {
@@ -1045,7 +1045,7 @@ impl Worker {
                     // Build new provider + hooks and spawn a new MirrorJob.
                     match (self.build_one_provider)(&trans.config, &self.cfg) {
                         Ok((mut provider, hooks)) => {
-                            provider.set_log_broadcast(self.log_broadcaster.sender_for(name));
+                            provider.set_log_publisher(self.log_broadcaster.publisher_for(name));
                             let upstream = provider.upstream().to_owned();
                             let is_master = provider.is_master();
 
@@ -1159,7 +1159,7 @@ impl Worker {
                     // Build provider + hooks and spawn new MirrorJob.
                     match (self.build_one_provider)(&trans.config, &self.cfg) {
                         Ok((mut provider, hooks)) => {
-                            provider.set_log_broadcast(self.log_broadcaster.sender_for(name));
+                            provider.set_log_publisher(self.log_broadcaster.publisher_for(name));
                             let upstream = provider.upstream().to_owned();
                             let is_master = provider.is_master();
 

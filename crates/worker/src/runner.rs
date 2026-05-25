@@ -173,23 +173,30 @@ pub async fn terminate_process_group(pid: u32) {
 
 /// Spawn a child process in its own process group (matches Go's Setpgid).
 ///
-/// `log_broadcast`, when present, receives every stdout/stderr line in real
-/// time — used by the worker's `GET /jobs/<mirror>/log/stream` SSE endpoint.
-/// Sends are best-effort: a `SendError` (no active subscribers) is silently
-/// ignored, matching `tokio::sync::broadcast` semantics. Lines are written
-/// to the log file regardless of subscriber state.
+/// `publisher`, when present, receives every stdout/stderr line in real
+/// time and accumulates a bounded-size replay buffer for clients that
+/// connect mid-sync via `GET /jobs/<mirror>/log/stream`. The buffer is
+/// **cleared at spawn entry** so each `spawn` invocation gives subscribers
+/// a fresh "this run only" view — matching the file-side semantics where
+/// `tee_to_log` truncates the rotated log file on open.
 pub async fn spawn(
     argv: &[String],
     working_dir: &Path,
     env_overrides: &HashMap<String, String>,
     log_path: Option<&Path>,
-    log_broadcast: Option<tokio::sync::broadcast::Sender<String>>,
+    publisher: Option<crate::log_stream::LogPublisher>,
 ) -> Result<RunningProcess> {
     assert!(!argv.is_empty(), "argv must be non-empty");
 
     if !working_dir.exists() {
         std::fs::create_dir_all(working_dir)
             .with_context(|| format!("create working dir {}", working_dir.display()))?;
+    }
+
+    // Drop any lines accumulated by a previous spawn — clients now see
+    // only this run's output.
+    if let Some(ref p) = publisher {
+        p.reset();
     }
 
     let mut env: HashMap<String, String> = std::env::vars().collect();
@@ -210,14 +217,14 @@ pub async fn spawn(
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
 
-    match (log_path, log_broadcast) {
-        (Some(log_path), broadcast) => {
+    match (log_path, publisher) {
+        (Some(log_path), publisher) => {
             let log_path = log_path.to_owned();
-            tokio::spawn(tee_to_log(stdout, stderr, log_path, broadcast));
+            tokio::spawn(tee_to_log(stdout, stderr, log_path, publisher));
         }
-        (None, Some(b)) => {
-            tokio::spawn(broadcast_only(stdout, b.clone()));
-            tokio::spawn(broadcast_only(stderr, b));
+        (None, Some(p)) => {
+            tokio::spawn(publish_only(stdout, p.clone()));
+            tokio::spawn(publish_only(stderr, p));
         }
         (None, None) => {
             tokio::spawn(drain(stdout));
@@ -236,14 +243,13 @@ pub async fn spawn(
 /// deadlock: if stderr fills its pipe buffer while we're blocked on stdout,
 /// the child stalls forever. Concurrent drain eliminates this risk.
 ///
-/// When `broadcast` is `Some`, each line is also published to the
-/// broadcast channel powering the streaming log API. Broadcast sends are
-/// best-effort — `SendError` (no live subscribers) is silently ignored.
+/// When `publisher` is `Some`, each line is also pushed into the per-mirror
+/// replay buffer + live broadcast channel that powers the streaming log API.
 async fn tee_to_log<Ro, Re>(
     stdout: Ro,
     stderr: Re,
     log_path: std::path::PathBuf,
-    broadcast: Option<tokio::sync::broadcast::Sender<String>>,
+    publisher: Option<crate::log_stream::LogPublisher>,
 ) where
     Ro: tokio::io::AsyncRead + Unpin + Send + 'static,
     Re: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -294,28 +300,25 @@ async fn tee_to_log<Ro, Re>(
     });
 
     // Writer: receive lines from the channel, append to the log file, and
-    // (if configured) republish to the per-mirror live-log broadcast.
+    // (if configured) republish to the per-mirror live-log channel.
     while let Some(l) = rx.recv().await {
         let _ = file.write_all(l.as_bytes()).await;
         let _ = file.write_all(b"\n").await;
-        if let Some(ref b) = broadcast {
-            // Ignore SendError — no live subscribers.
-            let _ = b.send(l);
+        if let Some(ref p) = publisher {
+            p.push(l);
         }
     }
     let _ = file.flush().await;
 }
 
-/// When the caller doesn't want a log file but still wants live broadcasting
-/// (rare today — kept for parity with future use cases). Each reader sends
-/// its lines directly to the broadcast channel.
-async fn broadcast_only<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+/// When the caller doesn't want a log file but still wants live publishing.
+async fn publish_only<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     reader: R,
-    broadcast: tokio::sync::broadcast::Sender<String>,
+    publisher: crate::log_stream::LogPublisher,
 ) {
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(l)) = lines.next_line().await {
-        let _ = broadcast.send(l);
+        publisher.push(l);
     }
 }
 

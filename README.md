@@ -715,15 +715,22 @@ Non-rsync providers (`command`, `two-stage-rsync`) only report `last_transferred
 
 ## Worker streaming log API
 
-The worker exposes a Server-Sent Events endpoint that streams stdout/stderr lines of a mirror's running sync in real time:
+The worker exposes a Server-Sent Events endpoint that streams stdout/stderr lines of a mirror's running sync in real time, with **automatic replay of the current sync's recent output** so the UI is never empty when a client connects mid-sync:
 
 ```
 GET http://<worker-host>:<worker-port>/jobs/<mirror-name>/log/stream
 ```
 
-Response: `text/event-stream`. Each output line of the child process is delivered as one SSE `data:` event. A keep-alive comment is sent every 15 seconds so idle connections survive proxy timeouts during quiescent periods. If the subscriber falls behind by more than 1024 lines, a single `event: lag` notification is emitted and streaming resumes from the newest line.
+Response: `text/event-stream`. On connect, the most recent ~1024 lines of the **current** sync are replayed as ordinary SSE `data:` events, then the connection seamlessly continues into live mode. The replay buffer is cleared at the start of every new sync, so the client never sees stale content from a previous run.
 
-Subscription is "from now on" — historical content lives in the rotated log file under `log_dir`, not in the stream. `404` is returned for unknown mirror names.
+Other guarantees:
+
+- **Atomic snapshot+subscribe**: a line emitted during the handshake lands on the stream exactly once — never duplicated, never missed.
+- **15s keep-alive comments** so idle connections survive proxy timeouts.
+- **Lag protection**: if a subscriber falls behind by more than 1024 lines, a single `event: lag` notification is emitted and streaming resumes from the newest line.
+- **Out-of-scope history**: lines older than the replay buffer (or from previous syncs) live only in the rotated log file under `log_dir`, not in the stream.
+
+`404` is returned for unknown mirror names.
 
 Example:
 
@@ -732,7 +739,7 @@ curl -N http://localhost:14242/jobs/debian/log/stream
 ```
 
 ```
-: subscribed to debian
+: subscribed
 data: receiving incremental file list
 
 data: pool/main/a/apt/apt_2.7.14_amd64.deb
@@ -745,7 +752,7 @@ In the browser:
 
 ```js
 const es = new EventSource("/jobs/debian/log/stream");
-es.onmessage = e => console.log(e.data);
+es.onmessage = e => console.log(e.data);             // replay + live use the same event
 es.addEventListener("lag", e => console.warn("lagged:", e.data));
 ```
 

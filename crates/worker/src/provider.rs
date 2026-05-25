@@ -63,13 +63,13 @@ pub trait MirrorProvider: Send + Sync {
     /// `Arc<Mutex<PathBuf>>` is set by `LogLimitHook::preExec` and read
     /// by the provider in `run()` so stdout/stderr go to the rotated log.
     fn set_log_path_shared(&mut self, path: Arc<Mutex<PathBuf>>);
-    /// Wire up a `broadcast::Sender<String>` so the runner can publish each
-    /// stdout/stderr line into the shared per-mirror channel that backs the
-    /// `GET /jobs/<mirror>/log/stream` SSE endpoint.
+    /// Wire up a `LogPublisher` so the runner can push each stdout/stderr
+    /// line into the per-mirror replay buffer + live broadcast channel that
+    /// back the `GET /jobs/<mirror>/log/stream` SSE endpoint.
     ///
     /// Default no-op — only providers that drive a real `runner::spawn` need
     /// to forward this through.
-    fn set_log_broadcast(&mut self, _sender: tokio::sync::broadcast::Sender<String>) {}
+    fn set_log_publisher(&mut self, _pub: crate::log_stream::LogPublisher) {}
     /// Wire up a `CgroupHook` so the provider can place the spawned child PID
     /// into the cgroup between `spawn()` and `wait()`.
     /// Only called on Linux when `[cgroup] enable = true` and Docker is off.
