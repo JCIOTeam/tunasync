@@ -183,7 +183,7 @@ async fn list_jobs(State(state): State<Arc<WorkerHttpState>>) -> impl IntoRespon
 /// # Behaviour
 ///
 /// - Returns `404` with a JSON body when `mirror` is not a known mirror name.
-/// - On connect, the most recent ~1024 lines of the *current* sync are
+/// - On connect, the most recent ~10 lines of the *current* sync are
 ///   replayed as ordinary SSE `data:` events, then the connection seamlessly
 ///   continues into live mode and forwards each new line as it appears.
 ///   The replay buffer is cleared at the start of every sync, so the client

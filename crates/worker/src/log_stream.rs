@@ -29,10 +29,11 @@ use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::broadcast;
 
-/// How many recent lines to keep for replay-on-connect. 1024 covers a few
-/// seconds of busy rsync output; older lines are evicted when full. Beyond
-/// that, the historical content lives in the rotated log file on disk.
-const BUFFER_CAPACITY: usize = 1024;
+/// How many recent lines to keep for replay-on-connect. Small on purpose:
+/// the buffer exists so the UI isn't blank when a client connects mid-sync,
+/// *not* to serve up historical context. 10 lines is plenty to show that
+/// "something is happening"; anything older lives in the rotated log file.
+const BUFFER_CAPACITY: usize = 10;
 
 /// Broadcast channel capacity — the maximum lag a slow subscriber can
 /// tolerate before receiving a `Lagged(n)` notification and skipping ahead.

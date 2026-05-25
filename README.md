@@ -721,14 +721,14 @@ The worker exposes a Server-Sent Events endpoint that streams stdout/stderr line
 GET http://<worker-host>:<worker-port>/jobs/<mirror-name>/log/stream
 ```
 
-Response: `text/event-stream`. On connect, the most recent ~1024 lines of the **current** sync are replayed as ordinary SSE `data:` events, then the connection seamlessly continues into live mode. The replay buffer is cleared at the start of every new sync, so the client never sees stale content from a previous run.
+Response: `text/event-stream`. On connect, the most recent ~10 lines of the **current** sync are replayed as ordinary SSE `data:` events, then the connection seamlessly continues into live mode. The replay buffer is cleared at the start of every new sync, so the client never sees stale content from a previous run. (The buffer is intentionally small — just enough so the UI isn't blank when you open the page mid-sync. For longer history, read the rotated log file under `log_dir`.)
 
 Other guarantees:
 
 - **Atomic snapshot+subscribe**: a line emitted during the handshake lands on the stream exactly once — never duplicated, never missed.
 - **15s keep-alive comments** so idle connections survive proxy timeouts.
-- **Lag protection**: if a subscriber falls behind by more than 1024 lines, a single `event: lag` notification is emitted and streaming resumes from the newest line.
-- **Out-of-scope history**: lines older than the replay buffer (or from previous syncs) live only in the rotated log file under `log_dir`, not in the stream.
+- **Lag protection**: if a subscriber falls behind by more than 1024 lines on the live channel, a single `event: lag` notification is emitted and streaming resumes from the newest line.
+- **Out-of-scope history**: lines older than the small replay buffer (or from previous syncs) live only in the rotated log file under `log_dir`, not in the stream.
 
 `404` is returned for unknown mirror names.
 
