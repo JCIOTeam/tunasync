@@ -243,7 +243,14 @@ impl MirrorProvider for CmdProvider {
             Some(log_file.as_path())
         };
 
-        let proc = runner::spawn(&argv, &sync_target, &spawn_env, log_path, self.log_publisher.clone()).await?;
+        let proc = runner::spawn(
+            &argv,
+            &sync_target,
+            &spawn_env,
+            log_path,
+            self.log_publisher.clone(),
+        )
+        .await?;
 
         // Store PID so terminate() can send SIGTERM.
         if let Some(pid) = proc.pid() {

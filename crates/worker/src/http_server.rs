@@ -220,9 +220,8 @@ async fn stream_log(
     // shows something immediately), followed by every buffered line as
     // an ordinary `data:` event. Replay events use the same shape as
     // live events so client code doesn't need a separate code path.
-    let preamble = stream::once(async move {
-        Ok::<_, Infallible>(Event::default().comment("subscribed"))
-    });
+    let preamble =
+        stream::once(async move { Ok::<_, Infallible>(Event::default().comment("subscribed")) });
     let replay = stream::iter(
         history
             .into_iter()
@@ -330,9 +329,11 @@ mod sse_tests {
         let (addr, broadcaster) = start_server().await;
 
         let mut s = TcpStream::connect(addr).await.unwrap();
-        s.write_all(b"GET /jobs/debian/log/stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
+        s.write_all(
+            b"GET /jobs/debian/log/stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
 
         let mut buf = BufReader::new(s);
 
@@ -380,9 +381,11 @@ mod sse_tests {
         publisher.push("line-before-2".into());
 
         let mut s = TcpStream::connect(addr).await.unwrap();
-        s.write_all(b"GET /jobs/debian/log/stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
+        s.write_all(
+            b"GET /jobs/debian/log/stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
 
         let mut buf = BufReader::new(s);
         // Skip response headers.
@@ -409,6 +412,9 @@ mod sse_tests {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
             }
         }
-        assert!(seen1 && seen2, "expected both buffered lines to be replayed");
+        assert!(
+            seen1 && seen2,
+            "expected both buffered lines to be replayed"
+        );
     }
 }

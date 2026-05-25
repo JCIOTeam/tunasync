@@ -303,9 +303,15 @@ impl MirrorProvider for RsyncProvider {
             Some(log_file.as_path())
         };
 
-        let proc = runner::spawn(&argv, &sync_target, &spawn_env, log_path, self.log_publisher.clone())
-            .await
-            .with_context(|| format!("spawn rsync for {}", self.name))?;
+        let proc = runner::spawn(
+            &argv,
+            &sync_target,
+            &spawn_env,
+            log_path,
+            self.log_publisher.clone(),
+        )
+        .await
+        .with_context(|| format!("spawn rsync for {}", self.name))?;
 
         if let Some(pid) = proc.pid() {
             *self.current_pid.lock().unwrap() = Some(pid);

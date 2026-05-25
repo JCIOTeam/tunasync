@@ -98,10 +98,7 @@ impl LogBroadcaster {
     /// Atomically snapshot the recent-lines buffer and subscribe to all
     /// future lines. The returned receiver is guaranteed to see every line
     /// published *after* the snapshot was taken — no gap, no duplicate.
-    pub fn snapshot_and_subscribe(
-        &self,
-        name: &str,
-    ) -> (Vec<String>, broadcast::Receiver<String>) {
+    pub fn snapshot_and_subscribe(&self, name: &str) -> (Vec<String>, broadcast::Receiver<String>) {
         let cell = self.cell(name);
         let guard = cell.lock();
         let history: Vec<String> = guard.buffer.iter().cloned().collect();
