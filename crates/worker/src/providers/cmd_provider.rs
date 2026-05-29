@@ -267,6 +267,26 @@ impl MirrorProvider for CmdProvider {
         *self.current_pid.lock().unwrap() = None;
         wait_result?;
 
+        // Check fail_on_match regex in the log file.
+        //
+        // This MUST run before the atomic publish swap: fail_on_match marks a
+        // command that exited 0 but whose log indicates failure (e.g. an
+        // mirror script that prints errors yet returns success). If we swapped
+        // first, the bad/incomplete staging content would already be live in
+        // the publish dir by the time we bail — defeating the entire point of
+        // atomic publishing. Check first, swap only on a clean log.
+        if let Some(re) = &self.fail_on_match {
+            if log_file.exists() {
+                let content = tokio::fs::read_to_string(&log_file)
+                    .await
+                    .unwrap_or_default();
+                let matches: Vec<_> = re.find_iter(&content).collect();
+                if !matches.is_empty() {
+                    anyhow::bail!("fail_on_match regex found {} matches in log", matches.len());
+                }
+            }
+        }
+
         // Atomic publish swap.
         if self.atomic_publish_enabled {
             super::rsync_provider::atomic_publish_swap(&sync_target, &publish_dir).with_context(
@@ -279,19 +299,6 @@ impl MirrorProvider for CmdProvider {
                 },
             )?;
             tracing::info!(mirror = %self.name, dest = %publish_dir.display(), "atomic publish complete");
-        }
-
-        // Check fail_on_match regex in the log file.
-        if let Some(re) = &self.fail_on_match {
-            if log_file.exists() {
-                let content = tokio::fs::read_to_string(&log_file)
-                    .await
-                    .unwrap_or_default();
-                let matches: Vec<_> = re.find_iter(&content).collect();
-                if !matches.is_empty() {
-                    anyhow::bail!("fail_on_match regex found {} matches in log", matches.len());
-                }
-            }
         }
 
         // Extract size from log — matches Go's ExtractSizeFromLog.
@@ -603,5 +610,91 @@ mod tests {
         let p = super::CmdProvider::from_config(&mc, &global).expect("from_config");
         let p: &dyn MirrorProvider = &p;
         assert_eq!(p.disk_quota_bytes(), 0);
+    }
+
+    /// Regression: when atomic_publish AND fail_on_match are both enabled, a
+    /// run whose command exits 0 but whose log matches fail_on_match must NOT
+    /// publish the staging contents. The fail_on_match check has to run BEFORE
+    /// the atomic swap; otherwise the broken/incomplete staging data is already
+    /// live in the publish dir by the time run() returns Err — defeating the
+    /// whole point of atomic publishing.
+    #[tokio::test]
+    async fn fail_on_match_blocks_publish_when_atomic() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let mirror_dir = base.path().join("mirror");
+        let staging_dir = base.path().join("staging");
+        let log_dir = base.path().join("log");
+        std::fs::create_dir_all(&mirror_dir).unwrap();
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        // Seed the publish dir with known-good content from a previous sync.
+        std::fs::write(mirror_dir.join("good.txt"), b"previous good data").unwrap();
+
+        let mut global = base_global();
+        global.mirror_dir = base.path().join("global-mirror").to_string_lossy().into();
+        global.staging_dir = staging_dir.to_string_lossy().into();
+        global.log_dir = log_dir.to_string_lossy().into();
+
+        let mut mc = base_mirror();
+        // Pin the publish dir to our seeded directory.
+        mc.mirror_dir = mirror_dir.to_string_lossy().into();
+        mc.atomic_publish = true;
+        // Command exits 0 but prints a line that fail_on_match catches. It
+        // also writes a (bad) file into the staging working dir so we can
+        // prove that file never reaches the publish dir.
+        mc.command =
+            "/bin/sh -c 'echo FATAL: upstream truncated; echo bad > bad.txt; exit 0'".into();
+        mc.fail_on_match = "FATAL".into();
+
+        let p = super::CmdProvider::from_config(&mc, &global).expect("from_config");
+
+        let result = p.run().await;
+
+        assert!(
+            result.is_err(),
+            "run must fail when fail_on_match matches, got {result:?}"
+        );
+        // The publish dir must still hold ONLY the previous good content.
+        assert!(
+            mirror_dir.join("good.txt").exists(),
+            "previous good data must survive a failed sync"
+        );
+        assert!(
+            !mirror_dir.join("bad.txt").exists(),
+            "staging's bad output must NOT be published when fail_on_match fires"
+        );
+    }
+
+    /// Counterpart: a clean run (no fail_on_match hit) with atomic_publish on
+    /// must publish the new staging contents as normal.
+    #[tokio::test]
+    async fn clean_run_publishes_when_atomic() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let mirror_dir = base.path().join("mirror");
+        let staging_dir = base.path().join("staging");
+        let log_dir = base.path().join("log");
+        std::fs::create_dir_all(&mirror_dir).unwrap();
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(mirror_dir.join("old.txt"), b"old").unwrap();
+
+        let mut global = base_global();
+        global.mirror_dir = base.path().join("global-mirror").to_string_lossy().into();
+        global.staging_dir = staging_dir.to_string_lossy().into();
+        global.log_dir = log_dir.to_string_lossy().into();
+
+        let mut mc = base_mirror();
+        mc.mirror_dir = mirror_dir.to_string_lossy().into();
+        mc.atomic_publish = true;
+        mc.command = "/bin/sh -c 'echo syncing; echo fresh > new.txt; exit 0'".into();
+        mc.fail_on_match = "FATAL".into();
+
+        let p = super::CmdProvider::from_config(&mc, &global).expect("from_config");
+
+        p.run().await.expect("clean run must succeed");
+
+        assert!(
+            mirror_dir.join("new.txt").exists(),
+            "fresh staging output must be published on a clean run"
+        );
     }
 }
