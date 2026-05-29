@@ -43,6 +43,13 @@ use tokio::sync::mpsc;
 
 pub struct RunningProcess {
     pub(crate) child: Child,
+    /// Handles for the spawned stdout/stderr drain tasks (tee-to-log or
+    /// publish). `wait()` awaits these AFTER the child exits so the log file
+    /// is fully written and flushed before callers read it for fail_on_match
+    /// / size extraction. Without this, those readers race the drain task and
+    /// can observe a truncated or empty log. Empty when there were no
+    /// readers to track.
+    io_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl RunningProcess {
@@ -52,8 +59,20 @@ impl RunningProcess {
     }
 
     /// Wait for the process to exit, treating `allowed_codes` as success.
+    ///
+    /// After the child exits, this also waits for the stdout/stderr drain
+    /// tasks to finish so the log file is completely flushed — callers that
+    /// read the log immediately afterwards (fail_on_match, size extraction)
+    /// are guaranteed to see the full output.
     pub async fn wait(mut self, allowed_codes: &[i32]) -> Result<()> {
         let status = self.child.wait().await.context("wait() on child")?;
+        // Drain tasks end on their own once the child's pipes close (which
+        // happens at exit). Await them so the log is fully written/flushed
+        // before we return and the caller inspects it.
+        let io_tasks = std::mem::take(&mut self.io_tasks);
+        for handle in io_tasks {
+            let _ = handle.await;
+        }
         if status.success() {
             return Ok(());
         }
@@ -73,6 +92,11 @@ impl RunningProcess {
     /// SIGTERM the process group → 2 s → SIGKILL the process group.
     /// SIGTERM → 2 s grace period → SIGKILL the process group.
     pub async fn terminate(mut self) {
+        // The child is being force-killed; we don't need its remaining output
+        // flushed, so abort the drain tasks rather than awaiting them.
+        for handle in std::mem::take(&mut self.io_tasks) {
+            handle.abort();
+        }
         #[cfg(unix)]
         {
             use nix::sys::signal::{kill, Signal};
@@ -217,22 +241,25 @@ pub async fn spawn(
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
 
-    match (log_path, publisher) {
+    let io_tasks = match (log_path, publisher) {
         (Some(log_path), publisher) => {
             let log_path = log_path.to_owned();
-            tokio::spawn(tee_to_log(stdout, stderr, log_path, publisher));
+            vec![tokio::spawn(tee_to_log(
+                stdout, stderr, log_path, publisher,
+            ))]
         }
         (None, Some(p)) => {
-            tokio::spawn(publish_only(stdout, p.clone()));
-            tokio::spawn(publish_only(stderr, p));
+            vec![
+                tokio::spawn(publish_only(stdout, p.clone())),
+                tokio::spawn(publish_only(stderr, p)),
+            ]
         }
         (None, None) => {
-            tokio::spawn(drain(stdout));
-            tokio::spawn(drain(stderr));
+            vec![tokio::spawn(drain(stdout)), tokio::spawn(drain(stderr))]
         }
-    }
+    };
 
-    Ok(RunningProcess { child })
+    Ok(RunningProcess { child, io_tasks })
 }
 
 // I/O helpers
