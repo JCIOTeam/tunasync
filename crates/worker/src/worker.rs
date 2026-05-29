@@ -195,25 +195,77 @@ fn build_timezone_cache(
         .collect()
 }
 
+/// Remap a POSIX day-of-week field to the `cron` crate's convention.
+///
+/// POSIX/Vixie cron (and Go's robfig/cron, which the original tunasync uses)
+/// number the days `0-7` where **both** `0` and `7` mean Sunday and `1` is
+/// Monday. The `cron` crate instead uses `1-7` where `1` is Sunday and `7` is
+/// Saturday, and rejects `0` outright. Widening a 5-field expression by only
+/// prepending the seconds field therefore silently shifted every numeric
+/// weekday by one day (`* * * * 1` fired on Sunday instead of Monday) and made
+/// any expression containing `0` (a very common way to write Sunday) fail to
+/// parse — which aborts worker startup. See the regression tests below.
+///
+/// This remaps each standalone weekday integer `n` in `0..=7` to `(n % 7) + 1`.
+/// Names (`Mon`, `Sun`, …), `*`, and the step count following a `/` are left
+/// untouched — only weekday *values* and range endpoints are translated.
+fn remap_posix_dow(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    let bytes = field.as_bytes();
+    let mut i = 0;
+    let mut prev_was_slash = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            let num: u32 = field[start..i].parse().unwrap_or(0);
+            if prev_was_slash || num > 7 {
+                // Step count (e.g. the `2` in `*/2`) or an out-of-range value:
+                // pass through unchanged and let the cron crate validate it.
+                out.push_str(&num.to_string());
+            } else {
+                out.push_str(&((num % 7) + 1).to_string());
+            }
+            prev_was_slash = false;
+        } else {
+            prev_was_slash = c == b'/';
+            out.push(c as char);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Parse a cron expression accepting both 5-field POSIX format
 /// (`minute hour dom month dow`) and the cron-crate native 6/7-field format
 /// (`sec minute hour dom month dow [year]`).
 ///
-/// The `cron` crate (0.12) requires 6 or 7 fields. Operators are far more
-/// familiar with the classic 5-field syntax used by crontab(5), Kubernetes,
-/// systemd timers, and just about every other scheduler — so accepting both
-/// is essential. A 5-field expression is widened by prepending `"0 "` (run
-/// at second 0 of the matching minute).
+/// The `cron` crate requires 6 or 7 fields. Operators are far more familiar
+/// with the classic 5-field syntax used by crontab(5), Kubernetes, systemd
+/// timers, and just about every other scheduler — so accepting both is
+/// essential. A 5-field expression is widened by prepending `"0 "` (run at
+/// second 0 of the matching minute) and its day-of-week field is translated
+/// from POSIX numbering to the cron crate's numbering via [`remap_posix_dow`]
+/// so that `… * * 1` means Monday and `… * * 0` means Sunday, matching what
+/// operators (and the Go implementation) expect.
 ///
 /// Returns the same error type the `cron` crate uses, so callers can render
 /// it verbatim in startup error messages.
 pub(crate) fn parse_cron_lenient(expr: &str) -> Result<cron::Schedule, cron::error::Error> {
     use std::str::FromStr;
     let trimmed = expr.trim();
-    let field_count = trimmed.split_ascii_whitespace().count();
-    if field_count == 5 {
-        // Widen to 6 fields by prepending "0 " for the seconds field.
-        let widened = format!("0 {trimmed}");
+    let fields: Vec<&str> = trimmed.split_ascii_whitespace().collect();
+    if fields.len() == 5 {
+        // Widen to 6 fields by prepending "0 " for the seconds field, and
+        // translate the POSIX day-of-week field to the cron crate convention.
+        let dow = remap_posix_dow(fields[4]);
+        let widened = format!(
+            "0 {} {} {} {} {}",
+            fields[0], fields[1], fields[2], fields[3], dow
+        );
         cron::Schedule::from_str(&widened)
     } else {
         cron::Schedule::from_str(trimmed)
@@ -1577,6 +1629,83 @@ mod cron_schedule_tests {
     fn parse_cron_lenient_rejects_garbage() {
         assert!(super::parse_cron_lenient("not a cron").is_err());
         assert!(super::parse_cron_lenient("99 99 99 99 99").is_err());
+    }
+
+    /// Regression: a numeric POSIX day-of-week in a 5-field expression must
+    /// fire on the correct weekday. POSIX uses 0-7 (0/7=Sun, 1=Mon); the cron
+    /// crate uses 1-7 (1=Sun). Before the remap, `* * * * 1` fired on Sunday
+    /// and `* * * * 0` failed to parse entirely (aborting worker startup).
+    #[test]
+    fn parse_cron_lenient_maps_posix_weekday_numbers() {
+        use chrono::{Datelike, Utc, Weekday};
+
+        let next_weekday = |expr: &str| -> Weekday {
+            let sched =
+                super::parse_cron_lenient(expr).unwrap_or_else(|e| panic!("parse {expr:?}: {e}"));
+            sched
+                .upcoming(Utc)
+                .next()
+                .expect("schedule yields an upcoming time")
+                .weekday()
+        };
+
+        // Numeric weekdays land on the POSIX-expected day.
+        assert_eq!(next_weekday("0 3 * * 1"), Weekday::Mon);
+        assert_eq!(next_weekday("0 3 * * 5"), Weekday::Fri);
+        assert_eq!(next_weekday("0 3 * * 6"), Weekday::Sat);
+        // Both 0 and 7 mean Sunday in POSIX, and both must parse.
+        assert_eq!(next_weekday("0 3 * * 0"), Weekday::Sun);
+        assert_eq!(next_weekday("0 3 * * 7"), Weekday::Sun);
+    }
+
+    /// Regression: ranges, lists and steps in the POSIX weekday field are
+    /// remapped element-wise, and the step count after `/` is left alone.
+    #[test]
+    fn parse_cron_lenient_remaps_weekday_ranges_and_lists() {
+        use chrono::{Datelike, Utc, Weekday};
+        use std::collections::HashSet;
+
+        let weekday_set = |expr: &str, take: usize| -> HashSet<Weekday> {
+            super::parse_cron_lenient(expr)
+                .unwrap_or_else(|e| panic!("parse {expr:?}: {e}"))
+                .upcoming(Utc)
+                .take(take)
+                .map(|d| d.weekday())
+                .collect()
+        };
+
+        // Mon-Fri must be exactly the five weekdays, never Sunday/Saturday.
+        let workweek = weekday_set("0 3 * * 1-5", 20);
+        assert!(workweek.contains(&Weekday::Mon));
+        assert!(workweek.contains(&Weekday::Fri));
+        assert!(!workweek.contains(&Weekday::Sat));
+        assert!(!workweek.contains(&Weekday::Sun));
+
+        // A weekend list "6,0" must be Saturday + Sunday and must parse.
+        let weekend = weekday_set("0 3 * * 6,0", 20);
+        assert_eq!(
+            weekend,
+            HashSet::from([Weekday::Sat, Weekday::Sun]),
+            "6,0 should be exactly the weekend"
+        );
+    }
+
+    /// Direct unit test of the weekday remap helper.
+    #[test]
+    fn remap_posix_dow_translates_values_but_not_steps() {
+        // n -> (n % 7) + 1 for standalone values.
+        assert_eq!(super::remap_posix_dow("0"), "1"); // Sun
+        assert_eq!(super::remap_posix_dow("1"), "2"); // Mon
+        assert_eq!(super::remap_posix_dow("7"), "1"); // Sun (alt)
+        assert_eq!(super::remap_posix_dow("1-5"), "2-6"); // Mon-Fri
+        assert_eq!(super::remap_posix_dow("6,0"), "7,1"); // Sat,Sun
+        assert_eq!(super::remap_posix_dow("*"), "*");
+        // Names are untouched.
+        assert_eq!(super::remap_posix_dow("Mon"), "Mon");
+        // The step count after '/' is a count, not a weekday — keep it as-is.
+        // (The base before '/' is still remapped.)
+        assert_eq!(super::remap_posix_dow("*/2"), "*/2");
+        assert_eq!(super::remap_posix_dow("1/2"), "2/2");
     }
 
     /// Direct unit test for the per-upstream-semaphore diff logic.
