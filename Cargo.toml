@@ -36,8 +36,6 @@ axum        = { version = "0.7", features = ["json"] }
 # Use tls-rustls-no-provider so axum-server does NOT force aws-lc-rs.
 # We register ring as the crypto provider at startup (see crates/tunasync/src/main.rs).
 axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
-tower       = { version = "0.4" }
-tower-http  = { version = "0.5", features = ["trace"] }
 reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Declare rustls directly so we can pin the crypto backend to ring only.
 # ring cross-compiles cleanly to all targets (loongarch64, riscv64, etc.)
@@ -55,12 +53,12 @@ chrono      = { version = "0.4", features = ["serde"] }
 chrono-tz   = "0.10"
 humantime         = "2"
 humantime-serde   = "1"
-cron        = "0.12"
+cron        = "0.16"
 
 # Logging / errors
 tracing             = "0.1"
 tracing-subscriber  = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
-thiserror           = "1"
+thiserror           = "2"
 anyhow              = "1"
 
 # Storage
