@@ -97,14 +97,14 @@ pub fn build_router(shared: Arc<AppState>) -> Router {
         .route("/ping", get(ping))
         .route("/jobs", get(list_all_jobs).head(list_all_jobs_head))
         .route("/jobs/disabled", delete(flush_disabled_jobs))
-        .route("/jobs/:name", get(list_mirror_by_name))
+        .route("/jobs/{name}", get(list_mirror_by_name))
         .route("/workers", get(list_workers).post(register_worker))
-        .route("/workers/:id", delete(delete_worker))
-        .route("/workers/:id/heartbeat", post(heartbeat_worker))
-        .route("/workers/:id/jobs", get(list_jobs_of_worker))
-        .route("/workers/:id/jobs/:job", post(update_job_of_worker))
-        .route("/workers/:id/jobs/:job/size", post(update_mirror_size))
-        .route("/workers/:id/schedules", post(update_schedules_of_worker))
+        .route("/workers/{id}", delete(delete_worker))
+        .route("/workers/{id}/heartbeat", post(heartbeat_worker))
+        .route("/workers/{id}/jobs", get(list_jobs_of_worker))
+        .route("/workers/{id}/jobs/{job}", post(update_job_of_worker))
+        .route("/workers/{id}/jobs/{job}/size", post(update_mirror_size))
+        .route("/workers/{id}/schedules", post(update_schedules_of_worker))
         .route("/cmd", post(handle_client_cmd))
         .route("/metrics", get(metrics))
         .route(
@@ -980,5 +980,83 @@ mod metrics_tests {
             !out.contains(r#"mirror="tricky"name""#),
             "unescaped quote slipped through: {out}"
         );
+    }
+}
+
+#[cfg(test)]
+mod router_tests {
+    //! Smoke tests that actually build the router and route requests through
+    //! it. These guard the axum 0.8 path-parameter migration: the pre-0.8
+    //! `:param` syntax panics at router-build time under axum 0.8, so simply
+    //! constructing the router and hitting a parameterized route is enough to
+    //! catch a missed conversion. The metrics_tests module above only exercises
+    //! pure helpers and would not have caught it.
+
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt; // for `oneshot`
+
+    fn test_state() -> Arc<AppState> {
+        // A real on-disk-temp SQLite db keeps the test hermetic while
+        // exercising the actual DbAdapter the handlers use.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::sqlite_adapter::SqliteAdapter::open(&tmp.path().join("t.db"))
+            .expect("open sqlite");
+        // Keep tmp alive for the duration of the test by leaking it; the OS
+        // reclaims the file when the process exits. (Tests are short-lived.)
+        std::mem::forget(tmp);
+        Arc::new(AppState {
+            db: Box::new(db),
+            http_client: reqwest::Client::new(),
+            maintenance: std::sync::atomic::AtomicBool::new(false),
+            notify: crate::config::NotifyConfig::default(),
+        })
+    }
+
+    async fn get(uri: &str) -> StatusCode {
+        let router = build_router(test_state());
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router response");
+        resp.status()
+    }
+
+    /// Baseline: the router builds and a static route responds. If any route
+    /// still used the old `:param` syntax, build_router would have panicked
+    /// before we got here.
+    #[tokio::test]
+    async fn ping_route_responds() {
+        assert_eq!(get("/ping").await, StatusCode::OK);
+    }
+
+    /// Single path parameter: `/jobs/{name}`. Empty db -> 200 with an empty
+    /// JSON array. Proves the param route matches and the extractor binds.
+    #[tokio::test]
+    async fn single_param_route_matches() {
+        assert_eq!(get("/jobs/some-mirror").await, StatusCode::OK);
+    }
+
+    /// Single param on the workers tree: `/workers/{id}/jobs`. Unknown worker
+    /// -> 400 ("invalid workerID"). The point is that the request routes to the
+    /// handler at all (not a 404/405 from a misdeclared route).
+    #[tokio::test]
+    async fn worker_param_route_matches() {
+        assert_eq!(
+            get("/workers/nonexistent/jobs").await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    /// Unknown path still 404s — confirms routing is real, not a catch-all.
+    #[tokio::test]
+    async fn unknown_route_is_404() {
+        assert_eq!(get("/no/such/path").await, StatusCode::NOT_FOUND);
     }
 }

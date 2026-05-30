@@ -32,10 +32,10 @@ futures     = "0.3"
 async-trait = "0.1"
 
 # Web / HTTP
-axum        = { version = "0.7", features = ["json"] }
+axum        = { version = "0.8", features = ["json"] }
 # Use tls-rustls-no-provider so axum-server does NOT force aws-lc-rs.
 # We register ring as the crypto provider at startup (see crates/tunasync/src/main.rs).
-axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Declare rustls directly so we can pin the crypto backend to ring only.
 # ring cross-compiles cleanly to all targets (loongarch64, riscv64, etc.)

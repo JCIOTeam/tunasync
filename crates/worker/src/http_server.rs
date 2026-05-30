@@ -84,7 +84,7 @@ pub fn build_router(state: WorkerHttpState) -> Router {
     Router::new()
         .route("/", post(handle_cmd))
         .route("/jobs", get(list_jobs))
-        .route("/jobs/:mirror/log/stream", get(stream_log))
+        .route("/jobs/{mirror}/log/stream", get(stream_log))
         .with_state(shared)
 }
 
