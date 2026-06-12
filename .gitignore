@@ -1,6 +1,8 @@
 *~
 .claude/
+.omc/
 CLAUDE.md
+AGENTS.md
 .DS_Store
 *.swo
 *.swp
