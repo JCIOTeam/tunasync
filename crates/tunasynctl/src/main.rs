@@ -64,6 +64,8 @@ struct CtlConfig {
     manager_port: Option<u16>,
     #[serde(default)]
     ca_cert: String,
+    #[serde(default)]
+    api_token: String,
 }
 
 impl CtlConfig {
@@ -91,6 +93,9 @@ impl CtlConfig {
                         }
                         if !cfg.ca_cert.is_empty() {
                             merged.ca_cert = cfg.ca_cert;
+                        }
+                        if !cfg.api_token.is_empty() {
+                            merged.api_token = cfg.api_token;
                         }
                     }
                     Err(e) => {
@@ -129,6 +134,17 @@ struct Cli {
     #[arg(long, global = true)]
     ca_cert: Option<PathBuf>,
 
+    /// API token for the manager (when `[server] api_token` is set).
+    /// Prefer the env var or ctl.conf over the flag — command-line
+    /// arguments are visible in the process list.
+    #[arg(
+        long,
+        env = "TUNASYNC_API_TOKEN",
+        global = true,
+        hide_env_values = true
+    )]
+    api_token: Option<String>,
+
     /// Verbose logging.
     #[arg(short, long, global = true)]
     verbose: bool,
@@ -156,6 +172,15 @@ enum Command {
     },
     /// List all registered workers.
     Workers,
+    /// Show recent completed sync runs for a mirror (sqlite manager backend
+    /// only; other backends return an empty list).
+    History {
+        /// Mirror name.
+        mirror: String,
+        /// Number of entries to show (newest first, max 100).
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Flush all disabled job rows from the manager DB.
     Flush {
         /// Safety guard: only flush if at least one currently-disabled
@@ -348,10 +373,11 @@ fn build_command() -> clap::Command {
 struct Client {
     base_url: String,
     http: reqwest::Client,
+    api_token: String,
 }
 
 impl Client {
-    fn new(base_url: String, ca_cert: Option<&PathBuf>) -> Result<Self> {
+    fn new(base_url: String, ca_cert: Option<&PathBuf>, api_token: String) -> Result<Self> {
         let http = if let Some(path) = ca_cert {
             tunasync_common::http::HttpClientBuilder::new()
                 .ca_cert_pem_from_path(path)?
@@ -359,7 +385,19 @@ impl Client {
         } else {
             tunasync_common::http::HttpClientBuilder::new().build()?
         };
-        Ok(Self { base_url, http })
+        Ok(Self {
+            base_url,
+            http,
+            api_token,
+        })
+    }
+
+    fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.api_token.is_empty() {
+            req
+        } else {
+            req.bearer_auth(&self.api_token)
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -367,8 +405,7 @@ impl Client {
     }
 
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
-        self.http
-            .get(self.url(path))
+        self.auth(self.http.get(self.url(path)))
             .send()
             .await
             .context(t!("GET request failed", "GET 请求失败"))?
@@ -384,8 +421,7 @@ impl Client {
         path: &str,
         body: &B,
     ) -> Result<T> {
-        self.http
-            .post(self.url(path))
+        self.auth(self.http.post(self.url(path)))
             .json(body)
             .send()
             .await
@@ -398,8 +434,7 @@ impl Client {
     }
 
     async fn delete<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
-        self.http
-            .delete(self.url(path))
+        self.auth(self.http.delete(self.url(path)))
             .send()
             .await
             .context(t!("DELETE request failed", "DELETE 请求失败"))?
@@ -653,7 +688,13 @@ async fn main() -> Result<()> {
 
     let base_url = build_base_url(&manager_addr, manager_port, ca_cert_path.is_some());
     tracing::info!(%base_url, "connecting to manager");
-    let client = Client::new(base_url, ca_cert_path.as_ref())?;
+    // CLI flag / env var wins over config file.
+    let api_token = cli
+        .api_token
+        .clone()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| file_cfg.api_token.clone());
+    let client = Client::new(base_url, ca_cert_path.as_ref(), api_token)?;
 
     match cli.command {
         Command::Completion { .. } => unreachable!(),
@@ -698,6 +739,12 @@ async fn main() -> Result<()> {
         Command::Workers => {
             let workers = client.list_workers().await?;
             print_json(&workers)?;
+        }
+
+        Command::History { mirror, limit } => {
+            let path = format!("/jobs/{mirror}/history?limit={limit}");
+            let entries: serde_json::Value = client.get(&path).await?;
+            print_json(&entries)?;
         }
 
         Command::Flush { stale_only } => {

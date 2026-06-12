@@ -13,6 +13,23 @@
 //!
 //! Midnight wraparound is supported: `22:00-04:00` covers 22:00–23:59 and
 //! 00:00–04:00 on the applicable weekdays.
+//!
+//! # Weekday semantics with wraparound windows
+//!
+//! The weekday filter applies to the day **the clock currently shows**, not
+//! the day the window "started". `22:00-04:00 Mon` therefore means
+//! *Monday 00:00–04:00* ∪ *Monday 22:00–24:00* — it does **not** extend into
+//! Tuesday's early hours. To cover "Monday night through Tuesday 04:00",
+//! use a two-day weekday range:
+//!
+//! ```toml
+//! blackout = ["22:00-04:00 Mon-Tue"]
+//! ```
+//!
+//! Note this also covers Monday 00:00–04:00 and Tuesday 22:00–24:00; if that
+//! symmetric coverage is unacceptable, split into per-day windows
+//! (`"22:00-23:59 Mon"`, `"00:00-04:00 Tue"` — the end is exclusive, so the
+//! final minute 23:59–24:00 is not covered by the first window).
 
 use chrono::{Datelike, NaiveTime, Timelike, Weekday};
 

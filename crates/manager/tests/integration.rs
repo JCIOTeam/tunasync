@@ -254,11 +254,17 @@ mod redis_db {
 // ---------------------------------------------------------------------------
 
 fn make_app() -> axum::Router {
+    make_app_with_token("")
+}
+
+fn make_app_with_token(token: &str) -> axum::Router {
     let db = open_db("sqlite", &tmp_path("server")).unwrap();
     let http_client = reqwest::Client::new();
     let state = std::sync::Arc::new(AppState {
         db,
         http_client,
+        sse_client: reqwest::Client::new(),
+        api_token: token.to_string(),
         maintenance: std::sync::atomic::AtomicBool::new(false),
         notify: Default::default(),
     });
@@ -1235,4 +1241,330 @@ async fn skip_failure_count_does_not_increment_consecutive_failures() {
         1,
         "skip_failure_count=false (real failure) must increment consecutive_failures"
     );
+}
+
+// ── traffic accumulation ────────────────────────────────────────────────────
+
+/// Regression test for traffic double-counting.
+///
+/// Old behavior: total_transferred_bytes was accumulated at the PreSyncing
+/// report whose last_started changed, using the worker's *persisted*
+/// last_transferred_bytes — so a failed run between two successful starts
+/// caused the previous success's bytes to be added twice.
+///
+/// New behavior: accumulate exactly once, on the transition into Success.
+#[tokio::test]
+async fn traffic_total_accumulates_once_per_success() {
+    let app = make_app();
+    let worker_id = "w-traffic";
+    let mirror = "traffic-test";
+    setup_worker_and_mirror(&app, worker_id, mirror).await;
+    let path = format!("/workers/{worker_id}/jobs/{mirror}");
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let report = |status: &str, transferred: u64| {
+        serde_json::json!({
+            "name": mirror, "worker": worker_id, "is_master": true,
+            "status": status,
+            "last_update": now, "last_started": now,
+            "last_ended": now, "next_schedule": now,
+            "upstream": "rsync://example.com/", "size": "", "error_msg": "",
+            "last_transferred_bytes": transferred
+        })
+    };
+
+    // Run 1: presync → sync → success(100).
+    post_json(&app, &path, &report("pre-syncing", 0)).await;
+    post_json(&app, &path, &report("syncing", 0)).await;
+    let (_, body) = post_json(&app, &path, &report("success", 100)).await;
+    assert_eq!(body["total_transferred_bytes"].as_u64(), Some(100));
+
+    // Worker's scheduling-only follow-up re-sends the Success entry —
+    // must NOT accumulate again.
+    let (_, body) = post_json(&app, &path, &report("success", 100)).await;
+    assert_eq!(
+        body["total_transferred_bytes"].as_u64(),
+        Some(100),
+        "duplicate Success report must not re-accumulate"
+    );
+
+    // Run 2: fails. The worker's persisted last_transferred (100) rides along
+    // on every report — must not be re-added.
+    post_json(&app, &path, &report("pre-syncing", 100)).await;
+    post_json(&app, &path, &report("syncing", 100)).await;
+    let (_, body) = post_json(&app, &path, &report("failed", 100)).await;
+    assert_eq!(
+        body["total_transferred_bytes"].as_u64(),
+        Some(100),
+        "failed run must not accumulate"
+    );
+
+    // Run 3: succeeds with 50 transferred.
+    post_json(&app, &path, &report("pre-syncing", 100)).await;
+    post_json(&app, &path, &report("syncing", 100)).await;
+    let (_, body) = post_json(&app, &path, &report("success", 50)).await;
+    assert_eq!(
+        body["total_transferred_bytes"].as_u64(),
+        Some(150),
+        "total must be 100+50, not double-counted to 200+"
+    );
+
+    // Run 4: zero-transfer success (worker now reports 0 explicitly).
+    post_json(&app, &path, &report("pre-syncing", 50)).await;
+    post_json(&app, &path, &report("syncing", 50)).await;
+    let (_, body) = post_json(&app, &path, &report("success", 0)).await;
+    assert_eq!(
+        body["total_transferred_bytes"].as_u64(),
+        Some(150),
+        "zero-transfer success must not inherit and re-add the previous run's bytes"
+    );
+}
+
+// ── SSE log-stream proxy ────────────────────────────────────────────────────
+
+/// `GET /jobs/:name/log/stream` on the MANAGER must proxy the stream from
+/// the owning worker. End-to-end: spin up a mock worker serving a short SSE
+/// body on a real TCP port, register it, report a mirror owned by it, then
+/// read the proxied stream through the manager router.
+#[tokio::test]
+async fn sse_proxy_streams_from_owning_worker() {
+    use axum::routing::get;
+
+    // Mock worker: GET /jobs/{mirror}/log/stream → 3 SSE data lines.
+    let worker_app = axum::Router::new().route(
+        "/jobs/{mirror}/log/stream",
+        get(
+            |axum::extract::Path(mirror): axum::extract::Path<String>| async move {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    format!("data: hello {mirror}\n\ndata: line2\n\ndata: line3\n\n"),
+                )
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let worker_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, worker_app).await.unwrap();
+    });
+
+    let app = make_app();
+    let zero = "0001-01-01T00:00:00Z";
+
+    // Register the mock worker with its real URL.
+    let worker = serde_json::json!({
+        "id": "w-sse",
+        "url": format!("http://{worker_addr}"),
+        "token": "",
+        "last_online": zero,
+        "last_register": zero,
+    });
+    post_json(&app, "/workers", &worker).await;
+
+    // Report a mirror owned by w-sse.
+    let job = serde_json::json!({
+        "name": "sse-test", "worker": "w-sse", "is_master": true,
+        "status": "syncing",
+        "last_update": zero, "last_started": zero,
+        "last_ended": zero, "next_schedule": zero,
+        "upstream": "rsync://example.com/", "size": "", "error_msg": ""
+    });
+    post_json(&app, "/workers/w-sse/jobs/sse-test", &job).await;
+
+    // Stream through the manager proxy.
+    use tower::ServiceExt;
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/jobs/sse-test/log/stream")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream"),
+    );
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("data: hello sse-test"), "got: {text}");
+    assert!(text.contains("data: line3"), "got: {text}");
+
+    // Unknown mirror → 404 from the manager itself.
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/jobs/nope/log/stream")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// When the owning worker is registered but unreachable, the proxy must
+/// fail fast with 502 instead of hanging.
+#[tokio::test]
+async fn sse_proxy_unreachable_worker_returns_502() {
+    let app = make_app();
+    let zero = "0001-01-01T00:00:00Z";
+
+    // Register a worker pointing at a port nobody listens on.
+    let worker = serde_json::json!({
+        "id": "w-dead",
+        "url": "http://127.0.0.1:1",
+        "token": "",
+        "last_online": zero,
+        "last_register": zero,
+    });
+    post_json(&app, "/workers", &worker).await;
+    let job = serde_json::json!({
+        "name": "dead-test", "worker": "w-dead", "is_master": true,
+        "status": "failed",
+        "last_update": zero, "last_started": zero,
+        "last_ended": zero, "next_schedule": zero,
+        "upstream": "rsync://example.com/", "size": "", "error_msg": ""
+    });
+    post_json(&app, "/workers/w-dead/jobs/dead-test", &job).await;
+
+    use tower::ServiceExt;
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/jobs/dead-test/log/stream")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+}
+
+// ── API token auth ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn api_token_gates_mutating_endpoints_only() {
+    let app = make_app_with_token("s3cret");
+    let zero = "0001-01-01T00:00:00Z";
+    let worker = serde_json::json!({
+        "id": "w-auth", "url": "http://127.0.0.1:1", "token": "",
+        "last_online": zero, "last_register": zero,
+    });
+    let body = || Body::from(serde_json::to_vec(&worker).unwrap());
+
+    // Mutating endpoint WITHOUT token → 401.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/workers")
+        .header("content-type", "application/json")
+        .body(body())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Wrong token → 401.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/workers")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer wrong")
+        .body(body())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Correct token → 200.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/workers")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer s3cret")
+        .body(body())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Public read-only surface stays open without a token.
+    for path in [
+        "/ping",
+        "/jobs",
+        "/jobs/some-mirror",
+        "/metrics",
+        "/maintenance",
+    ] {
+        let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "{path} must remain public"
+        );
+    }
+
+    // /cmd requires the token.
+    let cmd = serde_json::json!({"cmd": 2, "worker_id": "w-auth", "mirror_id": "", "options": {}});
+    let req = Request::builder()
+        .method("POST")
+        .uri("/cmd")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&cmd).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ── sync history ────────────────────────────────────────────────────────────
+
+/// History rows are appended once per completed run (active→terminal
+/// transition only), newest first, with duplicate terminal reports ignored.
+#[tokio::test]
+async fn sync_history_records_completed_runs() {
+    let app = make_app();
+    let worker_id = "w-hist";
+    let mirror = "hist-test";
+    setup_worker_and_mirror(&app, worker_id, mirror).await;
+    let path = format!("/workers/{worker_id}/jobs/{mirror}");
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let report = |status: &str, transferred: u64, err: &str| {
+        serde_json::json!({
+            "name": mirror, "worker": worker_id, "is_master": true,
+            "status": status,
+            "last_update": now, "last_started": now,
+            "last_ended": now, "next_schedule": now,
+            "upstream": "rsync://example.com/", "size": "", "error_msg": err,
+            "last_transferred_bytes": transferred
+        })
+    };
+
+    // Run 1: success(100). Follow-up duplicate Success must not add a row.
+    post_json(&app, &path, &report("pre-syncing", 0, "")).await;
+    post_json(&app, &path, &report("syncing", 0, "")).await;
+    post_json(&app, &path, &report("success", 100, "")).await;
+    post_json(&app, &path, &report("success", 100, "")).await;
+
+    // Run 2: failed.
+    post_json(&app, &path, &report("pre-syncing", 100, "")).await;
+    post_json(&app, &path, &report("syncing", 100, "")).await;
+    post_json(&app, &path, &report("failed", 100, "rsync exited 23")).await;
+
+    let (status, body) = get_json(&app, &format!("/jobs/{mirror}/history")).await;
+    assert_eq!(status, StatusCode::OK);
+    let entries: Vec<serde_json::Value> = serde_json::from_value(body).unwrap();
+    assert_eq!(entries.len(), 2, "exactly one row per completed run");
+    // Newest first.
+    assert_eq!(entries[0]["status"], "failed");
+    assert_eq!(entries[0]["error_msg"], "rsync exited 23");
+    assert_eq!(entries[1]["status"], "success");
+    assert_eq!(entries[1]["transferred_bytes"].as_u64(), Some(100));
+
+    // limit param.
+    let (_, body) = get_json(&app, &format!("/jobs/{mirror}/history?limit=1")).await;
+    let entries: Vec<serde_json::Value> = serde_json::from_value(body).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["status"], "failed");
+
+    // Unknown mirror → empty list, not an error.
+    let (status, body) = get_json(&app, "/jobs/never-existed/history").await;
+    assert_eq!(status, StatusCode::OK);
+    let entries: Vec<serde_json::Value> = serde_json::from_value(body).unwrap();
+    assert!(entries.is_empty());
 }

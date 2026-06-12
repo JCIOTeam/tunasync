@@ -316,6 +316,15 @@ pub struct ManagerApiConfig {
     /// CA cert to pin when connecting to manager.
     #[serde(default)]
     pub ca_cert: String,
+
+    /// Shared API token. When non-empty:
+    /// - attached as `Authorization: Bearer` to every manager request, and
+    /// - REQUIRED on this worker's own command endpoint (`POST /`) and SSE
+    ///   log stream (commands/streams come from the manager or operators).
+    ///
+    /// Set the SAME value in the manager's `[server] api_token`.
+    #[serde(default)]
+    pub api_token: String,
 }
 
 impl ManagerApiConfig {

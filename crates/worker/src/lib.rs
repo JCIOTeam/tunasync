@@ -425,6 +425,116 @@ fn compute_docker_env(
     env
 }
 
+// ---------------------------------------------------------------------------
+// Config check mode (`tunasync worker --check`)
+// ---------------------------------------------------------------------------
+
+/// Result of a `--check` validation pass.
+pub struct ConfigCheckReport {
+    /// Fatal problems — the worker would refuse to start, or a mirror would
+    /// silently misbehave (e.g. fall back from cron to interval scheduling).
+    pub errors: Vec<String>,
+    /// Non-fatal observations worth an operator's attention.
+    pub warnings: Vec<String>,
+    /// Number of mirrors after include-merging and flattening.
+    pub mirrors: usize,
+}
+
+/// Validate a worker config file WITHOUT starting anything.
+///
+/// Designed for `ExecStartPre=` in systemd units and pre-reload CI checks:
+/// it runs the exact same parsing/flattening pipeline as `run()` plus the
+/// checks that are only *warnings* at runtime (blackout expressions,
+/// provider construction), and collects ALL problems instead of bailing on
+/// the first — so one check run shows everything that needs fixing.
+///
+/// Returns `Err` only when the file itself cannot be read or parsed;
+/// semantic problems are reported through [`ConfigCheckReport::errors`].
+pub fn check_config(config_path: &std::path::Path) -> Result<ConfigCheckReport> {
+    let mut cfg: config::WorkerConfig = tunasync_common::config::load_toml(config_path)?;
+    if cfg.global.retry == 0 {
+        cfg.global.retry = 3;
+    }
+    load_include_mirrors(&mut cfg);
+    cfg.mirrors = config::flatten_mirrors(&cfg.mirrors_conf);
+
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+
+    // Global-level checks.
+    if !cfg.global.timezone.is_empty() {
+        if let Err(e) = cfg.global.timezone.parse::<chrono_tz::Tz>() {
+            errors.push(format!(
+                "global.timezone {:?} is not a valid IANA timezone: {e}",
+                cfg.global.timezone
+            ));
+        }
+    }
+    if cfg.manager.api_base_list().iter().all(|b| b.is_empty()) {
+        warnings.push(
+            "[manager] api_base is empty — the worker will not be able to \
+             report status to any manager"
+                .to_string(),
+        );
+    }
+
+    // Duplicate mirror names break the job map silently (last one wins).
+    {
+        let mut seen = std::collections::HashSet::new();
+        for mc in &cfg.mirrors {
+            if !seen.insert(mc.name.as_str()) {
+                errors.push(format!(
+                    "duplicate mirror name {:?} — later definition overrides \
+                     the earlier one",
+                    mc.name
+                ));
+            }
+        }
+    }
+
+    // Per-mirror checks. Collect everything rather than bailing early.
+    for mc in &cfg.mirrors {
+        if !mc.cron.is_empty() {
+            if let Err(e) = crate::worker::parse_cron_lenient(&mc.cron) {
+                errors.push(format!(
+                    "mirror {:?}: invalid cron expression {:?}: {e}",
+                    mc.name, mc.cron
+                ));
+            }
+        }
+        if !mc.timezone.is_empty() {
+            if let Err(e) = mc.timezone.parse::<chrono_tz::Tz>() {
+                errors.push(format!(
+                    "mirror {:?}: timezone {:?} is not a valid IANA timezone: {e}",
+                    mc.name, mc.timezone
+                ));
+            }
+        }
+        // Blackout windows are only warn-and-skip at runtime
+        // (`build_blackout_cache`) — surface unparseable ones as errors here
+        // so a typo can't silently disable a maintenance window.
+        for spec in &mc.blackout {
+            if crate::blackout::BlackoutWindow::parse(spec).is_none() {
+                errors.push(format!(
+                    "mirror {:?}: unparseable blackout window {:?}",
+                    mc.name, spec
+                ));
+            }
+        }
+        // Try to actually construct the provider + hooks: catches bad
+        // provider options, unsupported combinations, bad template syntax.
+        if let Err(e) = build_one_provider(mc, &cfg) {
+            errors.push(format!("mirror {:?}: {e:#}", mc.name));
+        }
+    }
+
+    Ok(ConfigCheckReport {
+        errors,
+        warnings,
+        mirrors: cfg.mirrors.len(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use crate::config::MirrorConfig;

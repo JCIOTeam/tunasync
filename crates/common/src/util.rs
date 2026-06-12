@@ -78,17 +78,49 @@ pub fn extract_transferred_bytes_from_rsync_log(log_content: &str) -> u64 {
     static RE: Lazy<regex::Regex> = Lazy::new(|| {
         // rsync outputs lines like:
         //   Total transferred file size: 1,234,567 bytes
-        //   Total transferred file size: 1.23G bytes
-        // We grab the raw number (with commas or suffixes).
-        regex::Regex::new(r"(?m)^Total transferred file size:\s+([0-9][0-9,.]*)\s+bytes")
-            .expect("static regex")
+        //   Total transferred file size: 1.23M bytes     (-h, powers of 1000)
+        //   Total transferred file size: 1.18Mi bytes    (-hh, powers of 1024)
+        // Capture the number (commas/decimal point) and an optional
+        // K/M/G/T/P suffix with an optional trailing `i`.
+        //
+        // The previous regex stopped at `[0-9,.]*\s+bytes` and therefore
+        // never matched the suffixed -h/-hh forms at all (and `1.23` would
+        // not parse as u64 anyway) — mirrors synced with --human-readable
+        // silently reported 0 transferred bytes.
+        regex::Regex::new(
+            r"(?m)^Total transferred file size:\s+([0-9][0-9,.]*)\s*([KMGTPkmgtp]i?)?\s+bytes",
+        )
+        .expect("static regex")
     });
     RE.captures_iter(log_content)
         .last()
-        .and_then(|c| c.get(1))
-        .map(|m| {
-            let s = m.as_str().replace(',', "");
-            s.parse::<u64>().unwrap_or(0)
+        .map(|c| {
+            let num: f64 = c
+                .get(1)
+                .map(|m| m.as_str().replace(',', ""))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+            let mult: f64 = match c.get(2).map(|m| m.as_str()) {
+                None => 1.0,
+                Some(suffix) => {
+                    // `-h` uses powers of 1000 (K/M/G…), `-hh` powers of
+                    // 1024 with an `i` marker (Ki/Mi/Gi…).
+                    let base: f64 = if suffix.ends_with('i') {
+                        1024.0
+                    } else {
+                        1000.0
+                    };
+                    match suffix.chars().next().map(|ch| ch.to_ascii_uppercase()) {
+                        Some('K') => base,
+                        Some('M') => base.powi(2),
+                        Some('G') => base.powi(3),
+                        Some('T') => base.powi(4),
+                        Some('P') => base.powi(5),
+                        _ => 1.0,
+                    }
+                }
+            };
+            (num * mult) as u64
         })
         .unwrap_or(0)
 }
@@ -199,6 +231,42 @@ pub fn disk_space(_path: &std::path::Path) -> Option<(u64, u64)> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// API token (bearer) authentication helpers
+// ---------------------------------------------------------------------------
+
+/// Constant-time byte-string equality.
+///
+/// Avoids early-exit timing differences when comparing secrets. Length
+/// difference still short-circuits — leaking the *length* of a high-entropy
+/// random token is not a practical concern, leaking prefix-match length is.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Validate an `Authorization: Bearer <token>` header value against the
+/// expected token. An empty `expected` means authentication is disabled and
+/// everything passes (backward compatible default).
+pub fn check_bearer(authorization: Option<&str>, expected: &str) -> bool {
+    if expected.is_empty() {
+        return true;
+    }
+    let Some(value) = authorization else {
+        return false;
+    };
+    let Some(presented) = value.strip_prefix("Bearer ") else {
+        return false;
+    };
+    constant_time_eq(presented.trim().as_bytes(), expected.as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,8 +333,41 @@ mod tests {
     }
 
     #[test]
+    fn bearer_check() {
+        use super::check_bearer;
+        // disabled auth passes everything
+        assert!(check_bearer(None, ""));
+        assert!(check_bearer(Some("garbage"), ""));
+        // enabled auth
+        assert!(check_bearer(Some("Bearer s3cret"), "s3cret"));
+        assert!(check_bearer(Some("Bearer s3cret  "), "s3cret"));
+        assert!(!check_bearer(Some("Bearer wrong"), "s3cret"));
+        assert!(!check_bearer(Some("s3cret"), "s3cret")); // missing scheme
+        assert!(!check_bearer(None, "s3cret"));
+    }
+
+    #[test]
     fn extract_transferred_bytes_empty() {
         assert_eq!(extract_transferred_bytes_from_rsync_log("no data"), 0);
+    }
+
+    /// Regression: `--human-readable` (-h) suffixed stats used to silently
+    /// parse as 0 because the regex never matched the suffixed form.
+    #[test]
+    fn extract_transferred_bytes_human_readable() {
+        // -h: powers of 1000
+        let log = "Total transferred file size: 1.23M bytes\n";
+        assert_eq!(extract_transferred_bytes_from_rsync_log(log), 1_230_000);
+        let log = "Total transferred file size: 2.5G bytes\n";
+        assert_eq!(extract_transferred_bytes_from_rsync_log(log), 2_500_000_000);
+        // -hh: powers of 1024 with `i` marker
+        let log = "Total transferred file size: 1.00Ki bytes\n";
+        assert_eq!(extract_transferred_bytes_from_rsync_log(log), 1024);
+        let log = "Total transferred file size: 1.50Gi bytes\n";
+        assert_eq!(
+            extract_transferred_bytes_from_rsync_log(log),
+            (1.5f64 * 1024.0 * 1024.0 * 1024.0) as u64
+        );
     }
 
     #[test]

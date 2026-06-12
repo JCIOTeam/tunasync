@@ -20,6 +20,7 @@ pub struct HttpClientBuilder {
     ca_cert: Option<Vec<u8>>,
     identity_pem: Option<Vec<u8>>,
     timeout: Option<Duration>,
+    streaming: bool,
 }
 
 impl HttpClientBuilder {
@@ -52,11 +53,27 @@ impl HttpClientBuilder {
         self
     }
 
+    /// Build a client for long-lived streaming responses (SSE proxying).
+    ///
+    /// Disables the *total* request timeout — an SSE stream legitimately
+    /// stays open for hours — while keeping a 10 s connect timeout so a
+    /// dead upstream still fails fast. Do NOT use this client for ordinary
+    /// request/response API calls; a stuck peer would hang them forever.
+    pub fn streaming(mut self) -> Self {
+        self.streaming = true;
+        self
+    }
+
     /// Build the `reqwest::Client`.
     pub fn build(self) -> Result<Client> {
-        let mut builder = Client::builder()
-            .timeout(self.timeout.unwrap_or(Duration::from_secs(30)))
-            .user_agent(concat!("tunasync-rs/", env!("CARGO_PKG_VERSION")));
+        let mut builder =
+            Client::builder().user_agent(concat!("tunasync-rs/", env!("CARGO_PKG_VERSION")));
+
+        if self.streaming {
+            builder = builder.connect_timeout(Duration::from_secs(10));
+        } else {
+            builder = builder.timeout(self.timeout.unwrap_or(Duration::from_secs(30)));
+        }
 
         if let Some(pem) = self.ca_cert {
             let cert = Certificate::from_pem(&pem).context("parse CA cert as PEM")?;

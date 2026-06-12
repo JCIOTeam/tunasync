@@ -82,14 +82,18 @@ impl Inner {
                     continue;
                 }
                 Some(w) => {
-                    // Wake the waiter.  If the send fails the receiver was
-                    // dropped (raced with cancellation) — release will be
-                    // called by the Permit's Drop impl anyway, so don't
-                    // adjust permits here (the waiter never got the permit).
+                    // Wake the waiter. If the send fails, the receiver was
+                    // dropped concurrently (cancellation raced past the
+                    // `cancelled` check above) — the waiter never got the
+                    // permit, so do NOT decrement, and keep looping so the
+                    // free permit is offered to the NEXT waiter instead of
+                    // sitting idle while live waiters starve.
                     if w.tx.send(()).is_ok() {
                         self.permits -= 1;
+                        break;
                     }
-                    break;
+                    // send failed → try the next waiter with this permit.
+                    continue;
                 }
             }
         }

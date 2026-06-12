@@ -9,8 +9,31 @@ pub mod redb_adapter;
 pub mod redis_adapter;
 pub mod sqlite_adapter;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tunasync_protocol::{MirrorStatus, WorkerStatus};
+use tunasync_protocol::{MirrorStatus, SyncStatus, WorkerStatus};
+
+// ---------------------------------------------------------------------------
+// Sync history
+// ---------------------------------------------------------------------------
+
+/// One completed sync run, recorded when a mirror transitions from an
+/// active state into a terminal one. Served via `GET /jobs/:name/history`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncHistoryEntry {
+    pub mirror: String,
+    pub worker: String,
+    pub status: SyncStatus,
+    pub started: chrono::DateTime<chrono::Utc>,
+    pub ended: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub transferred_bytes: u64,
+    #[serde(default)]
+    pub error_msg: String,
+}
+
+/// How many history rows to retain per mirror (pruned on insert).
+pub const SYNC_HISTORY_KEEP_PER_MIRROR: usize = 100;
 
 // ---------------------------------------------------------------------------
 // Error
@@ -67,6 +90,20 @@ pub trait DbAdapter: Send + Sync {
     fn list_mirror_status(&self, worker_id: &str) -> DbResult<Vec<MirrorStatus>>;
     fn list_all_mirror_status(&self) -> DbResult<Vec<MirrorStatus>>;
     fn flush_disabled_jobs(&self) -> DbResult<()>;
+
+    /// Record one completed sync run. Default: no-op — history is an
+    /// OPTIONAL capability; currently only the sqlite backend implements
+    /// it (redb/redis deployments get an empty history, never an error).
+    fn record_sync_history(&self, _entry: &SyncHistoryEntry) -> DbResult<()> {
+        Ok(())
+    }
+
+    /// Most-recent-first history for one mirror (across workers).
+    /// Default: empty for backends without history support.
+    fn get_sync_history(&self, _mirror: &str, _limit: usize) -> DbResult<Vec<SyncHistoryEntry>> {
+        Ok(Vec::new())
+    }
+
     fn close(&self) -> DbResult<()>;
 }
 

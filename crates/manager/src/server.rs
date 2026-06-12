@@ -41,11 +41,17 @@ use crate::db::{DbAdapter, DbError};
 pub struct AppState {
     pub db: Box<dyn DbAdapter>,
     pub http_client: reqwest::Client,
+    /// Client for proxying long-lived SSE streams from workers. Built with
+    /// NO total timeout (a log stream legitimately stays open for hours) but
+    /// a short connect timeout. Never use it for ordinary API calls.
+    pub sse_client: reqwest::Client,
     /// Read-only maintenance mode. When true, all mutating endpoints return
     /// 503 Service Unavailable. Toggle via `POST /maintenance` / `DELETE /maintenance`.
     pub maintenance: std::sync::atomic::AtomicBool,
     /// Notify config (webhook URL, stale_after, alert thresholds).
     pub notify: crate::config::NotifyConfig,
+    /// Shared API token (empty = auth disabled). See `ServerConfig::api_token`.
+    pub api_token: String,
 }
 
 /// JSON error response matching Go's `{ "error": "..." }` shape.
@@ -98,6 +104,8 @@ pub fn build_router(shared: Arc<AppState>) -> Router {
         .route("/jobs", get(list_all_jobs).head(list_all_jobs_head))
         .route("/jobs/disabled", delete(flush_disabled_jobs))
         .route("/jobs/{name}", get(list_mirror_by_name))
+        .route("/jobs/{name}/log/stream", get(proxy_job_log_stream))
+        .route("/jobs/{name}/history", get(get_job_history))
         .route("/workers", get(list_workers).post(register_worker))
         .route("/workers/{id}", delete(delete_worker))
         .route("/workers/{id}/heartbeat", post(heartbeat_worker))
@@ -113,7 +121,60 @@ pub fn build_router(shared: Arc<AppState>) -> Router {
                 .delete(disable_maintenance)
                 .get(get_maintenance),
         )
+        .layer(axum::middleware::from_fn_with_state(
+            shared.clone(),
+            auth_middleware,
+        ))
         .with_state(shared)
+}
+
+/// Bearer-token auth for the manager API.
+///
+/// No-op when `api_token` is empty (default — backward compatible). When
+/// set, every request must present `Authorization: Bearer <token>` EXCEPT
+/// the public read-only surface used by web frontends and load balancers:
+///
+/// - `GET/HEAD /ping`           — liveness probes
+/// - `GET/HEAD /jobs...`        — mirror status, detail, SSE log stream
+/// - `GET /metrics`             — Prometheus scrapes
+/// - `GET /maintenance`         — maintenance status read
+///
+/// Everything else — worker registration/reports, `/cmd`, deletes,
+/// maintenance toggles — is authenticated. Failures return `401` with a
+/// JSON error body.
+async fn auth_middleware(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if state.api_token.is_empty() {
+        return next.run(req).await;
+    }
+    let method = req.method();
+    let path = req.uri().path();
+    let read_only = method == axum::http::Method::GET || method == axum::http::Method::HEAD;
+    let public = read_only
+        && (path == "/ping"
+            || path == "/jobs"
+            || path.starts_with("/jobs/")
+            || path == "/metrics"
+            || path == "/maintenance");
+    if public {
+        return next.run(req).await;
+    }
+    let auth = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    if tunasync_common::util::check_bearer(auth, &state.api_token) {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "missing or invalid API token" })),
+        )
+            .into_response()
+    }
 }
 
 // Handlers
@@ -157,6 +218,121 @@ async fn list_mirror_by_name(
             Json(filtered).into_response()
         }
     }
+}
+
+/// `GET /jobs/:name/history?limit=N` — most-recent-first completed runs for
+/// one mirror. `limit` defaults to 20, capped at the per-mirror retention
+/// (100). Backends without history support (redb/redis) return `[]`.
+async fn get_job_history(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let limit = q
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(20)
+        .clamp(1, crate::db::SYNC_HISTORY_KEEP_PER_MIRROR);
+    match state.db.get_sync_history(&name, limit) {
+        Err(e) => db_err(e),
+        Ok(entries) => Json(entries).into_response(),
+    }
+}
+
+/// `GET /jobs/:name/log/stream` — proxy the live sync-log SSE stream from
+/// the worker that owns the mirror.
+///
+/// The actual SSE endpoint lives on the **worker's** HTTP server, which is
+/// typically bound to an internal interface and not reachable by browsers.
+/// This route lets frontends talk to a single origin (the manager): we look
+/// up which worker owns `name`, open the worker's stream with the
+/// no-total-timeout `sse_client`, and pipe the bytes through unbuffered.
+///
+/// Responses:
+/// - `404` — no mirror with this name is known to the manager
+/// - `502` — owning worker is registered but unreachable
+/// - upstream non-2xx — forwarded with the worker's status code
+/// - `200 text/event-stream` — live proxied stream (replay + live + keep-alives
+///   are produced by the worker; we add no events of our own)
+async fn proxy_job_log_stream(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    // Find the worker that owns this mirror.
+    let statuses = match state.db.list_all_mirror_status() {
+        Ok(s) => s,
+        Err(e) => return db_err(e),
+    };
+    let Some(mirror) = statuses.iter().find(|s| s.name == name) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("no mirror named {name:?}") })),
+        )
+            .into_response();
+    };
+    let worker = match state.db.get_worker(&mirror.worker) {
+        Ok(w) => w,
+        Err(DbError::NotFound(_)) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": format!("owning worker {:?} is not registered", mirror.worker)
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => return db_err(e),
+    };
+
+    // worker.url is the worker's command endpoint base (public_url, e.g.
+    // "http://host:6000"). Mirror names come from operator-controlled config
+    // and the DB, but percent-encode defensively anyway.
+    let base = worker.url.trim_end_matches('/');
+    let encoded: String = name
+        .bytes()
+        .flat_map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![b as char]
+            }
+            _ => format!("%{b:02X}").chars().collect(),
+        })
+        .collect();
+    let url = format!("{base}/jobs/{encoded}/log/stream");
+
+    let upstream = match state.sse_client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(mirror = %name, worker = %mirror.worker, url = %url, error = %e,
+                "SSE proxy: worker unreachable");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": format!("worker {:?} unreachable: {e}", mirror.worker)
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let status = upstream.status();
+    if !status.is_success() {
+        // Forward the worker's status (e.g. its own 404) with a JSON body.
+        let code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let body = upstream.text().await.unwrap_or_default();
+        return (code, body).into_response();
+    }
+
+    // Pipe the byte stream through. axum streams each chunk as it arrives;
+    // pair this with `proxy_buffering off` / `X-Accel-Buffering: no` on any
+    // fronting nginx so intermediaries don't batch the events.
+    let body = axum::body::Body::from_stream(upstream.bytes_stream());
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+        .header(axum::http::header::CACHE_CONTROL, "no-cache, no-transform")
+        .header("x-accel-buffering", "no")
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// `DELETE /jobs/disabled` — flush all disabled job rows.
@@ -320,8 +496,21 @@ async fn update_job_of_worker(
 
     // ── Extension fields ──────────────────────────────────────────────
 
-    // Traffic stats: accumulate total when a new sync reported transferred bytes.
-    if incoming.last_transferred_bytes > 0 && incoming.last_started != cur.last_started {
+    // Traffic stats: accumulate the running total exactly once per completed
+    // run, on the *transition into* Success.
+    //
+    // The previous rule ("accumulate when last_started changed", i.e. at the
+    // PreSyncing report carrying the persisted value of the PREVIOUS run)
+    // double-counted whenever a failed run sat between two starts: failures
+    // report transferred_bytes=0, so the worker's persisted
+    // last_transferred_bytes kept the old successful value, which then got
+    // re-accumulated at the next PreSyncing transition.
+    //
+    // Guarding on `cur.status != Success` (rather than just
+    // `incoming.status == Success`) also protects against the worker's
+    // scheduling-only follow-up report, which re-sends the full status entry
+    // (still Success) right after the Success report itself.
+    if incoming.status == SyncStatus::Success && cur.status != SyncStatus::Success {
         incoming.total_transferred_bytes =
             cur.total_transferred_bytes + incoming.last_transferred_bytes;
     } else {
@@ -330,6 +519,29 @@ async fn update_job_of_worker(
         // Preserve last_transferred if worker didn't report a new one.
         if incoming.last_transferred_bytes == 0 {
             incoming.last_transferred_bytes = cur.last_transferred_bytes;
+        }
+    }
+
+    // Sync history: append one row per completed run. The guard mirrors the
+    // traffic accumulation above — record only on the transition from an
+    // ACTIVE state into a terminal one, so the worker's scheduling-only
+    // follow-up report (same terminal status again) and skipped runs (which
+    // jump terminal→terminal without ever going active) don't add rows.
+    // Best-effort: a history write failure must never fail the report.
+    let was_active = matches!(cur.status, SyncStatus::PreSyncing | SyncStatus::Syncing);
+    let is_terminal = matches!(incoming.status, SyncStatus::Success | SyncStatus::Failed);
+    if was_active && is_terminal {
+        let entry = crate::db::SyncHistoryEntry {
+            mirror: incoming.name.clone(),
+            worker: incoming.worker.clone(),
+            status: incoming.status,
+            started: incoming.last_started,
+            ended: incoming.last_ended,
+            transferred_bytes: incoming.last_transferred_bytes,
+            error_msg: incoming.error_msg.clone(),
+        };
+        if let Err(e) = state.db.record_sync_history(&entry) {
+            tracing::warn!(mirror = %incoming.name, error = %e, "record sync history failed");
         }
     }
 
@@ -1009,6 +1221,8 @@ mod router_tests {
         Arc::new(AppState {
             db: Box::new(db),
             http_client: reqwest::Client::new(),
+            sse_client: reqwest::Client::new(),
+            api_token: String::new(),
             maintenance: std::sync::atomic::AtomicBool::new(false),
             notify: crate::config::NotifyConfig::default(),
         })

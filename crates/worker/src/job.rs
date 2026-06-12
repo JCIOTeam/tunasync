@@ -110,6 +110,10 @@ pub struct MirrorJob {
     state: Arc<AtomicU32>,
     ctrl_tx: mpsc::Sender<CtrlAction>,
     kill_tx: watch::Sender<bool>,
+    /// Handle of the spawned job task; consumed by graceful shutdown to
+    /// join the task (so in-flight hooks/publish can finish) instead of
+    /// abandoning it behind a fixed sleep.
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl MirrorJob {
@@ -128,7 +132,7 @@ impl MirrorJob {
         let (kill_tx, kill_rx) = watch::channel(false);
 
         let task_state = Arc::clone(&state);
-        tokio::spawn(run_job_task(
+        let task = tokio::spawn(run_job_task(
             provider,
             hooks,
             ctrl_rx,
@@ -145,7 +149,14 @@ impl MirrorJob {
             state,
             ctrl_tx,
             kill_tx,
+            task: Some(task),
         }
+    }
+
+    /// Take the task handle for joining during graceful shutdown.
+    /// Returns `None` if already taken.
+    pub fn take_task(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.task.take()
     }
 
     /// Current observable state.
@@ -160,8 +171,11 @@ impl MirrorJob {
     }
 
     /// Try to send without awaiting.
-    pub fn try_send(&self, action: CtrlAction) {
-        let _ = self.ctrl_tx.try_send(action);
+    /// Returns `false` if the action could NOT be queued (channel full or
+    /// task gone). Callers that drive the schedule MUST handle `false` —
+    /// a silently dropped Start would leave the mirror unscheduled forever.
+    pub fn try_send(&self, action: CtrlAction) -> bool {
+        self.ctrl_tx.try_send(action).is_ok()
     }
 
     /// Whether the job task is still alive (ctrl channel not closed).
@@ -231,6 +245,13 @@ async fn run_job_task(
             }
             CtrlAction::Start | CtrlAction::Restart | CtrlAction::ForceStart => {
                 set_state(&state, JobState::Ready);
+                // Mark any stale kill notification as seen BEFORE starting a
+                // new sync. A kill() issued while the job was idle (e.g. Stop
+                // or Restart on a non-syncing mirror) leaves the watch channel
+                // with an unseen version; without this drain, the very next
+                // semaphore-acquire select would treat that stale version as
+                // a fresh kill and silently swallow this Start.
+                let _ = kill_rx.borrow_and_update();
                 // Brief pause for cleanup after a Restart kill (matches Go's
                 // time.Sleep(time.Second) after Restart kill).
                 if action == CtrlAction::Restart {
@@ -929,5 +950,106 @@ mod per_upstream_semaphore_tests {
         drop(job2);
         drop(rx1);
         drop(rx2);
+    }
+}
+
+#[cfg(test)]
+mod stale_kill_repro {
+    //! Reproduces: a kill() issued while the job is IDLE (e.g. `tunasynctl
+    //! stop` on a mirror that isn't syncing) leaves the watch channel with
+    //! an unseen version. The NEXT Start then races a stale kill_rx.changed()
+    //! in the semaphore-acquire select and gets silently swallowed.
+
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+
+    use crate::hooks::DockerConfig;
+    use crate::job::{CtrlAction, MirrorJob};
+    use crate::priority_semaphore::PrioritySemaphore;
+    use crate::provider::MirrorProvider;
+
+    struct FlagProvider {
+        working_dir: PathBuf,
+        ran: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl MirrorProvider for FlagProvider {
+        fn name(&self) -> &str {
+            "flag-stub"
+        }
+        fn upstream(&self) -> &str {
+            "rsync://localhost/test/"
+        }
+        fn is_master(&self) -> bool {
+            true
+        }
+        fn interval(&self) -> Duration {
+            Duration::from_secs(3600)
+        }
+        fn retry(&self) -> u32 {
+            1
+        }
+        fn timeout(&self) -> Duration {
+            Duration::ZERO
+        }
+        fn working_dir(&self) -> &Path {
+            &self.working_dir
+        }
+        fn disk_quota_bytes(&self) -> u64 {
+            0
+        }
+        async fn run(&self) -> anyhow::Result<()> {
+            self.ran.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn terminate(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn set_docker_config(&mut self, _: DockerConfig) {}
+        fn set_log_path_shared(&mut self, _: Arc<Mutex<PathBuf>>) {}
+    }
+
+    #[tokio::test]
+    async fn start_after_idle_stop_is_swallowed_by_stale_kill() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let provider = Box::new(FlagProvider {
+            working_dir: std::env::temp_dir(),
+            ran: Arc::clone(&ran),
+        });
+        let (status_tx, mut status_rx) = tokio::sync::mpsc::channel(64);
+        // Keep draining status messages.
+        tokio::spawn(async move { while status_rx.recv().await.is_some() {} });
+
+        let sem = Arc::new(PrioritySemaphore::new(1));
+        // Hold the only permit so the job's acquire is PENDING — this makes
+        // the stale-kill branch in the select deterministic.
+        let held = sem.acquire(0).await;
+
+        let job = MirrorJob::spawn(provider, vec![], status_tx, Arc::clone(&sem), None, 0);
+
+        // Simulate `tunasynctl stop` on an idle mirror: Stop + kill().
+        job.try_send(CtrlAction::Stop);
+        job.kill();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Simulate a later `tunasynctl start`.
+        job.try_send(CtrlAction::Start);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Release the permit — if the Start were honored, the job would now
+        // acquire it and run the sync.
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "BUG REPRODUCED: Start sent after an idle-time Stop/kill was \
+             swallowed by the stale kill watch — sync never ran"
+        );
     }
 }

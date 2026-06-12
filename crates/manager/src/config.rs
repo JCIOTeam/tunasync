@@ -55,6 +55,14 @@ pub struct ServerConfig {
     pub port: u16,
     #[serde(default)]
     pub ssl_cert: String,
+
+    /// Shared API token. When non-empty, all mutating / worker-facing
+    /// endpoints require `Authorization: Bearer <api_token>`. Read-only
+    /// frontend endpoints (`GET /ping`, `GET /jobs*`, `GET /metrics`,
+    /// `GET /maintenance`) stay public. Set the SAME value in every
+    /// worker's `[manager] api_token` and in tunasynctl.
+    #[serde(default)]
+    pub api_token: String,
     #[serde(default)]
     pub ssl_key: String,
 }
@@ -84,6 +92,7 @@ impl Default for ServerConfig {
             port: Self::default_port(),
             ssl_cert: String::new(),
             ssl_key: String::new(),
+            api_token: String::new(),
         }
     }
 }

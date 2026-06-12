@@ -42,7 +42,14 @@ impl SqliteAdapter {
              CREATE TABLE IF NOT EXISTS mirror_status (
                 key  TEXT NOT NULL PRIMARY KEY,
                 data BLOB NOT NULL
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS sync_history (
+                id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                mirror TEXT NOT NULL,
+                data   BLOB NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_sync_history_mirror
+                ON sync_history (mirror, id DESC);",
         )?;
 
         Ok(Self {
@@ -249,6 +256,51 @@ impl DbAdapter for SqliteAdapter {
             conn.execute("DELETE FROM mirror_status WHERE key = ?1", params![key])?;
         }
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Sync history
+    // ------------------------------------------------------------------
+
+    fn record_sync_history(&self, entry: &crate::db::SyncHistoryEntry) -> DbResult<()> {
+        let data = serde_json::to_vec(entry)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sync_history (mirror, data) VALUES (?1, ?2)",
+            params![entry.mirror, data],
+        )?;
+        // Prune: keep only the most recent N rows per mirror so the table
+        // stays bounded without a background vacuum task.
+        conn.execute(
+            "DELETE FROM sync_history
+             WHERE mirror = ?1
+               AND id NOT IN (
+                   SELECT id FROM sync_history
+                   WHERE mirror = ?1
+                   ORDER BY id DESC
+                   LIMIT ?2
+               )",
+            params![entry.mirror, crate::db::SYNC_HISTORY_KEEP_PER_MIRROR as i64],
+        )?;
+        Ok(())
+    }
+
+    fn get_sync_history(
+        &self,
+        mirror: &str,
+        limit: usize,
+    ) -> DbResult<Vec<crate::db::SyncHistoryEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT data FROM sync_history WHERE mirror = ?1 ORDER BY id DESC LIMIT ?2")?;
+        let rows = stmt.query_map(params![mirror, limit as i64], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_slice(&row?)?);
+        }
+        Ok(out)
     }
 
     fn close(&self) -> DbResult<()> {

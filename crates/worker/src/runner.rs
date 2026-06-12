@@ -66,12 +66,32 @@ impl RunningProcess {
     /// are guaranteed to see the full output.
     pub async fn wait(mut self, allowed_codes: &[i32]) -> Result<()> {
         let status = self.child.wait().await.context("wait() on child")?;
-        // Drain tasks end on their own once the child's pipes close (which
-        // happens at exit). Await them so the log is fully written/flushed
-        // before we return and the caller inspects it.
+        // Drain tasks normally end on their own once the child's pipes close
+        // (which happens at exit). Await them so the log is fully
+        // written/flushed before we return and the caller inspects it.
+        //
+        // The wait is BOUNDED: if the child forked a grandchild that inherits
+        // the stdout/stderr pipe and stays alive (e.g. a mirror script that
+        // daemonizes a helper), the pipes never reach EOF and an unbounded
+        // await would hang this sync forever — even with timeout=0 configured.
+        // Flushing the buffered pipe contents (≤64 KiB per pipe + channel)
+        // takes well under a second, so 10 s is a generous ceiling; past it we
+        // abort the drains and warn that the tail of the log may be missing.
         let io_tasks = std::mem::take(&mut self.io_tasks);
-        for handle in io_tasks {
-            let _ = handle.await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        for mut handle in io_tasks {
+            if tokio::time::timeout_at(deadline, &mut handle)
+                .await
+                .is_err()
+            {
+                handle.abort();
+                tracing::warn!(
+                    "log drain did not finish within 10s after child exit — a \
+                     grandchild process likely inherited the stdout/stderr pipe \
+                     and is still running; aborting drain (log tail may be \
+                     incomplete)"
+                );
+            }
         }
         if status.success() {
             return Ok(());

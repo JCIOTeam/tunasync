@@ -353,7 +353,11 @@ impl Worker {
             .into_iter()
             .map(String::from)
             .collect();
-        let manager = Arc::new(ManagerClient::new(bases, http_client));
+        let manager = Arc::new(ManagerClient::new(
+            bases,
+            http_client,
+            cfg.manager.api_token.clone(),
+        ));
 
         let provider_list = build_jobs(&cfg);
         let mut jobs = HashMap::new();
@@ -456,6 +460,7 @@ impl Worker {
 
         // Spawn HTTP server task.
         let http_state = WorkerHttpState {
+            api_token: self.cfg.manager.api_token.clone(),
             cmd_tx: self.cmd_tx.clone(),
             worker_name: worker_id.clone(),
             mirror_names: Arc::clone(&self.mirror_names),
@@ -483,8 +488,11 @@ impl Worker {
             interval.tick().await; // skip the immediate first tick
             loop {
                 interval.tick().await;
-                if let Err(e) = mgr.heartbeat(&wid).await {
-                    warn!(worker = %wid, error = %e, "heartbeat failed");
+                match mgr.heartbeat(&wid).await {
+                    Err(e) => warn!(worker = %wid, error = %e, "heartbeat failed"),
+                    // Manager reachable — replay any reports buffered while
+                    // it was down (no-op when the buffer is empty).
+                    Ok(()) => mgr.flush_pending(&wid).await,
                 }
             }
         });
@@ -775,7 +783,20 @@ impl Worker {
                         );
                         self.schedule.push(entry.name, retry_at);
                     } else if let Some(job) = self.jobs.get(&entry.name) {
-                        job.try_send(CtrlAction::Start);
+                        if !job.try_send(CtrlAction::Start) {
+                            // The ctrl channel is full (e.g. buffered Pings
+                            // during a long-running sync) or the task died.
+                            // The entry was already popped and the job will
+                            // never emit a terminal message for a Start it
+                            // never received — without this re-push the
+                            // mirror would silently stop syncing forever.
+                            tracing::warn!(
+                                mirror = %entry.name,
+                                "could not queue scheduled Start (ctrl channel                                  full or task dead) — retrying in 30s"
+                            );
+                            self.schedule
+                                .push(entry.name, Instant::now() + Duration::from_secs(30));
+                        }
                     }
                 } else {
                     break;
@@ -807,13 +828,41 @@ impl Worker {
                 _ = &mut shutdown => {
                     info!("received shutdown signal — halting all jobs");
                     for job in self.jobs.values() {
-                        job.try_send(CtrlAction::Halt);
                         job.kill();
+                        job.try_send(CtrlAction::Halt);
                     }
-                    // Brief grace period for jobs to finish (matches Go's
-                    // WaitGroup approach — we wait a few seconds for tasks
-                    // to drain their final status messages before exiting).
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    // Join all job tasks (instead of the old fixed 5s sleep)
+                    // so in-flight publishes/post-exec hooks can complete and
+                    // logs get flushed, with a hard 30s ceiling as the safety
+                    // net. Go uses an unbounded WaitGroup here; we bound it
+                    // because a wedged provider must not block shutdown.
+                    let handles: Vec<_> = self
+                        .jobs
+                        .drain()
+                        .filter_map(|(_, mut j)| j.take_task())
+                        .collect();
+                    let deadline =
+                        tokio::time::Instant::now() + Duration::from_secs(30);
+                    let mut joined = 0usize;
+                    let total = handles.len();
+                    for mut h in handles {
+                        if tokio::time::timeout_at(deadline, &mut h).await.is_ok() {
+                            joined += 1;
+                        } else {
+                            h.abort();
+                        }
+                    }
+                    if joined < total {
+                        tracing::warn!(
+                            joined, total,
+                            "some job tasks did not exit within 30s and were aborted"
+                        );
+                    }
+                    // Drain any final status messages the tasks emitted on
+                    // their way out so the manager sees terminal states.
+                    while let Ok(msg) = self.status_rx.try_recv() {
+                        self.handle_job_message(msg, &worker_id).await;
+                    }
                     info!("shutdown complete");
                     return;
                 }
@@ -849,7 +898,14 @@ impl Worker {
         if !msg.size.is_empty() {
             status_entry.size = msg.size.clone();
         }
-        if msg.transferred_bytes > 0 {
+        if msg.status == SyncStatus::Success {
+            // A Success message is authoritative for this run's transferred
+            // bytes — including 0 (nothing changed upstream / stats parse
+            // failed). Without the unconditional overwrite, a zero-transfer
+            // success would keep the PREVIOUS run's value and the manager
+            // would accumulate it again on this run's Success transition.
+            status_entry.last_transferred_bytes = msg.transferred_bytes;
+        } else if msg.transferred_bytes > 0 {
             status_entry.last_transferred_bytes = msg.transferred_bytes;
         }
 
@@ -923,9 +979,14 @@ impl Worker {
                 if cmd.mirror_id.is_empty() {
                     for job in self.jobs.values() {
                         if let Some(action) = cmd_to_ctrl(&cmd) {
-                            job.try_send(action);
                             // Kill running sync on Stop/Disable/Halt/Restart so
-                            // it terminates promptly.
+                            // it terminates promptly. Signal the kill BEFORE
+                            // queueing the ctrl action: the job's Start/Restart
+                            // handler drains stale kill versions when it picks
+                            // up the action, so kill-then-send guarantees the
+                            // stale version is visible (and drained) by then,
+                            // whereas send-then-kill could land the kill just
+                            // after the drain and swallow the restart's sync.
                             if matches!(
                                 action,
                                 CtrlAction::Stop
@@ -935,6 +996,7 @@ impl Worker {
                             ) {
                                 job.kill();
                             }
+                            job.try_send(action);
                         }
                     }
                 } else if let Some(job) = self.jobs.get(&cmd.mirror_id) {
@@ -988,7 +1050,8 @@ impl Worker {
                             return;
                         }
 
-                        job.try_send(action);
+                        // Same kill-before-send ordering as the broadcast
+                        // path above (see comment there).
                         if matches!(
                             action,
                             CtrlAction::Stop
@@ -998,6 +1061,7 @@ impl Worker {
                         ) {
                             job.kill();
                         }
+                        job.try_send(action);
                     }
                 } else {
                     tracing::warn!(mirror = %cmd.mirror_id, "cmd for unknown mirror");

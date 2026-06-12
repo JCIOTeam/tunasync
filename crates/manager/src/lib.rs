@@ -68,10 +68,25 @@ pub async fn run_with_config(cfg: ManagerConfig) -> Result<()> {
             .build()?
     };
 
+    // Streaming client for proxying worker SSE log streams (no total
+    // timeout — see `GET /jobs/:name/log/stream`). Shares the CA pin.
+    let sse_client = if cfg.files.ca_cert.is_empty() {
+        tunasync_common::http::HttpClientBuilder::new()
+            .streaming()
+            .build()?
+    } else {
+        tunasync_common::http::HttpClientBuilder::new()
+            .ca_cert_pem_from_path(std::path::Path::new(&cfg.files.ca_cert))?
+            .streaming()
+            .build()?
+    };
+
     // Wrap in Arc so both the router and background tasks share the same state.
     let state = std::sync::Arc::new(AppState {
         db,
         http_client,
+        sse_client,
+        api_token: cfg.server.api_token.clone(),
         maintenance: std::sync::atomic::AtomicBool::new(false),
         notify: cfg.notify.clone(),
     });

@@ -86,6 +86,12 @@ enum Command {
         /// PID file path.
         #[arg(long, default_value = "/run/tunasync/tunasync.worker.pid")]
         pidfile: Option<PathBuf>,
+
+        /// Validate the config and exit without starting the worker.
+        /// Exit code 0 = OK (warnings allowed), 1 = errors found.
+        /// Intended for `ExecStartPre=` and pre-reload checks.
+        #[arg(long)]
+        check: bool,
     },
 }
 
@@ -158,8 +164,42 @@ async fn main() -> Result<()> {
             tunasync_manager::run_with_config(cfg).await
         }
 
-        Command::Worker { config, pidfile } => {
+        Command::Worker {
+            config,
+            pidfile,
+            check,
+        } => {
             tunasync_common::logger::init(cli.verbose, cli.with_systemd, true);
+
+            if *check {
+                // Validate-only mode: never touches PID files, never starts
+                // any task. Prints a human-readable report and sets the exit
+                // code for scripting.
+                let report = tunasync_worker::check_config(config)?;
+                for w in &report.warnings {
+                    eprintln!("warning: {w}");
+                }
+                for e in &report.errors {
+                    eprintln!("error: {e}");
+                }
+                if report.errors.is_empty() {
+                    println!(
+                        "{}: OK — {} mirror(s), {} warning(s)",
+                        config.display(),
+                        report.mirrors,
+                        report.warnings.len()
+                    );
+                    return Ok(());
+                }
+                eprintln!(
+                    "{}: {} error(s), {} warning(s)",
+                    config.display(),
+                    report.errors.len(),
+                    report.warnings.len()
+                );
+                std::process::exit(1);
+            }
+
             tracing::info!(?config, "starting tunasync worker");
 
             // Write PID file if requested (best-effort, non-fatal).

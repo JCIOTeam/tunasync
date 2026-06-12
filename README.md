@@ -209,6 +209,49 @@ atomic_publish = true
 
 Falls back to a two-step rename (brief 404 window) only on kernels/filesystems that don't support `RENAME_EXCHANGE` (pre-3.15 kernels or some FUSE mounts); a warning is logged.
 
+### API token authentication
+
+Set the same shared token on every component to require `Authorization: Bearer <token>` on all mutating and worker-facing endpoints (empty token = auth disabled, the backward-compatible default):
+
+```toml
+# manager.conf
+[server]
+api_token = "use-a-long-random-string"
+
+# worker.conf
+[manager]
+api_token = "use-a-long-random-string"
+
+# ctl.conf
+api_token = "use-a-long-random-string"   # or TUNASYNC_API_TOKEN / --api-token
+```
+
+The manager's public read-only surface stays open for web frontends and probes: `GET /ping`, `GET /jobs*` (including the SSE log proxy), `GET /metrics`, `GET /maintenance`. Everything else — worker registration/reports, `/cmd`, deletes, maintenance toggles — returns `401` without the token. The worker's own command endpoint and SSE stream are gated by the same token; the manager attaches it automatically when forwarding commands or proxying log streams.
+
+### Config check mode
+
+```console
+$ tunasync worker --check -c /etc/tunasync/worker.conf
+/etc/tunasync/worker.conf: OK — 42 mirror(s), 0 warning(s)
+```
+
+Validates the config without starting anything: TOML parse, include merging, cron expressions, IANA timezones, blackout windows (which are only warn-and-skip at runtime), duplicate mirror names, and full provider construction for every mirror. All problems are reported in one pass; the exit code is 0/1 for scripting. Recommended as `ExecStartPre=` in the systemd unit and before `tunasynctl reload`.
+
+### Offline report buffering
+
+Status/size/schedule reports that fail against **all** manager bases are buffered (coalesced to the latest per mirror) and replayed automatically on the next successful heartbeat — a manager outage no longer permanently loses terminal sync states or traffic statistics.
+
+### Sync history
+
+The manager records one row per completed run (on the transition from an active state into Success/Failed) when using the **sqlite** backend, retaining the most recent 100 runs per mirror:
+
+```console
+$ tunasynctl history debian -n 5         # newest first
+$ curl http://manager:14242/jobs/debian/history?limit=5
+```
+
+Each entry carries worker, status, start/end time, transferred bytes, and the error message. redb/redis backends return an empty list.
+
 ### Maintenance mode
 
 Put the manager into read-only mode. All mutating API calls (sync updates, commands) return 503 until maintenance mode is disabled.
@@ -732,6 +775,8 @@ Other guarantees:
 
 `404` is returned for unknown mirror names.
 
+> **Security note**: like the worker's command endpoint (`POST /`), this endpoint carries **no authentication** — anyone who can reach the worker's HTTP port can read live sync logs and issue Stop/Disable/Reload commands. Bind the worker to an internal interface (`listen_addr`), firewall the port to the manager host(s), and/or enable TLS with a private CA (`ca_cert`). Do not expose the worker port to the public internet.
+
 Example:
 
 ```sh
@@ -757,6 +802,16 @@ es.addEventListener("lag", e => console.warn("lagged:", e.data));
 ```
 
 The endpoint lives on the worker, not the manager — point it at the worker that owns the mirror (use `GET /workers/:id/jobs` on the manager to discover ownership).
+
+### Manager-side proxy (recommended for browser frontends)
+
+The manager also exposes the same path and transparently proxies it to the owning worker:
+
+```
+GET http://<manager-host>:<manager-port>/jobs/<mirror-name>/log/stream
+```
+
+The manager looks up which worker owns the mirror, opens the worker's stream (sharing the `ca_cert` TLS pin if configured), and pipes the events through unbuffered (`X-Accel-Buffering: no` is set for fronting nginx). This means web frontends only ever need to reach the **manager** origin — the worker port can stay firewalled to the manager host, as recommended in the security note above. Responses: `404` for unknown mirrors, `502` when the owning worker is unreachable, otherwise the worker's stream verbatim.
 
 ## License
 
