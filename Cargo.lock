@@ -2429,7 +2429,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tunasync"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -2443,7 +2443,7 @@ dependencies = [
 
 [[package]]
 name = "tunasync-common"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2459,7 +2459,7 @@ dependencies = [
 
 [[package]]
 name = "tunasync-manager"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2483,7 +2483,7 @@ dependencies = [
 
 [[package]]
 name = "tunasync-migrate"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "bbolt-rs",
@@ -2500,7 +2500,7 @@ dependencies = [
 
 [[package]]
 name = "tunasync-protocol"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "chrono",
  "serde",
@@ -2510,7 +2510,7 @@ dependencies = [
 
 [[package]]
 name = "tunasync-worker"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2545,7 +2545,7 @@ dependencies = [
 
 [[package]]
 name = "tunasynctl"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3235,7 +3235,7 @@ checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
 
 [[package]]
 name = "zerotrie"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0f9152d31db0792fa83f70fb2f83148effb5c1f5b8c7686c3459e361d9bc20bf"
 dependencies = [
