@@ -204,6 +204,49 @@ atomic_publish = true
 
 不支持 `RENAME_EXCHANGE`（Linux 3.15 以下内核或部分 FUSE 挂载）时自动回退到两步 rename（有极短 404 窗口），并打印警告日志。
 
+### API 令牌鉴权
+
+在三个组件上配置同一个共享令牌后，所有变更类和 worker 相关的接口都会要求 `Authorization: Bearer <token>`（令牌为空 = 关闭鉴权，保持向下兼容的默认行为）：
+
+```toml
+# manager.conf
+[server]
+api_token = "use-a-long-random-string"
+
+# worker.conf
+[manager]
+api_token = "use-a-long-random-string"
+
+# ctl.conf
+api_token = "use-a-long-random-string"   # 也可用 TUNASYNC_API_TOKEN / --api-token
+```
+
+manager 的公共只读接口对 Web 前端和探针保持开放：`GET /ping`、`GET /jobs*`（包括 SSE 日志代理）、`GET /metrics`、`GET /maintenance`。其余接口——worker 注册/上报、`/cmd`、删除、维护模式开关——在没有令牌时返回 `401`。worker 自身的命令端点和 SSE 流由同一令牌守卫，manager 在转发命令或代理日志流时会自动附带该令牌。
+
+### 配置检查模式
+
+```console
+$ tunasync worker --check -c /etc/tunasync/worker.conf
+/etc/tunasync/worker.conf: OK — 42 mirror(s), 0 warning(s)
+```
+
+不启动任何服务，仅校验配置文件：TOML 解析、include 合并、cron 表达式、IANA 时区、屏蔽时间窗（运行时只会告警跳过，不会启动失败）、镜像重名检测，并对每个镜像完成完整的 provider 构造。所有问题一次报告完，退出码为 0/1 便于脚本判断。推荐作为 systemd 单元的 `ExecStartPre=`，并在执行 `tunasynctl reload` 前先跑一遍。
+
+### 离线上报缓冲
+
+当对**所有** manager 地址都上报失败时，状态/大小/调度上报会被缓冲下来（每个镜像合并到最新一次），并在下一次心跳成功后自动重放——manager 短暂宕机不再永久丢失终态同步状态和流量统计。
+
+### 同步历史
+
+使用 **sqlite** 后端时，manager 会在每次同步从活动状态进入 Success/Failed 时记录一行历史，每个镜像保留最近 100 条：
+
+```console
+$ tunasynctl history debian -n 5         # 最新优先
+$ curl http://manager:14242/jobs/debian/history?limit=5
+```
+
+每条记录包含 worker、状态、起止时间、传输字节数和错误信息。redb / redis 后端返回空列表。
+
 ### 维护模式
 
 将 manager 置于只读状态，所有变更 API（同步更新、控制命令）返回 503，直到关闭维护模式：
@@ -716,6 +759,8 @@ GET http://<worker-host>:<worker-port>/jobs/<mirror-name>/log/stream
 
 未知的镜像名返回 `404`。
 
+> **安全提示**：与 worker 的命令端点（`POST /`）一样，本接口**默认不带鉴权**——任何能访问 worker HTTP 端口的人都可以读取实时同步日志、下发 Stop/Disable/Reload 命令。请把 worker 绑定到内网地址（`listen_addr`）、用防火墙把端口限制在 manager 主机来源、并/或用私有 CA 启用 TLS（`ca_cert`）。**不要**把 worker 端口直接暴露到公网。如果在三个组件上都配置了 `api_token`，则该接口同样会要求 `Authorization: Bearer`，manager 在代理日志流时会自动带上。
+
 ### 接口输出示例
 
 `curl` 命令行：
@@ -780,6 +825,16 @@ es.onerror = (e) => {
 ```
 
 > 这个接口在 worker 上，不在 manager 上。一台 manager 后面挂多台 worker 的话，需要通过 manager 的 `GET /workers/:id/jobs` 找到镜像所在的 worker，然后再去连那台 worker 的 `/jobs/:name/log/stream`。
+
+### Manager 端代理（推荐用于浏览器前端）
+
+manager 也暴露了同样的路径，会透明地代理到拥有该镜像的 worker：
+
+```
+GET http://<manager-host>:<manager-port>/jobs/<mirror-name>/log/stream
+```
+
+manager 会先查出镜像归属哪个 worker，打开该 worker 的流（如果配置了 `ca_cert` 会复用 TLS 证书锁定），并将事件原样无缓冲转发出来（同时设置 `X-Accel-Buffering: no` 以兼容前置的 nginx）。这样 Web 前端只需要访问 **manager** 来源即可，worker 端口可以保持仅对 manager 主机开放，配合上面那条安全提示。响应：未知镜像 `404`、归属 worker 不可达 `502`，否则原样转发 worker 的事件流。
 
 ## 许可证
 
