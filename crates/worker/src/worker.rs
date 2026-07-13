@@ -279,6 +279,7 @@ pub struct Worker {
     config_path: PathBuf,
     jobs: HashMap<String, MirrorJob>,
     manager: Arc<ManagerClient>,
+    api_token: Arc<RwLock<String>>,
     #[allow(dead_code)] // cloned into job tasks; field not read directly
     status_tx: mpsc::Sender<JobMessage>,
     status_rx: mpsc::Receiver<JobMessage>,
@@ -355,9 +356,10 @@ impl Worker {
             .collect();
         let manager = Arc::new(ManagerClient::new(
             bases,
-            http_client,
+            http_client.clone(),
             cfg.manager.api_token.clone(),
         ));
+        let api_token = Arc::new(RwLock::new(cfg.manager.api_token.clone()));
 
         let provider_list = build_jobs(&cfg);
         let mut jobs = HashMap::new();
@@ -434,6 +436,7 @@ impl Worker {
             config_path,
             jobs,
             manager,
+            api_token,
             status_tx,
             status_rx,
             cmd_tx,
@@ -460,13 +463,13 @@ impl Worker {
 
         // Spawn HTTP server task.
         let http_state = WorkerHttpState {
-            api_token: self.cfg.manager.api_token.clone(),
+            api_token: Arc::clone(&self.api_token),
             cmd_tx: self.cmd_tx.clone(),
             worker_name: worker_id.clone(),
             mirror_names: Arc::clone(&self.mirror_names),
             log_broadcaster: Arc::clone(&self.log_broadcaster),
         };
-        let bind_addr = self.cfg.server.bind_addr();
+        let bind_addr = self.cfg.server.bind_addr().map_err(anyhow::Error::msg)?;
         tokio::spawn(run_http_server(
             http_state,
             bind_addr,
@@ -1076,7 +1079,7 @@ impl Worker {
     /// current mirror list and applies Add / Modify / Delete operations.
     /// Mirrors Go's `Worker.ReloadMirrorConfig`.
     async fn handle_reload(&mut self) {
-        use crate::diff_config::{diff_mirror_config, DiffOp};
+        use crate::diff_config::{diff_mirror_config, DiffOp, MirrorCfgTrans};
 
         // Re-read the config file from disk.
         let mut new_cfg: crate::config::WorkerConfig = match tunasync_common::config::load_toml(
@@ -1091,17 +1094,161 @@ impl Worker {
 
         // Merge include files and flatten nested mirror configs,
         // matching the startup path in lib.rs exactly.
-        crate::load_include_mirrors(&mut new_cfg);
+        let include_errors = crate::load_include_mirrors(&mut new_cfg);
+        if !include_errors.is_empty() {
+            tracing::error!(
+                errors = ?include_errors,
+                "hot-reload: include loading failed — keeping current config"
+            );
+            return;
+        }
         new_cfg.mirrors = crate::config::flatten_mirrors(&new_cfg.mirrors_conf);
 
-        let diff = diff_mirror_config(&self.cfg.mirrors, &new_cfg.mirrors);
-
-        if diff.is_empty() {
-            tracing::info!("hot-reload: config unchanged");
+        let config_errors = crate::validate_worker_config(&new_cfg);
+        if !config_errors.is_empty() {
+            tracing::error!(
+                errors = ?config_errors,
+                "hot-reload: config validation failed — keeping current config"
+            );
             return;
         }
 
-        tracing::info!(changes = diff.len(), "hot-reload: applying config diff");
+        if new_cfg.global.name != self.cfg.global.name {
+            tracing::warn!(
+                old = %self.cfg.global.name,
+                new = %new_cfg.global.name,
+                "hot-reload: worker name change requires a restart — keeping current name"
+            );
+            new_cfg.global.name = self.cfg.global.name.clone();
+        }
+
+        let provider_globals_changed = self.cfg.global.log_dir != new_cfg.global.log_dir
+            || self.cfg.global.mirror_dir != new_cfg.global.mirror_dir
+            || self.cfg.global.interval != new_cfg.global.interval
+            || self.cfg.global.retry != new_cfg.global.retry
+            || self.cfg.global.timeout != new_cfg.global.timeout
+            || self.cfg.global.rsync_options != new_cfg.global.rsync_options
+            || self.cfg.global.exec_on_success != new_cfg.global.exec_on_success
+            || self.cfg.global.exec_on_failure != new_cfg.global.exec_on_failure
+            || self.cfg.global.dangerous_global_success_exit_codes
+                != new_cfg.global.dangerous_global_success_exit_codes
+            || self.cfg.global.dangerous_global_rsync_success_exit_codes
+                != new_cfg.global.dangerous_global_rsync_success_exit_codes
+            || self.cfg.global.staging_dir != new_cfg.global.staging_dir
+            || serde_json::to_vec(&(
+                &self.cfg.cgroup,
+                &self.cfg.zfs,
+                &self.cfg.btrfs_snapshot,
+                &self.cfg.docker,
+            ))
+            .ok()
+                != serde_json::to_vec(&(
+                    &new_cfg.cgroup,
+                    &new_cfg.zfs,
+                    &new_cfg.btrfs_snapshot,
+                    &new_cfg.docker,
+                ))
+                .ok();
+
+        let mut diff = diff_mirror_config(&self.cfg.mirrors, &new_cfg.mirrors);
+        if provider_globals_changed {
+            let already_changed: HashSet<&str> = diff
+                .iter()
+                .map(|trans| trans.config.name.as_str())
+                .collect();
+            let inherited_changes: Vec<MirrorCfgTrans> = new_cfg
+                .mirrors
+                .iter()
+                .filter(|mc| {
+                    self.cfg.mirrors.iter().any(|old| old.name == mc.name)
+                        && !already_changed.contains(mc.name.as_str())
+                })
+                .cloned()
+                .map(|config| MirrorCfgTrans {
+                    op: DiffOp::Modify,
+                    config,
+                })
+                .collect();
+            diff.extend(inherited_changes);
+        }
+
+        if diff.is_empty() {
+            tracing::info!("hot-reload: mirror config unchanged; applying global settings");
+        } else {
+            tracing::info!(changes = diff.len(), "hot-reload: applying config diff");
+        }
+
+        // Prepare every replacement before mutating any live job. This makes
+        // provider construction transactional across the whole reload: one
+        // invalid mirror cannot leave half the worker on the new config and
+        // half on the old config.
+        let mut prepared = HashMap::new();
+        for trans in &diff {
+            if matches!(trans.op, DiffOp::Add | DiffOp::Modify) {
+                match (self.build_one_provider)(&trans.config, &new_cfg) {
+                    Ok(built) => {
+                        prepared.insert(trans.config.name.clone(), built);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            mirror = %trans.config.name,
+                            error = %e,
+                            "hot-reload: provider preparation failed — keeping current config"
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Apply per-upstream concurrency changes before spawning replacement
+        // jobs so Add/Modify transitions in this reload see the new limits.
+        {
+            let old_limits = &self.cfg.global.per_upstream_concurrent;
+            let requested_limits = new_cfg.global.per_upstream_concurrent.clone();
+
+            let removed: Vec<String> = old_limits
+                .keys()
+                .filter(|h| !requested_limits.contains_key(*h))
+                .cloned()
+                .collect();
+            for host in &removed {
+                self.per_upstream_semaphores.remove(host);
+                tracing::info!(
+                    host = %host,
+                    "hot-reload: removed per-upstream concurrency limit"
+                );
+            }
+
+            for (host, &new_limit) in &requested_limits {
+                let new_limit = new_limit.max(1);
+                match old_limits.get(host) {
+                    None => {
+                        self.per_upstream_semaphores
+                            .insert(host.clone(), Arc::new(Semaphore::new(new_limit)));
+                    }
+                    Some(&old) => {
+                        let old_limit = old.max(1);
+                        if new_limit > old_limit {
+                            if let Some(sem) = self.per_upstream_semaphores.get(host) {
+                                sem.add_permits(new_limit - old_limit);
+                            }
+                        } else if new_limit < old_limit {
+                            new_cfg
+                                .global
+                                .per_upstream_concurrent
+                                .insert(host.clone(), old_limit);
+                            tracing::warn!(
+                                host = %host,
+                                from = old_limit,
+                                to = new_limit,
+                                "hot-reload: cannot shrink per-upstream concurrency limit until restart"
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         for trans in &diff {
             let name = &trans.config.name;
@@ -1124,15 +1271,12 @@ impl Worker {
                     tracing::info!(mirror = %name, "hot-reload: deleted job");
                 }
                 DiffOp::Modify => {
+                    let (mut provider, hooks) = prepared
+                        .remove(name)
+                        .expect("modified provider prepared before applying reload");
+
                     // Remember the old job's state so we can preserve it.
                     let old_state = self.jobs.get(name).map(|j| j.state());
-
-                    // Snapshot the old config so we can roll back if the new
-                    // provider fails to build. Without a rollback, cfg.mirrors
-                    // would contain the bad new config and subsequent reloads
-                    // would diff against it, keeping the mirror permanently stuck.
-                    let old_config_snapshot =
-                        self.cfg.mirrors.iter().find(|m| &m.name == name).cloned();
 
                     // Preserve historical telemetry (last_update, size,
                     // last_started, last_ended, transferred_bytes counters)
@@ -1158,94 +1302,42 @@ impl Worker {
                         self.cfg.mirrors.push(trans.config.clone());
                     }
 
-                    // Build new provider + hooks and spawn a new MirrorJob.
-                    match (self.build_one_provider)(&trans.config, &self.cfg) {
-                        Ok((mut provider, hooks)) => {
-                            provider.set_log_publisher(self.log_broadcaster.publisher_for(name));
-                            let upstream = provider.upstream().to_owned();
-                            let is_master = provider.is_master();
+                    provider.set_log_publisher(self.log_broadcaster.publisher_for(name));
+                    let upstream = provider.upstream().to_owned();
+                    let is_master = provider.is_master();
 
-                            // Merge preserved telemetry with the new
-                            // provider-derived fields. If there was no
-                            // previous status (Modify applied to a mirror
-                            // that wasn't in our map for some reason — e.g.
-                            // first-time reload before initial status report),
-                            // fall back to a zero-value status.
-                            //
-                            // N3: scheduled must be reset to now(). The
-                            // Modify branch enqueues with Instant::now()
-                            // below, so the next sync fires immediately —
-                            // preserving the stale scheduled value from the
-                            // previous status would make the manager UI
-                            // show a future or past time that bears no
-                            // relation to reality. All other historical
-                            // telemetry (last_update, size, transferred
-                            // bytes, etc.) is preserved as designed.
-                            let now_utc = Utc::now();
-                            let merged = if let Some(mut prev) = preserved {
-                                prev.upstream = upstream;
-                                prev.is_master = is_master;
-                                prev.scheduled = now_utc;
-                                prev
-                            } else {
-                                MirrorStatus {
-                                    name: name.clone(),
-                                    worker: self.cfg.global.name.clone(),
-                                    is_master,
-                                    upstream,
-                                    scheduled: now_utc,
-                                    ..Default::default()
-                                }
-                            };
-                            self.mirror_statuses.insert(name.clone(), merged);
+                    // Merge preserved telemetry with the new provider-derived
+                    // fields and reset the visible schedule to the immediate
+                    // run enqueued below.
+                    let now_utc = Utc::now();
+                    let merged = if let Some(mut prev) = preserved {
+                        prev.upstream = upstream;
+                        prev.is_master = is_master;
+                        prev.scheduled = now_utc;
+                        prev
+                    } else {
+                        MirrorStatus {
+                            name: name.clone(),
+                            worker: new_cfg.global.name.clone(),
+                            is_master,
+                            upstream,
+                            scheduled: now_utc,
+                            ..Default::default()
+                        }
+                    };
+                    self.mirror_statuses.insert(name.clone(), merged);
 
-                            let upstream_sem2 = upstream_host(provider.upstream())
-                                .and_then(|h| self.per_upstream_semaphores.get(&h).cloned());
-                            let job = MirrorJob::spawn(
-                                provider,
-                                hooks,
-                                self.status_tx.clone(),
-                                Arc::clone(&self.semaphore),
-                                upstream_sem2,
-                                trans.config.priority,
-                            );
-                            self.jobs.insert(name.clone(), job);
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                mirror = %name,
-                                error = %e,
-                                "hot-reload: failed to rebuild provider — rolling back config"
-                            );
-                            // Roll back cfg.mirrors to the old config so the
-                            // next hot-reload's diff sees the correct baseline.
-                            // Without rollback, the bad new config stays in
-                            // cfg.mirrors and the mirror is invisible to the
-                            // scheduler until the next successful reload.
-                            if let Some(old_cfg) = old_config_snapshot {
-                                if let Some(pos) =
-                                    self.cfg.mirrors.iter().position(|m| &m.name == name)
-                                {
-                                    self.cfg.mirrors[pos] = old_cfg;
-                                } else {
-                                    self.cfg.mirrors.push(old_cfg);
-                                }
-                            }
-                            // Also restore the status map so the mirror
-                            // remains visible in the manager UI with a
-                            // descriptive error message.
-                            let mut failed_status = preserved.unwrap_or_else(|| MirrorStatus {
-                                name: name.clone(),
-                                worker: self.cfg.global.name.clone(),
-                                ..Default::default()
-                            });
-                            failed_status.status = SyncStatus::Failed;
-                            failed_status.error_msg =
-                                format!("hot-reload: failed to rebuild provider: {e}");
-                            self.mirror_statuses.insert(name.clone(), failed_status);
-                            continue;
-                        }
-                    }
+                    let upstream_sem2 = upstream_host(provider.upstream())
+                        .and_then(|h| self.per_upstream_semaphores.get(&h).cloned());
+                    let job = MirrorJob::spawn(
+                        provider,
+                        hooks,
+                        self.status_tx.clone(),
+                        Arc::clone(&self.semaphore),
+                        upstream_sem2,
+                        trans.config.priority,
+                    );
+                    self.jobs.insert(name.clone(), job);
 
                     // Preserve the old job's state (matches Go's ReloadMirrorConfig
                     // which checks the previous state when re-spawning a modified job).
@@ -1270,43 +1362,36 @@ impl Worker {
                     }
                 }
                 DiffOp::Add => {
+                    let (mut provider, hooks) = prepared
+                        .remove(name)
+                        .expect("new provider prepared before applying reload");
                     self.cfg.mirrors.push(trans.config.clone());
+                    provider.set_log_publisher(self.log_broadcaster.publisher_for(name));
+                    let upstream = provider.upstream().to_owned();
+                    let is_master = provider.is_master();
 
-                    // Build provider + hooks and spawn new MirrorJob.
-                    match (self.build_one_provider)(&trans.config, &self.cfg) {
-                        Ok((mut provider, hooks)) => {
-                            provider.set_log_publisher(self.log_broadcaster.publisher_for(name));
-                            let upstream = provider.upstream().to_owned();
-                            let is_master = provider.is_master();
+                    self.mirror_statuses.insert(
+                        name.clone(),
+                        MirrorStatus {
+                            name: name.clone(),
+                            worker: new_cfg.global.name.clone(),
+                            is_master,
+                            upstream,
+                            ..Default::default()
+                        },
+                    );
 
-                            self.mirror_statuses.insert(
-                                name.clone(),
-                                MirrorStatus {
-                                    name: name.clone(),
-                                    worker: self.cfg.global.name.clone(),
-                                    is_master,
-                                    upstream,
-                                    ..Default::default()
-                                },
-                            );
-
-                            let upstream_sem3 = upstream_host(provider.upstream())
-                                .and_then(|h| self.per_upstream_semaphores.get(&h).cloned());
-                            let job = MirrorJob::spawn(
-                                provider,
-                                hooks,
-                                self.status_tx.clone(),
-                                Arc::clone(&self.semaphore),
-                                upstream_sem3,
-                                trans.config.priority,
-                            );
-                            self.jobs.insert(name.clone(), job);
-                        }
-                        Err(e) => {
-                            tracing::error!(mirror = %name, error = %e, "hot-reload: failed to build new provider");
-                            continue;
-                        }
-                    }
+                    let upstream_sem3 = upstream_host(provider.upstream())
+                        .and_then(|h| self.per_upstream_semaphores.get(&h).cloned());
+                    let job = MirrorJob::spawn(
+                        provider,
+                        hooks,
+                        self.status_tx.clone(),
+                        Arc::clone(&self.semaphore),
+                        upstream_sem3,
+                        trans.config.priority,
+                    );
+                    self.jobs.insert(name.clone(), job);
 
                     tracing::info!(mirror = %name, "hot-reload: new job");
                     self.schedule.push(name.clone(), std::time::Instant::now());
@@ -1331,6 +1416,7 @@ impl Worker {
                 "hot-reload: increased concurrency limit"
             );
         } else if new_concurrent < old_concurrent {
+            new_cfg.global.concurrent = old_concurrent;
             tracing::warn!(
                 from = old_concurrent,
                 to = new_concurrent,
@@ -1339,104 +1425,81 @@ impl Worker {
             );
         }
 
-        // Apply per-upstream concurrency changes. Mirrors per-mirror
-        // semantics of the global semaphore reload above:
-        //
-        // * New host         → insert a new Semaphore. Visible to subsequent
-        //                      MirrorJob::spawn() calls (including any
-        //                      Modify or Add transitions in this same diff).
-        // * Removed host     → drop the map entry. Currently-running jobs
-        //                      that hold a clone of the old Arc continue to
-        //                      use it until they finish — we cannot revoke a
-        //                      permit that is in active use. Subsequent
-        //                      respawns of those jobs (Modify, restart) will
-        //                      pick up None and run unconstrained.
-        // * Limit increased  → add_permits on the existing Arc, so already-
-        //                      spawned jobs that share the Arc see the new
-        //                      ceiling immediately.
-        // * Limit decreased  → warn. tokio's Semaphore has no
-        //                      `remove_permits` analogue, and silently
-        //                      revoking a permit held by a running sync
-        //                      would deadlock that sync. Operator must
-        //                      restart the worker to shrink.
-        //
-        // Important: read the OLD limits from `self.cfg.global` *before*
-        // we overwrite it with `new_cfg.global` lower down.
-        {
-            let old_limits = &self.cfg.global.per_upstream_concurrent;
-            let new_limits = &new_cfg.global.per_upstream_concurrent;
-
-            // Removed hosts.
-            let removed: Vec<String> = old_limits
-                .keys()
-                .filter(|h| !new_limits.contains_key(*h))
-                .cloned()
-                .collect();
-            for host in &removed {
-                self.per_upstream_semaphores.remove(host);
-                tracing::info!(
-                    host = %host,
-                    "hot-reload: removed per-upstream concurrency limit \
-                     (running jobs keep the old limit until they finish or restart)"
-                );
-            }
-
-            // New / modified hosts.
-            for (host, &new_limit) in new_limits {
-                let new_limit = new_limit.max(1);
-                match old_limits.get(host) {
-                    None => {
-                        self.per_upstream_semaphores
-                            .insert(host.clone(), Arc::new(Semaphore::new(new_limit)));
-                        tracing::info!(
-                            host = %host,
-                            limit = new_limit,
-                            "hot-reload: added per-upstream concurrency limit \
-                             (existing jobs for this host are not retroactively constrained)"
-                        );
-                    }
-                    Some(&old) => {
-                        let old_limit = old.max(1);
-                        if new_limit > old_limit {
-                            let added = new_limit - old_limit;
-                            if let Some(sem) = self.per_upstream_semaphores.get(host) {
-                                sem.add_permits(added);
-                            }
+        let manager_changed = new_cfg.manager.api_base_list() != self.cfg.manager.api_base_list()
+            || new_cfg.manager.api_token != self.cfg.manager.api_token
+            || new_cfg.manager.ca_cert != self.cfg.manager.ca_cert;
+        if manager_changed {
+            let client = if new_cfg.manager.ca_cert.is_empty() {
+                tunasync_common::http::HttpClientBuilder::new().build()
+            } else {
+                tunasync_common::http::HttpClientBuilder::new()
+                    .ca_cert_pem_from_path(std::path::Path::new(&new_cfg.manager.ca_cert))
+                    .and_then(|builder| builder.build())
+            };
+            match client {
+                Ok(client) => {
+                    let bases: Vec<String> = new_cfg
+                        .manager
+                        .api_base_list()
+                        .into_iter()
+                        .map(String::from)
+                        .collect();
+                    let candidate = ManagerClient::new(
+                        bases.clone(),
+                        client.clone(),
+                        new_cfg.manager.api_token.clone(),
+                    );
+                    let status = WorkerStatus {
+                        id: self.cfg.global.name.clone(),
+                        url: self.cfg.server.public_url(&self.cfg),
+                        token: String::new(),
+                        last_online: zero_time(),
+                        last_register: zero_time(),
+                    };
+                    match candidate.register(&status).await {
+                        Ok(_) => {
+                            self.manager.reconfigure(
+                                bases,
+                                client,
+                                new_cfg.manager.api_token.clone(),
+                            );
+                            *self.api_token.write().await = new_cfg.manager.api_token.clone();
                             tracing::info!(
-                                host = %host,
-                                from = old_limit,
-                                to = new_limit,
-                                added,
-                                "hot-reload: grew per-upstream concurrency limit"
+                                "hot-reload: registered with and switched to updated manager configuration"
                             );
-                        } else if new_limit < old_limit {
-                            tracing::warn!(
-                                host = %host,
-                                from = old_limit,
-                                to = new_limit,
-                                "hot-reload: cannot shrink per-upstream concurrency limit \
-                                 on a running worker — keeping {old_limit} until restart"
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "hot-reload: updated manager registration failed — keeping old manager config"
                             );
+                            new_cfg.manager = self.cfg.manager.clone();
                         }
                     }
                 }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "hot-reload: failed to rebuild manager HTTP client — keeping old manager config"
+                    );
+                    new_cfg.manager = self.cfg.manager.clone();
+                }
             }
-        }
-
-        // Detect manager-list changes. The ManagerClient was built at startup
-        // with a fixed list of base URLs (it does not currently support
-        // runtime swap), so we cannot honour this change without a restart.
-        // At least tell the operator instead of silently doing nothing.
-        if new_cfg.manager.api_base_list() != self.cfg.manager.api_base_list() {
-            tracing::warn!(
-                "hot-reload: manager URL list changed in config but the running \
-                 worker still uses the old list — restart the worker to apply"
-            );
         }
 
         // Update global config (interval/retry defaults etc.) from new file.
         self.cfg.global = new_cfg.global;
         self.cfg.manager = new_cfg.manager;
+        if new_cfg.server.addr != self.cfg.server.addr
+            || new_cfg.server.port != self.cfg.server.port
+            || new_cfg.server.ssl_cert != self.cfg.server.ssl_cert
+            || new_cfg.server.ssl_key != self.cfg.server.ssl_key
+            || new_cfg.server.hostname != self.cfg.server.hostname
+        {
+            tracing::warn!(
+                "hot-reload: worker HTTP server settings changed but require a restart — keeping current listener"
+            );
+        }
 
         // Keep mirror_names in sync so the HTTP handler can validate new mirrors.
         {
@@ -2070,68 +2133,24 @@ mod cron_schedule_tests {
         assert!(!cfg_mirrors.iter().any(|m| m.name == "delete"));
     }
 
-    /// When hot-reload Modify fails to build the provider, cfg.mirrors must
-    /// be rolled back to the old config so subsequent reloads diff against
-    /// the correct baseline, and mirror_statuses must still contain an entry
-    /// (with a Failed status and error message) so the mirror remains visible
-    /// in the manager UI.
+    /// A failed replacement build must leave the live config and status
+    /// untouched because production now validates before removing the old job.
     #[test]
-    fn hot_reload_modify_provider_failure_rolls_back_cfg() {
-        use std::collections::HashMap;
-        use tunasync_protocol::{MirrorStatus, SyncStatus};
-
-        let mirror_name = "failing-mirror".to_string();
-
-        // Simulate: cfg had the old config.
+    fn hot_reload_modify_provider_failure_keeps_current_state() {
         let mut old_cfg = MirrorConfig::default();
-        old_cfg.name = mirror_name.clone();
+        old_cfg.name = "failing-mirror".into();
         old_cfg.upstream = "rsync://old/".into();
-        let old_config_snapshot = Some(old_cfg.clone());
-
-        // Simulate: cfg was already updated to new config before build attempt.
-        let mut new_cfg = MirrorConfig::default();
-        new_cfg.name = mirror_name.clone();
-        new_cfg.upstream = "rsync://new-broken/".into();
-        let mut cfg_mirrors: Vec<MirrorConfig> = vec![new_cfg];
-
-        // Simulate: mirror_statuses was cleared before build attempt.
-        let mut mirror_statuses: HashMap<String, MirrorStatus> = HashMap::new();
-
-        // Previously-preserved status.
-        let preserved = MirrorStatus {
-            name: mirror_name.clone(),
-            worker: "w1".into(),
-            status: SyncStatus::Success,
+        let cfg_mirrors = vec![old_cfg.clone()];
+        let status = tunasync_protocol::MirrorStatus {
+            name: old_cfg.name.clone(),
+            status: tunasync_protocol::SyncStatus::Success,
             size: "100G".into(),
             ..Default::default()
         };
 
-        // Simulate the rollback branch (build_one_provider returned Err).
-        let e = anyhow::anyhow!("docker image not found");
-
-        // Roll back cfg.mirrors.
-        if let Some(ref old) = old_config_snapshot {
-            if let Some(pos) = cfg_mirrors.iter().position(|m| m.name == mirror_name) {
-                cfg_mirrors[pos] = old.clone();
-            }
-        }
-
-        // Restore mirror_statuses with Failed status (mirrors what the
-        // production code does when `preserved` is Some).
-        let mut failed_status = preserved;
-        failed_status.status = SyncStatus::Failed;
-        failed_status.error_msg = format!("hot-reload: failed to rebuild provider: {e}");
-        mirror_statuses.insert(mirror_name.clone(), failed_status);
-
-        // cfg.mirrors rolled back to old upstream.
-        assert_eq!(cfg_mirrors.len(), 1);
+        // The error branch executes `continue` before any mutation.
         assert_eq!(cfg_mirrors[0].upstream, "rsync://old/");
-
-        // mirror_statuses restored with Failed + error message.
-        let status = &mirror_statuses[&mirror_name];
-        assert_eq!(status.status, SyncStatus::Failed);
-        assert!(status.error_msg.contains("hot-reload"));
-        // Historical data (size) preserved from the old status.
+        assert_eq!(status.status, tunasync_protocol::SyncStatus::Success);
         assert_eq!(status.size, "100G");
     }
 

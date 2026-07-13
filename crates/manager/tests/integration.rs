@@ -306,6 +306,33 @@ async fn post_json(app: &axum::Router, path: &str, body: &Value) -> (StatusCode,
     (status, json)
 }
 
+async fn post_json_auth(
+    app: &axum::Router,
+    path: &str,
+    body: &Value,
+    token: &str,
+) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::from(serde_json::to_vec(body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, json)
+}
+
 async fn delete_req(app: &axum::Router, path: &str) -> (StatusCode, Value) {
     let resp = app
         .clone()
@@ -705,17 +732,14 @@ async fn update_schedules() {
 }
 
 // ── handle_client_cmd ─────────────────────────────────────────────────────
-// The manager pre-updates the DB (disable → Disabled, stop → Paused) before
-// forwarding to the worker. Since no real worker is listening in these tests
-// the forward will fail with 500, but the DB update has already happened and
-// is visible via GET /jobs.
+// State changes are committed only after the worker accepts the command.
 
 #[tokio::test]
-async fn cmd_disable_pre_updates_status() {
+async fn cmd_disable_failure_does_not_update_status() {
     let app = make_app();
     setup_worker_and_mirror(&app, "w1", "ubuntu").await;
 
-    post_json(
+    let (status, _) = post_json(
         &app,
         "/cmd",
         &serde_json::json!({
@@ -727,17 +751,17 @@ async fn cmd_disable_pre_updates_status() {
         }),
     )
     .await;
-    // Forward to worker fails (no real worker), but DB was pre-updated.
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
     let (_, jobs) = get_json(&app, "/jobs").await;
-    assert_eq!(jobs[0]["status"], "disabled");
+    assert_eq!(jobs[0]["status"], "success");
 }
 
 #[tokio::test]
-async fn cmd_stop_pre_updates_status() {
+async fn cmd_stop_failure_does_not_update_status() {
     let app = make_app();
     setup_worker_and_mirror(&app, "w1", "ubuntu").await;
 
-    post_json(
+    let (status, _) = post_json(
         &app,
         "/cmd",
         &serde_json::json!({
@@ -749,8 +773,70 @@ async fn cmd_stop_pre_updates_status() {
         }),
     )
     .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
     let (_, jobs) = get_json(&app, "/jobs").await;
-    assert_eq!(jobs[0]["status"], "paused");
+    assert_eq!(jobs[0]["status"], "success");
+}
+
+#[tokio::test]
+async fn cmd_success_forwards_token_then_updates_status() {
+    use axum::routing::post;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let saw_token = Arc::new(AtomicBool::new(false));
+    let saw_token_handler = Arc::clone(&saw_token);
+    let worker_app = axum::Router::new().route(
+        "/",
+        post(move |headers: axum::http::HeaderMap| {
+            let saw_token = Arc::clone(&saw_token_handler);
+            async move {
+                let valid = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    == Some("Bearer s3cret");
+                saw_token.store(valid, Ordering::SeqCst);
+                if valid {
+                    StatusCode::OK
+                } else {
+                    StatusCode::UNAUTHORIZED
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let worker_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, worker_app).await.unwrap();
+    });
+
+    let app = make_app_with_token("s3cret");
+    let zero = "0001-01-01T00:00:00Z";
+    let worker = serde_json::json!({
+        "id": "w-token", "url": format!("http://{worker_addr}"), "token": "",
+        "last_online": zero, "last_register": zero,
+    });
+    assert_eq!(
+        post_json_auth(&app, "/workers", &worker, "s3cret").await.0,
+        StatusCode::OK
+    );
+    let job = serde_json::json!({
+        "name": "ubuntu", "worker": "w-token", "is_master": true,
+        "status": "success", "last_update": zero, "last_started": zero,
+        "last_ended": zero, "next_schedule": zero,
+        "upstream": "rsync://example.com/", "size": "1T", "error_msg": ""
+    });
+    post_json_auth(&app, "/workers/w-token/jobs/ubuntu", &job, "s3cret").await;
+
+    let cmd = serde_json::json!({
+        "cmd": "disable", "mirror_id": "ubuntu", "worker_id": "w-token",
+        "args": [], "options": {}
+    });
+    let (status, _) = post_json_auth(&app, "/cmd", &cmd, "s3cret").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(saw_token.load(Ordering::SeqCst));
+    let (_, jobs) = get_json(&app, "/jobs").await;
+    assert_eq!(jobs[0]["status"], "disabled");
 }
 
 #[tokio::test]
@@ -1403,6 +1489,61 @@ async fn sse_proxy_streams_from_owning_worker() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn sse_proxy_forwards_token_to_worker() {
+    use axum::routing::get;
+
+    let worker_app = axum::Router::new().route(
+        "/jobs/{mirror}/log/stream",
+        get(|headers: axum::http::HeaderMap| async move {
+            if headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                != Some("Bearer s3cret")
+            {
+                return (StatusCode::UNAUTHORIZED, "unauthorized");
+            }
+            (StatusCode::OK, "data: secured\n\n")
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let worker_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, worker_app).await.unwrap();
+    });
+
+    let app = make_app_with_token("s3cret");
+    let zero = "0001-01-01T00:00:00Z";
+    let worker = serde_json::json!({
+        "id": "w-secure-sse", "url": format!("http://{worker_addr}"), "token": "",
+        "last_online": zero, "last_register": zero,
+    });
+    post_json_auth(&app, "/workers", &worker, "s3cret").await;
+    let job = serde_json::json!({
+        "name": "secure-sse", "worker": "w-secure-sse", "is_master": true,
+        "status": "syncing", "last_update": zero, "last_started": zero,
+        "last_ended": zero, "next_schedule": zero,
+        "upstream": "rsync://example.com/", "size": "", "error_msg": ""
+    });
+    post_json_auth(
+        &app,
+        "/workers/w-secure-sse/jobs/secure-sse",
+        &job,
+        "s3cret",
+    )
+    .await;
+
+    let req = Request::builder()
+        .uri("/jobs/secure-sse/log/stream")
+        .header("Authorization", "Bearer s3cret")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("data: secured"));
+}
+
 /// When the owning worker is registered but unreachable, the proxy must
 /// fail fast with 502 instead of hanging.
 #[tokio::test]
@@ -1498,6 +1639,13 @@ async fn api_token_gates_mutating_endpoints_only() {
             "{path} must remain public"
         );
     }
+
+    let req = Request::builder()
+        .uri("/jobs/auth-mirror/log/stream")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     // /cmd requires the token.
     let cmd = serde_json::json!({"cmd": 2, "worker_id": "w-auth", "mirror_id": "", "options": {}});

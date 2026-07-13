@@ -61,7 +61,8 @@ fn expand_log_dir_template(log_dir: &str, mc: &config::MirrorConfig) -> String {
 /// Merge Go's `[include]` section glob into `global.include` array, then
 /// expand all glob patterns and merge the resulting mirror configs
 /// into `cfg.mirrors_conf`.  Called at startup and on hot-reload.
-pub fn load_include_mirrors(cfg: &mut config::WorkerConfig) {
+pub fn load_include_mirrors(cfg: &mut config::WorkerConfig) -> Vec<String> {
+    let mut errors = Vec::new();
     // Merge Go-style [include] section into global.include array.
     if !cfg.include.include_mirrors.is_empty() {
         cfg.global.include.push(cfg.include.include_mirrors.clone());
@@ -72,6 +73,7 @@ pub fn load_include_mirrors(cfg: &mut config::WorkerConfig) {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!(pattern = %pattern, error = %e, "invalid include glob");
+                errors.push(format!("invalid include glob {pattern:?}: {e}"));
                 continue;
             }
         };
@@ -80,6 +82,7 @@ pub fn load_include_mirrors(cfg: &mut config::WorkerConfig) {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(error = %e, "error reading include glob entry");
+                    errors.push(format!("error reading include glob {pattern:?}: {e}"));
                     continue;
                 }
             };
@@ -90,10 +93,79 @@ pub fn load_include_mirrors(cfg: &mut config::WorkerConfig) {
                 }
                 Err(e) => {
                     tracing::warn!(file = %path.display(), error = %e, "failed to load include file");
+                    errors.push(format!(
+                        "failed to load include file {}: {e}",
+                        path.display()
+                    ));
                 }
             }
         }
     }
+    errors
+}
+
+fn validate_path_component(value: &str, field: &str, mirror: &str) -> Option<String> {
+    let mut components = std::path::Path::new(value).components();
+    let valid = matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none();
+    (!valid).then(|| {
+        format!("mirror {mirror:?}: {field} must be a single safe path component, got {value:?}")
+    })
+}
+
+fn validate_relative_path(value: &str, field: &str, mirror: &str) -> Option<String> {
+    if value.is_empty() {
+        return None;
+    }
+    let valid = std::path::Path::new(value)
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)));
+    (!valid).then(|| {
+        format!(
+            "mirror {mirror:?}: {field} must be a relative path without '.' or '..', got {value:?}"
+        )
+    })
+}
+
+pub(crate) fn validate_worker_config(cfg: &config::WorkerConfig) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    if let Err(e) = cfg.server.validate_tls() {
+        errors.push(e);
+    }
+    if let Err(e) = cfg.server.bind_addr() {
+        errors.push(e);
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for mc in &cfg.mirrors {
+        if !seen.insert(mc.name.as_str()) {
+            errors.push(format!("duplicate mirror name {:?}", mc.name));
+        }
+        if let Some(e) = validate_path_component(&mc.name, "name", &mc.name) {
+            errors.push(e);
+        }
+        if let Some(e) = validate_relative_path(&mc.mirror_subdir, "mirror_subdir", &mc.name) {
+            errors.push(e);
+        }
+        if !mc.disk_quota.is_empty()
+            && tunasync_common::util::parse_size_bytes(&mc.disk_quota).is_none()
+        {
+            errors.push(format!(
+                "mirror {:?}: invalid disk_quota {:?}",
+                mc.name, mc.disk_quota
+            ));
+        }
+        for spec in &mc.blackout {
+            if crate::blackout::BlackoutWindow::parse(spec).is_none() {
+                errors.push(format!(
+                    "mirror {:?}: unparseable blackout window {:?}",
+                    mc.name, spec
+                ));
+            }
+        }
+    }
+    errors
 }
 
 /// Entry point invoked by `tunasync worker`.
@@ -116,10 +188,18 @@ pub async fn run(config_path: std::path::PathBuf) -> Result<()> {
     }
 
     // Merge include files before building the mirror list.
-    load_include_mirrors(&mut cfg);
+    let include_errors = load_include_mirrors(&mut cfg);
+    if !include_errors.is_empty() {
+        anyhow::bail!("{}", include_errors.join("; "));
+    }
 
     // Flatten nested mirror configs (Go's recursiveMirrors).
     cfg.mirrors = config::flatten_mirrors(&cfg.mirrors_conf);
+
+    let config_errors = validate_worker_config(&cfg);
+    if !config_errors.is_empty() {
+        anyhow::bail!("{}", config_errors.join("; "));
+    }
 
     // Validate cron expressions at startup so a misconfigured mirror fails
     // fast rather than silently falling back to the interval scheduler.
@@ -159,6 +239,12 @@ pub async fn run(config_path: std::path::PathBuf) -> Result<()> {
                 );
             }
         }
+    }
+
+    // Do not start a partially configured worker. Every mirror must build
+    // successfully so a healthy process cannot silently omit broken jobs.
+    for mc in &cfg.mirrors {
+        build_one_provider(mc, &cfg)?;
     }
 
     tracing::info!(
@@ -452,14 +538,13 @@ pub struct ConfigCheckReport {
 /// semantic problems are reported through [`ConfigCheckReport::errors`].
 pub fn check_config(config_path: &std::path::Path) -> Result<ConfigCheckReport> {
     let mut cfg: config::WorkerConfig = tunasync_common::config::load_toml(config_path)?;
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
     if cfg.global.retry == 0 {
         cfg.global.retry = 3;
     }
-    load_include_mirrors(&mut cfg);
+    errors.extend(load_include_mirrors(&mut cfg));
     cfg.mirrors = config::flatten_mirrors(&cfg.mirrors_conf);
-
-    let mut errors = Vec::new();
-    let mut warnings = Vec::new();
 
     // Global-level checks.
     if !cfg.global.timezone.is_empty() {
@@ -478,19 +563,7 @@ pub fn check_config(config_path: &std::path::Path) -> Result<ConfigCheckReport> 
         );
     }
 
-    // Duplicate mirror names break the job map silently (last one wins).
-    {
-        let mut seen = std::collections::HashSet::new();
-        for mc in &cfg.mirrors {
-            if !seen.insert(mc.name.as_str()) {
-                errors.push(format!(
-                    "duplicate mirror name {:?} — later definition overrides \
-                     the earlier one",
-                    mc.name
-                ));
-            }
-        }
-    }
+    errors.extend(validate_worker_config(&cfg));
 
     // Per-mirror checks. Collect everything rather than bailing early.
     for mc in &cfg.mirrors {
@@ -507,17 +580,6 @@ pub fn check_config(config_path: &std::path::Path) -> Result<ConfigCheckReport> 
                 errors.push(format!(
                     "mirror {:?}: timezone {:?} is not a valid IANA timezone: {e}",
                     mc.name, mc.timezone
-                ));
-            }
-        }
-        // Blackout windows are only warn-and-skip at runtime
-        // (`build_blackout_cache`) — surface unparseable ones as errors here
-        // so a typo can't silently disable a maintenance window.
-        for spec in &mc.blackout {
-            if crate::blackout::BlackoutWindow::parse(spec).is_none() {
-                errors.push(format!(
-                    "mirror {:?}: unparseable blackout window {:?}",
-                    mc.name, spec
                 ));
             }
         }

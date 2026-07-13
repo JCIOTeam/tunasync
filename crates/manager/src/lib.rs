@@ -42,6 +42,7 @@ pub async fn run(config_path: std::path::PathBuf) -> Result<()> {
 /// file, matching Go's `LoadConfig` which accepts a `*cli.Context` and
 /// patches the struct fields with CLI flag values.
 pub async fn run_with_config(cfg: ManagerConfig) -> Result<()> {
+    cfg.server.validate_tls().map_err(anyhow::Error::msg)?;
     tracing::info!(
         addr = %cfg.server.addr,
         port = cfg.server.port,
@@ -118,7 +119,7 @@ pub async fn run_with_config(cfg: ManagerConfig) -> Result<()> {
             });
             tracing::info!(
                 stale_after = %cfg.notify.stale_after,
-                webhook = %if cfg.notify.webhook_url.is_empty() { "(disabled)" } else { &cfg.notify.webhook_url },
+                webhook_enabled = !cfg.notify.webhook_url.is_empty(),
                 "stale detector started"
             );
         } else {
@@ -130,7 +131,7 @@ pub async fn run_with_config(cfg: ManagerConfig) -> Result<()> {
     }
 
     let router = build_router(state);
-    let bind_addr = cfg.server.bind_addr();
+    let bind_addr = cfg.server.bind_addr().map_err(anyhow::Error::msg)?;
 
     // Graceful shutdown signal (SIGTERM or SIGINT).
     let shutdown = async {

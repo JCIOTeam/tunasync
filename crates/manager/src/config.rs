@@ -3,7 +3,7 @@
 //! Wire-compatible with Go tunasync's `manager/config.go`. TOML field names
 //! are preserved exactly so existing `manager.conf` files work without change.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -75,13 +75,24 @@ impl ServerConfig {
         14242
     }
 
-    pub fn bind_addr(&self) -> std::net::SocketAddr {
-        let ip: IpAddr = self.addr.parse().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
-        std::net::SocketAddr::new(ip, self.port)
+    pub fn bind_addr(&self) -> Result<std::net::SocketAddr, String> {
+        let ip: IpAddr = self
+            .addr
+            .parse()
+            .map_err(|e| format!("invalid manager listen address {:?}: {e}", self.addr))?;
+        Ok(std::net::SocketAddr::new(ip, self.port))
     }
 
     pub fn tls_enabled(&self) -> bool {
         !self.ssl_cert.is_empty() && !self.ssl_key.is_empty()
+    }
+
+    pub fn validate_tls(&self) -> Result<(), String> {
+        if self.ssl_cert.is_empty() == self.ssl_key.is_empty() {
+            Ok(())
+        } else {
+            Err("manager TLS requires both ssl_cert and ssl_key".into())
+        }
     }
 }
 

@@ -27,12 +27,10 @@
 //!
 //! # Security
 //!
-//! None of these endpoints carry authentication (matching the Go original).
-//! Anyone who can reach the worker port can pause/disable/reload mirrors and
-//! read live sync logs. Deployments MUST restrict reachability: bind to an
-//! internal `listen_addr`, firewall the port to the manager host(s), and/or
-//! enable TLS with a private CA so only holders of the CA-signed cert chain
-//! can connect.
+//! When `[manager] api_token` is configured, command and log-stream requests
+//! require the same bearer token used between the worker and manager. Without
+//! a token, deployments must restrict reachability with `listen_addr` and a
+//! firewall; TLS alone encrypts traffic but does not authenticate callers.
 
 use std::collections::HashSet;
 use std::convert::Infallible;
@@ -75,7 +73,7 @@ struct MsgResponse {
 pub struct WorkerHttpState {
     /// Shared API token (empty = auth disabled). Required on `POST /` and
     /// the SSE log stream when set; `GET /jobs` stays public.
-    pub api_token: String,
+    pub api_token: Arc<RwLock<String>>,
     /// Channel to forward validated commands to the scheduler.
     pub cmd_tx: mpsc::Sender<WorkerCmd>,
     /// Worker name (for informational GET /jobs response).
@@ -109,11 +107,12 @@ pub fn build_router(state: WorkerHttpState) -> Router {
 /// auth is disabled). Sync logs can contain upstream URLs/credentials in
 /// error output, and `POST /` can stop/disable/reload mirrors — both must
 /// be gated once a token is configured.
-fn check_auth(state: &WorkerHttpState, headers: &axum::http::HeaderMap) -> Option<Response> {
+async fn check_auth(state: &WorkerHttpState, headers: &axum::http::HeaderMap) -> Option<Response> {
     let auth = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    if tunasync_common::util::check_bearer(auth, &state.api_token) {
+    let token = state.api_token.read().await;
+    if tunasync_common::util::check_bearer(auth, &token) {
         None
     } else {
         Some(
@@ -141,7 +140,7 @@ async fn handle_cmd(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    if let Some(resp) = check_auth(&state, &headers) {
+    if let Some(resp) = check_auth(&state, &headers).await {
         return resp;
     }
     // Parse JSON — Go returns 400 on invalid JSON.
@@ -239,7 +238,7 @@ async fn stream_log(
     Path(mirror): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    if let Some(resp) = check_auth(&state, &headers) {
+    if let Some(resp) = check_auth(&state, &headers).await {
         return resp;
     }
     // 404 fast-path for unknown mirrors — symmetric with the POST handler.
@@ -338,7 +337,7 @@ mod sse_tests {
         let mirror_names = Arc::new(RwLock::new(names));
         let log_broadcaster = LogBroadcaster::new();
         let state = WorkerHttpState {
-            api_token: String::new(),
+            api_token: Arc::new(RwLock::new(String::new())),
             cmd_tx,
             worker_name: "test".to_owned(),
             mirror_names,

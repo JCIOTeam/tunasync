@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use tunasync_protocol::{MirrorSchedules, MirrorStatus, WorkerCmd, WorkerStatus};
 
-/// Reports that failed to reach ANY manager base and are awaiting replay.
+/// Reports that failed to reach one or more manager bases and await replay.
 ///
 /// Coalesced: only the LATEST status/size per mirror and the latest
 /// schedules snapshot are kept, so the buffer is bounded by mirror count
@@ -33,35 +33,62 @@ impl PendingReports {
 ///
 /// One instance is shared across the worker via `Arc<ManagerClient>`.
 ///
-/// Reports that fail against ALL manager bases are stashed in a pending
+/// Reports that fail against one or more manager bases are stashed in a pending
 /// buffer and replayed by [`ManagerClient::flush_pending`] (called from the
 /// heartbeat task once the manager is reachable again), so a manager outage
 /// no longer permanently loses terminal sync states or traffic stats.
 pub struct ManagerClient {
+    connection: parking_lot::RwLock<ManagerConnection>,
+    registration: parking_lot::RwLock<Option<WorkerStatus>>,
+    pending: tokio::sync::Mutex<PendingReports>,
+    /// Serialize live delivery with pending replay. Without this, a stale
+    /// snapshot taken by flush_pending could arrive after a newer live report
+    /// and overwrite manager state.
+    delivery: tokio::sync::Mutex<()>,
+}
+
+#[derive(Clone)]
+struct ManagerConnection {
     bases: Vec<String>,
     client: Client,
-    /// `Authorization: Bearer` token attached to every request when
-    /// non-empty (see `[manager] api_token` in worker.conf).
     token: String,
-    pending: tokio::sync::Mutex<PendingReports>,
+}
+
+struct PostAllResult {
+    attempted: usize,
+    errors: Vec<(String, anyhow::Error)>,
 }
 
 impl ManagerClient {
     pub fn new(bases: Vec<String>, client: Client, token: String) -> Self {
         Self {
-            bases,
-            client,
-            token,
+            connection: parking_lot::RwLock::new(ManagerConnection {
+                bases,
+                client,
+                token,
+            }),
+            registration: parking_lot::RwLock::new(None),
             pending: tokio::sync::Mutex::new(PendingReports::default()),
+            delivery: tokio::sync::Mutex::new(()),
         }
     }
 
+    /// Replace manager endpoints and credentials without dropping buffered
+    /// reports or interrupting requests already in flight.
+    pub fn reconfigure(&self, bases: Vec<String>, client: Client, token: String) {
+        *self.connection.write() = ManagerConnection {
+            bases,
+            client,
+            token,
+        };
+    }
+
     /// Attach bearer auth when a token is configured.
-    fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        if self.token.is_empty() {
+    fn auth(req: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
+        if token.is_empty() {
             req
         } else {
-            req.bearer_auth(&self.token)
+            req.bearer_auth(token)
         }
     }
 
@@ -71,14 +98,94 @@ impl ManagerClient {
 
     /// `POST {manager}/workers` — register this worker.
     pub async fn register(&self, status: &WorkerStatus) -> Result<WorkerStatus> {
-        self.post_first("/workers", status).await
+        *self.registration.write() = Some(status.clone());
+        let connection = self.connection.read().clone();
+        let mut first_success = None;
+        let mut last_err = anyhow::anyhow!("no manager URLs configured");
+        for base in &connection.bases {
+            match Self::register_one(&connection, base, status).await {
+                Ok(registered) => {
+                    if first_success.is_none() {
+                        first_success = Some(registered);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(manager = %base, error = %e, "manager registration failed");
+                    last_err = e;
+                }
+            }
+        }
+        first_success.ok_or(last_err)
     }
 
     /// `POST {manager}/workers/{worker_id}/heartbeat` — keep last_online fresh.
     pub async fn heartbeat(&self, worker_id: &str) -> Result<()> {
-        let path = format!("/workers/{worker_id}/heartbeat");
-        let _: serde_json::Value = self.post_first(&path, &serde_json::json!({})).await?;
-        Ok(())
+        let connection = self.connection.read().clone();
+        let registration = self.registration.read().clone();
+        let mut any_success = false;
+        let mut last_err = anyhow::anyhow!("no manager URLs configured");
+
+        for base in &connection.bases {
+            let url = format!("{base}/workers/{worker_id}/heartbeat");
+            let heartbeat = Self::auth(connection.client.post(&url), &connection.token)
+                .timeout(Duration::from_secs(30))
+                .json(&serde_json::json!({}))
+                .send()
+                .await;
+            match heartbeat {
+                Ok(resp) if resp.status().is_success() => {
+                    any_success = true;
+                    continue;
+                }
+                Ok(resp) => {
+                    let code = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    last_err = anyhow::anyhow!("POST {url} returned {code}: {body}");
+                }
+                Err(e) => last_err = e.into(),
+            }
+
+            // A manager that was unavailable during startup has no worker row,
+            // so replaying reports alone can never recover it. Register again
+            // as soon as that manager becomes reachable.
+            if let Some(status) = &registration {
+                match Self::register_one(&connection, base, status).await {
+                    Ok(_) => {
+                        any_success = true;
+                        tracing::info!(manager = %base, worker = %worker_id, "re-registered worker with manager");
+                    }
+                    Err(e) => last_err = e,
+                }
+            }
+        }
+
+        if any_success {
+            Ok(())
+        } else {
+            Err(last_err)
+        }
+    }
+
+    async fn register_one(
+        connection: &ManagerConnection,
+        base: &str,
+        status: &WorkerStatus,
+    ) -> Result<WorkerStatus> {
+        let url = format!("{base}/workers");
+        let resp = Self::auth(connection.client.post(&url), &connection.token)
+            .timeout(Duration::from_secs(30))
+            .json(status)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let code = resp.status();
+        if !code.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("POST {url} returned {code}: {body}");
+        }
+        resp.json::<WorkerStatus>()
+            .await
+            .with_context(|| format!("decode registration response from {url}"))
     }
 
     // ------------------------------------------------------------------
@@ -92,18 +199,31 @@ impl ManagerClient {
         worker_id: &str,
         status: &MirrorStatus,
     ) -> Result<MirrorStatus> {
+        let _delivery = self.delivery.lock().await;
+        self.report_status_unlocked(worker_id, status).await
+    }
+
+    async fn report_status_unlocked(
+        &self,
+        worker_id: &str,
+        status: &MirrorStatus,
+    ) -> Result<MirrorStatus> {
         let path = format!("/workers/{worker_id}/jobs/{}", status.name);
-        let errs = self.post_all(&path, status).await;
-        if errs.is_empty() {
+        let result = self.post_all(&path, status).await;
+        if result.errors.is_empty() {
             // A fresh report supersedes any stashed (older) one.
             self.pending.lock().await.statuses.remove(&status.name);
             Ok(status.clone())
-        } else if errs.len() < self.bases.len() {
+        } else if result.errors.len() < result.attempted {
             // At least one base succeeded — partial failure is acceptable.
-            for (url, e) in &errs {
+            for (url, e) in &result.errors {
                 tracing::warn!(url = %url, error = %e, "partial status report failure");
             }
-            self.pending.lock().await.statuses.remove(&status.name);
+            self.pending
+                .lock()
+                .await
+                .statuses
+                .insert(status.name.clone(), status.clone());
             Ok(status.clone())
         } else {
             // All bases failed — stash the latest status for replay once the
@@ -113,7 +233,7 @@ impl ManagerClient {
                 .await
                 .statuses
                 .insert(status.name.clone(), status.clone());
-            Err(errs.into_iter().last().unwrap().1)
+            Err(result.errors.into_iter().last().unwrap().1)
         }
     }
 
@@ -126,6 +246,7 @@ impl ManagerClient {
     /// the pending entry on its own success, and manager-side state is
     /// last-write-wins anyway).
     pub async fn flush_pending(&self, worker_id: &str) {
+        let _delivery = self.delivery.lock().await;
         // Take a snapshot so we don't hold the lock across network I/O.
         let snapshot = {
             let mut p = self.pending.lock().await;
@@ -142,26 +263,36 @@ impl ManagerClient {
         );
         for (_, status) in snapshot.statuses {
             // report_status re-stashes on failure.
-            let _ = self.report_status(worker_id, &status).await;
+            let _ = self.report_status_unlocked(worker_id, &status).await;
         }
         for (mirror, size) in snapshot.sizes {
-            let _ = self.report_size(worker_id, &mirror, &size).await;
+            let _ = self.report_size_unlocked(worker_id, &mirror, &size).await;
         }
         if let Some(schedules) = snapshot.schedules {
-            let _ = self.report_schedules(worker_id, &schedules).await;
+            let _ = self.report_schedules_unlocked(worker_id, &schedules).await;
         }
     }
 
     /// `POST {manager}/workers/{worker_id}/jobs/{mirror_id}/size` — POST to all bases.
     /// Returns Ok if at least one base succeeded.
     pub async fn report_size(&self, worker_id: &str, mirror_id: &str, size: &str) -> Result<()> {
+        let _delivery = self.delivery.lock().await;
+        self.report_size_unlocked(worker_id, mirror_id, size).await
+    }
+
+    async fn report_size_unlocked(
+        &self,
+        worker_id: &str,
+        mirror_id: &str,
+        size: &str,
+    ) -> Result<()> {
         #[derive(serde::Serialize)]
         struct SizeMsg<'a> {
             name: &'a str,
             size: &'a str,
         }
         let path = format!("/workers/{worker_id}/jobs/{mirror_id}/size");
-        let errs = self
+        let result = self
             .post_all(
                 &path,
                 &SizeMsg {
@@ -170,14 +301,18 @@ impl ManagerClient {
                 },
             )
             .await;
-        if errs.is_empty() {
+        if result.errors.is_empty() {
             self.pending.lock().await.sizes.remove(mirror_id);
             Ok(())
-        } else if errs.len() < self.bases.len() {
-            for (url, e) in &errs {
+        } else if result.errors.len() < result.attempted {
+            for (url, e) in &result.errors {
                 tracing::warn!(url = %url, error = %e, "partial size report failure");
             }
-            self.pending.lock().await.sizes.remove(mirror_id);
+            self.pending
+                .lock()
+                .await
+                .sizes
+                .insert(mirror_id.to_string(), size.to_string());
             Ok(())
         } else {
             self.pending
@@ -185,7 +320,7 @@ impl ManagerClient {
                 .await
                 .sizes
                 .insert(mirror_id.to_string(), size.to_string());
-            Err(errs.into_iter().last().unwrap().1)
+            Err(result.errors.into_iter().last().unwrap().1)
         }
     }
 
@@ -196,19 +331,29 @@ impl ManagerClient {
         worker_id: &str,
         schedules: &MirrorSchedules,
     ) -> Result<()> {
+        let _delivery = self.delivery.lock().await;
+        self.report_schedules_unlocked(worker_id, schedules).await
+    }
+
+    async fn report_schedules_unlocked(
+        &self,
+        worker_id: &str,
+        schedules: &MirrorSchedules,
+    ) -> Result<()> {
         let path = format!("/workers/{worker_id}/schedules");
-        let errs = self.post_all(&path, schedules).await;
-        if errs.is_empty() {
+        let result = self.post_all(&path, schedules).await;
+        if result.errors.is_empty() {
             self.pending.lock().await.schedules = None;
             Ok(())
-        } else if errs.len() < self.bases.len() {
-            for (url, e) in &errs {
+        } else if result.errors.len() < result.attempted {
+            for (url, e) in &result.errors {
                 tracing::warn!(url = %url, error = %e, "partial schedule report failure");
             }
+            self.pending.lock().await.schedules = Some(schedules.clone());
             Ok(())
         } else {
             self.pending.lock().await.schedules = Some(schedules.clone());
-            Err(errs.into_iter().last().unwrap().1)
+            Err(result.errors.into_iter().last().unwrap().1)
         }
     }
 
@@ -218,15 +363,16 @@ impl ManagerClient {
 
     /// POST to ALL manager base URLs, collecting errors. Matches Go's behaviour
     /// where status/schedule updates go to every manager in the list.
-    async fn post_all<Req>(&self, path: &str, body: &Req) -> Vec<(String, anyhow::Error)>
+    async fn post_all<Req>(&self, path: &str, body: &Req) -> PostAllResult
     where
         Req: serde::Serialize,
     {
-        let mut errs = Vec::new();
-        for base in &self.bases {
+        let connection = self.connection.read().clone();
+        let attempted = connection.bases.len();
+        let mut errors = Vec::new();
+        for base in &connection.bases {
             let url = format!("{base}{path}");
-            match self
-                .auth(self.client.post(&url))
+            match Self::auth(connection.client.post(&url), &connection.token)
                 .timeout(Duration::from_secs(30))
                 .json(body)
                 .send()
@@ -234,13 +380,13 @@ impl ManagerClient {
             {
                 Err(e) => {
                     tracing::warn!(url = %url, error = %e, "manager request failed");
-                    errs.push((base.clone(), e.into()));
+                    errors.push((base.clone(), e.into()));
                 }
                 Ok(resp) => {
                     let status = resp.status();
                     if !status.is_success() {
                         let body = resp.text().await.unwrap_or_default();
-                        errs.push((
+                        errors.push((
                             base.clone(),
                             anyhow::anyhow!("POST {url} returned {}: {body}", status),
                         ));
@@ -249,45 +395,7 @@ impl ManagerClient {
                 }
             }
         }
-        errs
-    }
-
-    /// POST to the first available manager base URL, returning the parsed
-    /// response body. Falls through to each base in turn on connection errors.
-    async fn post_first<Req, Res>(&self, path: &str, body: &Req) -> Result<Res>
-    where
-        Req: serde::Serialize,
-        Res: serde::de::DeserializeOwned,
-    {
-        let mut last_err = anyhow::anyhow!("no manager URLs configured");
-        for base in &self.bases {
-            let url = format!("{base}{path}");
-            match self
-                .auth(self.client.post(&url))
-                .timeout(Duration::from_secs(30))
-                .json(body)
-                .send()
-                .await
-            {
-                Err(e) => {
-                    tracing::warn!(url = %url, error = %e, "manager request failed");
-                    last_err = e.into();
-                }
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success() {
-                        return resp
-                            .json::<Res>()
-                            .await
-                            .with_context(|| format!("decode response from {url}"));
-                    } else {
-                        let body = resp.text().await.unwrap_or_default();
-                        last_err = anyhow::anyhow!("POST {url} returned {status}: {body}");
-                    }
-                }
-            }
-        }
-        Err(last_err)
+        PostAllResult { attempted, errors }
     }
 
     // ------------------------------------------------------------------
@@ -311,11 +419,11 @@ impl ManagerClient {
     where
         Res: serde::de::DeserializeOwned,
     {
+        let connection = self.connection.read().clone();
         let mut last_err = anyhow::anyhow!("no manager URLs configured");
-        for base in &self.bases {
+        for base in &connection.bases {
             let url = format!("{base}{path}");
-            match self
-                .auth(self.client.get(&url))
+            match Self::auth(connection.client.get(&url), &connection.token)
                 .timeout(Duration::from_secs(30))
                 .send()
                 .await
@@ -337,5 +445,112 @@ impl ManagerClient {
     /// Helper used by the worker's HTTP server when receiving commands.
     pub fn parse_cmd(bytes: &[u8]) -> Result<WorkerCmd> {
         serde_json::from_slice(bytes).context("parse WorkerCmd")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+    use serde_json::Value;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn reconfigure_switches_endpoint_and_token() {
+        async fn handler(
+            State(expected): State<Arc<String>>,
+            headers: axum::http::HeaderMap,
+            Json(body): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            let auth = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok());
+            if auth != Some(expected.as_str()) {
+                return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})));
+            }
+            (StatusCode::OK, Json(body))
+        }
+
+        async fn server(expected: &str) -> String {
+            let app = Router::new()
+                .route("/workers", post(handler))
+                .with_state(Arc::new(expected.to_string()));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            format!("http://{addr}")
+        }
+
+        let first = server("Bearer first").await;
+        let second = server("Bearer second").await;
+        let client = reqwest::Client::new();
+        let manager = ManagerClient::new(vec![first], client.clone(), "first".into());
+        let status = WorkerStatus {
+            id: "w1".into(),
+            url: "http://127.0.0.1:6000".into(),
+            token: String::new(),
+            last_online: tunasync_protocol::zero_time(),
+            last_register: tunasync_protocol::zero_time(),
+        };
+
+        manager.register(&status).await.unwrap();
+        manager.reconfigure(vec![second], client, "second".into());
+        manager.register(&status).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn heartbeat_re_registers_missing_worker() {
+        #[derive(Default)]
+        struct RegistrationState {
+            registered: AtomicBool,
+        }
+
+        async fn register(
+            State(state): State<Arc<RegistrationState>>,
+            Json(status): Json<WorkerStatus>,
+        ) -> Json<WorkerStatus> {
+            state.registered.store(true, Ordering::SeqCst);
+            Json(status)
+        }
+
+        async fn heartbeat(State(state): State<Arc<RegistrationState>>) -> StatusCode {
+            if state.registered.load(Ordering::SeqCst) {
+                StatusCode::OK
+            } else {
+                StatusCode::BAD_REQUEST
+            }
+        }
+
+        let state = Arc::new(RegistrationState::default());
+        let app = Router::new()
+            .route("/workers", post(register))
+            .route("/workers/{id}/heartbeat", post(heartbeat))
+            .with_state(Arc::clone(&state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let manager = ManagerClient::new(
+            vec![format!("http://{addr}")],
+            reqwest::Client::new(),
+            String::new(),
+        );
+        let status = WorkerStatus {
+            id: "w1".into(),
+            url: "http://127.0.0.1:6000".into(),
+            token: String::new(),
+            last_online: tunasync_protocol::zero_time(),
+            last_register: tunasync_protocol::zero_time(),
+        };
+        manager.register(&status).await.unwrap();
+
+        state.registered.store(false, Ordering::SeqCst);
+        manager.heartbeat("w1").await.unwrap();
+        assert!(state.registered.load(Ordering::SeqCst));
     }
 }

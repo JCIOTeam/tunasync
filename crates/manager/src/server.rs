@@ -135,7 +135,7 @@ pub fn build_router(shared: Arc<AppState>) -> Router {
 /// the public read-only surface used by web frontends and load balancers:
 ///
 /// - `GET/HEAD /ping`           — liveness probes
-/// - `GET/HEAD /jobs...`        — mirror status, detail, SSE log stream
+/// - `GET/HEAD /jobs...`        — mirror status and detail (not SSE logs)
 /// - `GET /metrics`             — Prometheus scrapes
 /// - `GET /maintenance`         — maintenance status read
 ///
@@ -153,12 +153,10 @@ async fn auth_middleware(
     let method = req.method();
     let path = req.uri().path();
     let read_only = method == axum::http::Method::GET || method == axum::http::Method::HEAD;
+    let public_job_read =
+        path == "/jobs" || (path.starts_with("/jobs/") && !path.ends_with("/log/stream"));
     let public = read_only
-        && (path == "/ping"
-            || path == "/jobs"
-            || path.starts_with("/jobs/")
-            || path == "/metrics"
-            || path == "/maintenance");
+        && (path == "/ping" || public_job_read || path == "/metrics" || path == "/maintenance");
     if public {
         return next.run(req).await;
     }
@@ -299,7 +297,13 @@ async fn proxy_job_log_stream(
         .collect();
     let url = format!("{base}/jobs/{encoded}/log/stream");
 
-    let upstream = match state.sse_client.get(&url).send().await {
+    let request = state.sse_client.get(&url);
+    let request = if state.api_token.is_empty() {
+        request
+    } else {
+        request.bearer_auth(&state.api_token)
+    };
+    let upstream = match request.send().await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(mirror = %name, worker = %mirror.worker, url = %url, error = %e,
@@ -734,21 +738,6 @@ async fn handle_client_cmd(
         Ok(w) => w,
     };
 
-    // Pre-update job status for Disable/Stop.
-    let changed = matches!(client_cmd.cmd, CmdVerb::Disable | CmdVerb::Stop);
-    if changed {
-        if let Ok(mut cur) = state.db.get_mirror_status(worker_id, &client_cmd.mirror_id) {
-            cur.status = match client_cmd.cmd {
-                CmdVerb::Disable => SyncStatus::Disabled,
-                CmdVerb::Stop => SyncStatus::Paused,
-                _ => unreachable!(),
-            };
-            let _ = state
-                .db
-                .update_mirror_status(worker_id, &client_cmd.mirror_id, cur);
-        }
-    }
-
     // Forward command to worker.
     let worker_cmd = WorkerCmd {
         cmd: client_cmd.cmd,
@@ -764,15 +753,16 @@ async fn handle_client_cmd(
         "posting command to worker"
     );
 
-    match state
-        .http_client
-        .post(&worker.url)
-        .json(&worker_cmd)
-        .send()
-        .await
-    {
+    let request = state.http_client.post(&worker.url).json(&worker_cmd);
+    let request = if state.api_token.is_empty() {
+        request
+    } else {
+        request.bearer_auth(&state.api_token)
+    };
+
+    match request.send().await {
         Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
             Json(ErrBody {
                 error: format!(
                     "post command to worker {worker_id} ({}) failed: {e}",
@@ -781,7 +771,39 @@ async fn handle_client_cmd(
             }),
         )
             .into_response(),
-        Ok(_) => ok_msg(format!("successfully send command to worker {worker_id}")).into_response(),
+        Ok(resp) if resp.status().is_success() => {
+            if matches!(client_cmd.cmd, CmdVerb::Disable | CmdVerb::Stop) {
+                if let Ok(mut cur) = state.db.get_mirror_status(worker_id, &client_cmd.mirror_id) {
+                    cur.status = match client_cmd.cmd {
+                        CmdVerb::Disable => SyncStatus::Disabled,
+                        CmdVerb::Stop => SyncStatus::Paused,
+                        _ => unreachable!(),
+                    };
+                    if let Err(e) =
+                        state
+                            .db
+                            .update_mirror_status(worker_id, &client_cmd.mirror_id, cur)
+                    {
+                        return db_err(e);
+                    }
+                }
+            }
+            ok_msg(format!("successfully sent command to worker {worker_id}")).into_response()
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrBody {
+                    error: format!(
+                        "worker {worker_id} ({}) rejected command with {status}: {body}",
+                        worker.url
+                    ),
+                }),
+            )
+                .into_response()
+        }
     }
 }
 

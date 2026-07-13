@@ -9,10 +9,12 @@ User=tunasync
 ExecStart=/usr/bin/tunasync manager -c /etc/tunasync/manager.conf --with-systemd
 Restart=on-failure
 RestartSec=5
+RuntimeDirectory=tunasync
+StateDirectory=tunasync
+LogsDirectory=tunasync
 
 # Hardening
 ProtectSystem=strict
-ReadWritePaths=/var/lib/tunasync
 ProtectHome=yes
 NoNewPrivileges=yes
 

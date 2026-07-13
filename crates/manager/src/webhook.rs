@@ -26,7 +26,11 @@ pub async fn send(client: &Client, url: &str, text: &str) {
         text: &'a str,
     }
 
-    debug!(url, text, "sending webhook notification");
+    let destination = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "invalid-url".into());
+    debug!(destination, "sending webhook notification");
 
     match client
         .post(url)
@@ -36,17 +40,17 @@ pub async fn send(client: &Client, url: &str, text: &str) {
         .await
     {
         Ok(resp) if resp.status().is_success() => {
-            debug!(url, "webhook delivered successfully");
+            debug!(destination, "webhook delivered successfully");
         }
         Ok(resp) => {
             warn!(
-                url,
+                destination,
                 status = %resp.status(),
                 "webhook delivery got non-2xx response"
             );
         }
         Err(e) => {
-            warn!(url, error = %e, "webhook delivery failed");
+            warn!(destination, error = %e, "webhook delivery failed");
         }
     }
 }

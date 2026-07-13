@@ -221,7 +221,7 @@ api_token = "use-a-long-random-string"
 api_token = "use-a-long-random-string"   # 也可用 TUNASYNC_API_TOKEN / --api-token
 ```
 
-manager 的公共只读接口对 Web 前端和探针保持开放：`GET /ping`、`GET /jobs*`（包括 SSE 日志代理）、`GET /metrics`、`GET /maintenance`。其余接口——worker 注册/上报、`/cmd`、删除、维护模式开关——在没有令牌时返回 `401`。worker 自身的命令端点和 SSE 流由同一令牌守卫，manager 在转发命令或代理日志流时会自动附带该令牌。
+manager 的公共只读接口对 Web 前端和探针保持开放：`GET /ping`、普通 `GET /jobs*` 状态查询、`GET /metrics`、`GET /maintenance`。SSE 日志代理以及其余接口——worker 注册/上报、`/cmd`、删除、维护模式开关——在没有令牌时返回 `401`。worker 自身的命令端点和 SSE 流由同一令牌守卫，manager 在转发命令或代理日志流时会自动附带该令牌。
 
 ### 配置检查模式
 

@@ -342,13 +342,13 @@ impl ManagerApiConfig {
 // Server section (this worker's own HTTP listener)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     #[serde(default)]
     pub hostname: String,
-    #[serde(default, rename = "listen_addr")]
+    #[serde(default = "ServerConfig::default_addr", rename = "listen_addr")]
     pub addr: String,
-    #[serde(default, rename = "listen_port")]
+    #[serde(default = "ServerConfig::default_port", rename = "listen_port")]
     pub port: u16,
     #[serde(default)]
     pub ssl_cert: String,
@@ -357,17 +357,32 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    pub fn bind_addr(&self) -> std::net::SocketAddr {
-        let ip: std::net::IpAddr = if self.addr.is_empty() {
-            "0.0.0.0".parse().unwrap()
-        } else {
-            self.addr.parse().unwrap_or("0.0.0.0".parse().unwrap())
-        };
-        std::net::SocketAddr::new(ip, if self.port == 0 { 6000 } else { self.port })
+    fn default_addr() -> String {
+        "127.0.0.1".into()
+    }
+
+    fn default_port() -> u16 {
+        6000
+    }
+
+    pub fn bind_addr(&self) -> Result<std::net::SocketAddr, String> {
+        let ip = self
+            .addr
+            .parse()
+            .map_err(|e| format!("invalid worker listen_addr {:?}: {e}", self.addr))?;
+        Ok(std::net::SocketAddr::new(ip, self.port))
     }
 
     pub fn tls_enabled(&self) -> bool {
         !self.ssl_cert.is_empty() && !self.ssl_key.is_empty()
+    }
+
+    pub fn validate_tls(&self) -> Result<(), String> {
+        if self.ssl_cert.is_empty() == self.ssl_key.is_empty() {
+            Ok(())
+        } else {
+            Err("worker TLS requires both ssl_cert and ssl_key".into())
+        }
     }
 
     /// Public URL the manager uses to reach this worker.
@@ -375,15 +390,33 @@ impl ServerConfig {
         let proto = if self.tls_enabled() { "https" } else { "http" };
         let host = if !self.hostname.is_empty() {
             self.hostname.clone()
+        } else if self
+            .addr
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| !ip.is_unspecified())
+        {
+            self.addr.clone()
         } else {
             hostname::get()
                 .ok()
                 .and_then(|h| h.into_string().ok())
                 .unwrap_or_else(|| "localhost".into())
         };
-        let port = if self.port == 0 { 6000 } else { self.port };
+        let port = self.port;
         let _ = cfg; // reserved for future use
         format!("{proto}://{host}:{port}")
+    }
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            hostname: String::new(),
+            addr: Self::default_addr(),
+            port: Self::default_port(),
+            ssl_cert: String::new(),
+            ssl_key: String::new(),
+        }
     }
 }
 
@@ -1022,6 +1055,12 @@ upstream = "rsync://rsync.archlinux.org/archlinux/"
 "#;
         let cfg: WorkerConfig = tunasync_common::config::parse_toml(toml).unwrap();
         assert_eq!(cfg.mirrors_conf[0].provider, ProviderKind::TwoStageRsync);
+    }
+
+    #[test]
+    fn default_public_url_uses_loopback_listener() {
+        let cfg = WorkerConfig::default();
+        assert_eq!(cfg.server.public_url(&cfg), "http://127.0.0.1:6000");
     }
 
     #[test]
