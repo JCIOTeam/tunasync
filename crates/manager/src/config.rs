@@ -58,8 +58,9 @@ pub struct ServerConfig {
 
     /// Shared API token. When non-empty, all mutating / worker-facing
     /// endpoints require `Authorization: Bearer <api_token>`. Read-only
-    /// frontend endpoints (`GET /ping`, `GET /jobs*`, `GET /metrics`,
-    /// `GET /maintenance`) stay public. Set the SAME value in every
+    /// frontend endpoints (`GET /ping`, ordinary `GET /jobs*`, `GET /metrics`,
+    /// `GET /maintenance`) stay public; the SSE log proxy is authenticated.
+    /// Set the SAME value in every
     /// worker's `[manager] api_token` and in tunasynctl.
     #[serde(default)]
     pub api_token: String,

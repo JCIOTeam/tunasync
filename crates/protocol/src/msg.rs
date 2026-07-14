@@ -76,8 +76,7 @@ pub struct MirrorStatus {
     pub last_transferred_bytes: u64,
 
     /// Running total of bytes transferred across all syncs of this mirror
-    /// on this worker. Accumulated by the manager when a worker reports a
-    /// new `last_started` value.
+    /// on this worker. Accumulated by the manager on transitions into Success.
     #[serde(default, skip_serializing_if = "crate::is_default")]
     pub total_transferred_bytes: u64,
 

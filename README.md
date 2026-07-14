@@ -151,7 +151,7 @@ Limit how many mirrors may sync from the same upstream host simultaneously, inde
 "ftp.debian.org"   = 1
 ```
 
-Changes to this map take effect on the next SIGHUP / `tunasynctl reload` (hot-reload supported). The global `concurrent` limit still applies; the per-upstream limit adds an additional constraint.
+Changes to this map are applied on the next SIGHUP / `tunasynctl reload`. Adding, increasing, or removing a limit takes effect immediately. Decreasing an existing limit requires a worker restart because permits already issued by the running semaphore cannot be revoked safely. The global `concurrent` limit still applies; the per-upstream limit adds an additional constraint.
 
 ### Upstream probe with fallback
 
@@ -226,7 +226,7 @@ api_token = "use-a-long-random-string"
 api_token = "use-a-long-random-string"   # or TUNASYNC_API_TOKEN / --api-token
 ```
 
-The manager's public read-only surface stays open for web frontends and probes: `GET /ping`, `GET /jobs*` (including the SSE log proxy), `GET /metrics`, `GET /maintenance`. Everything else — worker registration/reports, `/cmd`, deletes, maintenance toggles — returns `401` without the token. The worker's own command endpoint and SSE stream are gated by the same token; the manager attaches it automatically when forwarding commands or proxying log streams.
+The manager's public read-only surface stays open for web frontends and probes: `GET /ping`, ordinary `GET /jobs*` status queries, `GET /metrics`, and `GET /maintenance`. The SSE log proxy and everything else — worker registration/reports, `/cmd`, deletes, and maintenance toggles — return `401` without the token. The worker's own command endpoint and SSE stream are gated by the same token; the manager attaches it automatically when forwarding commands or proxying log streams.
 
 ### Config check mode
 
@@ -235,7 +235,7 @@ $ tunasync worker --check -c /etc/tunasync/worker.conf
 /etc/tunasync/worker.conf: OK — 42 mirror(s), 0 warning(s)
 ```
 
-Validates the config without starting anything: TOML parse, include merging, cron expressions, IANA timezones, blackout windows (which are only warn-and-skip at runtime), duplicate mirror names, and full provider construction for every mirror. All problems are reported in one pass; the exit code is 0/1 for scripting. Recommended as `ExecStartPre=` in the systemd unit and before `tunasynctl reload`.
+Validates the config without starting anything: TOML parsing, include merging, listen/TLS settings, cron expressions, IANA timezones, blackout windows, mirror names and paths, duplicate mirror names, disk quotas, and full provider construction for every mirror. Invalid values are startup errors rather than warn-and-skip fallbacks. Problems are reported together where possible; the exit code is 0/1 for scripting. Recommended as `ExecStartPre=` in the systemd unit and before `tunasynctl reload`.
 
 ### Offline report buffering
 
@@ -254,7 +254,7 @@ Each entry carries worker, status, start/end time, transferred bytes, and the er
 
 ### Maintenance mode
 
-Put the manager into read-only mode. All mutating API calls (sync updates, commands) return 503 until maintenance mode is disabled.
+Put the manager into operator read-only mode. Destructive/operator actions such as commands, worker deletion, and flushing disabled jobs return 503 until maintenance mode is disabled. Worker registration, heartbeat, status, size, and schedule reports continue so running syncs remain observable and manager state does not diverge.
 
 ```bash
 tunasynctl maintenance enable
@@ -495,7 +495,7 @@ TUNASYNCTL_LANG=en tunasynctl list --format table
 
 ### Security
 
-For encrypted worker-manager communication, set `ssl_cert` and `ssl_key` on the manager, `ca_cert` on the worker, and use `https://` in `api_base`. For same-host deployments, plain HTTP is sufficient.
+For encrypted worker-manager communication, set both `ssl_cert` and `ssl_key` on the manager, `ca_cert` on the worker, and use `https://` in `api_base`. Supplying only one of the certificate/key pair is rejected. For same-host deployments, plain HTTP bound to loopback is sufficient.
 
 ### Running as a systemd service
 
@@ -743,12 +743,14 @@ time() - tunasync_mirror_last_success_timestamp_seconds > 48 * 3600
 
 #### How `total_transferred_bytes` accumulates
 
-The worker reads `Total transferred file size` from each rsync `--stats` log (`extract_transferred_bytes_from_rsync_log` in `crates/common/src/util.rs`) and reports it as `last_transferred_bytes` in the status update. On the manager side (`update_job_of_worker` in `crates/manager/src/server.rs`), whenever `last_started` changes and `last_transferred_bytes > 0` the manager adds the new value to the running total:
+The worker reads `Total transferred file size` from each rsync `--stats` log (`extract_transferred_bytes_from_rsync_log` in `crates/common/src/util.rs`) and reports it as `last_transferred_bytes` in the status update. On the manager side (`update_job_of_worker` in `crates/manager/src/server.rs`), the value is added only on the transition into `Success`:
 
 ```rust
-if incoming.last_transferred_bytes > 0 && incoming.last_started != cur.last_started {
+if incoming.status == SyncStatus::Success && cur.status != SyncStatus::Success {
     incoming.total_transferred_bytes =
         cur.total_transferred_bytes + incoming.last_transferred_bytes;
+} else {
+    incoming.total_transferred_bytes = cur.total_transferred_bytes;
 }
 ```
 
@@ -775,12 +777,14 @@ Other guarantees:
 
 `404` is returned for unknown mirror names.
 
-> **Security note**: like the worker's command endpoint (`POST /`), this endpoint carries **no authentication** — anyone who can reach the worker's HTTP port can read live sync logs and issue Stop/Disable/Reload commands. Bind the worker to an internal interface (`listen_addr`), firewall the port to the manager host(s), and/or enable TLS with a private CA (`ca_cert`). Do not expose the worker port to the public internet.
+> **Security note**: when `api_token` is empty, the worker command endpoint (`POST /`) and this SSE endpoint are unauthenticated. When `api_token` is configured, both require `Authorization: Bearer <token>`, and the manager supplies that header automatically when forwarding commands or proxying logs. For backward compatibility, an omitted `listen_addr` still binds to `0.0.0.0`; set it explicitly to `127.0.0.1` for same-host deployments, or to a private interface plus firewall rules when the manager is remote. Use TLS with a private CA when traffic crosses hosts. Do not expose the worker port directly to the public internet.
 
-Example:
+### Output example
+
+Command-line request to the worker's default port:
 
 ```sh
-curl -N http://localhost:14242/jobs/debian/log/stream
+curl -N http://localhost:6000/jobs/debian/log/stream
 ```
 
 ```
@@ -793,7 +797,16 @@ data:      2,047,438 100%   23.50MB/s    0:00:00 (xfr#1, ir-chk=1023/4096)
 : keep-alive
 ```
 
-In the browser:
+If a subscriber falls behind, the stream emits:
+
+```
+event: lag
+data: dropped 47 line(s); subscriber too slow
+```
+
+### Browser `EventSource` usage
+
+When token authentication is disabled, the native browser `EventSource` API can connect directly:
 
 ```js
 const es = new EventSource("/jobs/debian/log/stream");
@@ -801,7 +814,7 @@ es.onmessage = e => console.log(e.data);             // replay + live use the sa
 es.addEventListener("lag", e => console.warn("lagged:", e.data));
 ```
 
-The endpoint lives on the worker, not the manager — point it at the worker that owns the mirror (use `GET /workers/:id/jobs` on the manager to discover ownership).
+Native `EventSource` cannot set an `Authorization` header. When `api_token` is enabled, use an SSE client based on `fetch` that supports custom headers, or terminate authentication at a trusted same-origin reverse proxy. The direct endpoint lives on the worker; use the manager-side proxy below for normal browser deployments.
 
 ### Manager-side proxy (recommended for browser frontends)
 
@@ -811,7 +824,7 @@ The manager also exposes the same path and transparently proxies it to the ownin
 GET http://<manager-host>:<manager-port>/jobs/<mirror-name>/log/stream
 ```
 
-The manager looks up which worker owns the mirror, opens the worker's stream (sharing the `ca_cert` TLS pin if configured), and pipes the events through unbuffered (`X-Accel-Buffering: no` is set for fronting nginx). This means web frontends only ever need to reach the **manager** origin — the worker port can stay firewalled to the manager host, as recommended in the security note above. Responses: `404` for unknown mirrors, `502` when the owning worker is unreachable, otherwise the worker's stream verbatim.
+The manager looks up which worker owns the mirror, opens the worker's stream (sharing the `ca_cert` TLS pin if configured), and pipes the events through unbuffered (`X-Accel-Buffering: no` is set for fronting nginx). This means web frontends only ever need to reach the **manager** origin — the worker port can stay firewalled to the manager host. When `api_token` is enabled, the client must authenticate to this manager route as well. Responses: `404` for unknown mirrors, `502` when the owning worker is unreachable, otherwise the worker's stream verbatim.
 
 ## License
 

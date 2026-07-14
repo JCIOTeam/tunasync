@@ -37,6 +37,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
+  security-audit:
+    name: Dependency security audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   # Lightweight cross-compile check for every release target.
   # Uses `cargo check` (no link step) to catch type/API errors early without
   # needing a full cross sysroot.  Build scripts (ring, sqlite3-sys) still run

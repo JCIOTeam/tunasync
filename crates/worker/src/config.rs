@@ -358,7 +358,10 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     fn default_addr() -> String {
-        "127.0.0.1".into()
+        // Preserve the Go/legacy Rust behavior for configs that omit
+        // listen_addr. Operators should set 127.0.0.1 explicitly for a
+        // same-host deployment; examples and packaged configs do so.
+        "0.0.0.0".into()
     }
 
     fn default_port() -> u16 {
@@ -366,11 +369,20 @@ impl ServerConfig {
     }
 
     pub fn bind_addr(&self) -> Result<std::net::SocketAddr, String> {
-        let ip = self
-            .addr
+        let addr = if self.addr.is_empty() {
+            Self::default_addr()
+        } else {
+            self.addr.clone()
+        };
+        let ip = addr
             .parse()
             .map_err(|e| format!("invalid worker listen_addr {:?}: {e}", self.addr))?;
-        Ok(std::net::SocketAddr::new(ip, self.port))
+        let port = if self.port == 0 {
+            Self::default_port()
+        } else {
+            self.port
+        };
+        Ok(std::net::SocketAddr::new(ip, port))
     }
 
     pub fn tls_enabled(&self) -> bool {
@@ -388,21 +400,29 @@ impl ServerConfig {
     /// Public URL the manager uses to reach this worker.
     pub fn public_url(&self, cfg: &WorkerConfig) -> String {
         let proto = if self.tls_enabled() { "https" } else { "http" };
+        let effective_addr = if self.addr.is_empty() {
+            Self::default_addr()
+        } else {
+            self.addr.clone()
+        };
         let host = if !self.hostname.is_empty() {
             self.hostname.clone()
-        } else if self
-            .addr
+        } else if effective_addr
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| !ip.is_unspecified())
         {
-            self.addr.clone()
+            effective_addr
         } else {
             hostname::get()
                 .ok()
                 .and_then(|h| h.into_string().ok())
                 .unwrap_or_else(|| "localhost".into())
         };
-        let port = self.port;
+        let port = if self.port == 0 {
+            Self::default_port()
+        } else {
+            self.port
+        };
         let _ = cfg; // reserved for future use
         format!("{proto}://{host}:{port}")
     }
@@ -1058,9 +1078,38 @@ upstream = "rsync://rsync.archlinux.org/archlinux/"
     }
 
     #[test]
-    fn default_public_url_uses_loopback_listener() {
+    fn default_public_url_uses_hostname_for_unspecified_listener() {
         let cfg = WorkerConfig::default();
-        assert_eq!(cfg.server.public_url(&cfg), "http://127.0.0.1:6000");
+        let url = cfg.server.public_url(&cfg);
+        assert!(url.starts_with("http://"));
+        assert!(url.ends_with(":6000"));
+        assert!(!url.contains("0.0.0.0"));
+    }
+
+    #[test]
+    fn default_bind_addr_preserves_legacy_all_interfaces_listener() {
+        let cfg = WorkerConfig::default();
+        assert_eq!(
+            cfg.server.bind_addr().unwrap(),
+            "0.0.0.0:6000".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn explicit_zero_server_values_preserve_legacy_defaults() {
+        let cfg: WorkerConfig = tunasync_common::config::parse_toml(
+            r#"
+[server]
+listen_addr = ""
+listen_port = 0
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.server.bind_addr().unwrap(),
+            "0.0.0.0:6000".parse().unwrap()
+        );
+        assert!(cfg.server.public_url(&cfg).ends_with(":6000"));
     }
 
     #[test]

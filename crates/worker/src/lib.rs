@@ -247,6 +247,14 @@ pub async fn run(config_path: std::path::PathBuf) -> Result<()> {
         build_one_provider(mc, &cfg)?;
     }
 
+    let listen_ip = cfg.server.bind_addr().map_err(anyhow::Error::msg)?.ip();
+    if !listen_ip.is_loopback() && cfg.manager.api_token.is_empty() {
+        tracing::warn!(
+            listen_addr = %listen_ip,
+            "worker HTTP API is reachable beyond loopback without api_token authentication"
+        );
+    }
+
     tracing::info!(
         worker = %cfg.global.name,
         mirrors = cfg.mirrors.len(),

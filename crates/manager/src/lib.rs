@@ -85,6 +85,7 @@ pub async fn run_with_config(cfg: ManagerConfig) -> Result<()> {
     // Wrap in Arc so both the router and background tasks share the same state.
     let state = std::sync::Arc::new(AppState {
         db,
+        mirror_update_lock: tokio::sync::Mutex::new(()),
         http_client,
         sse_client,
         api_token: cfg.server.api_token.clone(),
@@ -133,26 +134,10 @@ pub async fn run_with_config(cfg: ManagerConfig) -> Result<()> {
     let router = build_router(state);
     let bind_addr = cfg.server.bind_addr().map_err(anyhow::Error::msg)?;
 
-    // Graceful shutdown signal (SIGTERM or SIGINT).
-    let shutdown = async {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-            let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
-            tokio::select! {
-                _ = sigterm.recv() => tracing::info!("received SIGTERM"),
-                _ = sigint.recv()  => tracing::info!("received SIGINT"),
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-        }
-    };
-
     if cfg.server.tls_enabled() {
         tracing::info!(%bind_addr, "binding HTTPS listener");
+        let handle = axum_server::Handle::new();
+        tokio::spawn(shutdown_axum_server(handle.clone()));
         axum_server::bind_rustls(
             bind_addr,
             axum_server::tls_rustls::RustlsConfig::from_pem_file(
@@ -162,6 +147,7 @@ pub async fn run_with_config(cfg: ManagerConfig) -> Result<()> {
             .await
             .context("load TLS cert/key")?,
         )
+        .handle(handle)
         .serve(router.into_make_service())
         .await
         .context("HTTPS server error")?;
@@ -171,12 +157,34 @@ pub async fn run_with_config(cfg: ManagerConfig) -> Result<()> {
             .await
             .with_context(|| format!("bind {bind_addr}"))?;
         axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown)
+            .with_graceful_shutdown(shutdown_signal())
             .await
             .context("HTTP server error")?;
     }
 
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
+        tokio::select! {
+            _ = sigterm.recv() => tracing::info!("received SIGTERM"),
+            _ = sigint.recv()  => tracing::info!("received SIGINT"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+async fn shutdown_axum_server(handle: axum_server::Handle<std::net::SocketAddr>) {
+    shutdown_signal().await;
+    handle.graceful_shutdown(Some(std::time::Duration::from_secs(30)));
 }
 
 /// Background task: write a JSON snapshot of all mirror statuses to
@@ -199,7 +207,7 @@ async fn status_file_writer(state: std::sync::Arc<AppState>, path: std::path::Pa
     loop {
         interval.tick().await;
 
-        let mirrors = match state.db.list_all_mirror_status() {
+        let mirrors = match state.db_call(|db| db.list_all_mirror_status()).await {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(error = %e, "status_file: failed to read mirror status");
@@ -220,9 +228,15 @@ async fn status_file_writer(state: std::sync::Arc<AppState>, path: std::path::Pa
             }
         };
 
-        // Atomic write: write to <path>.tmp then rename.
+        // Atomic write: write to <path>.tmp then rename. Filesystem I/O is
+        // blocking too, so keep it off the async executor alongside the DB.
         let tmp_path = path.with_extension("json.tmp");
-        if let Err(e) = std::fs::write(&tmp_path, &json) {
+        let write_tmp = tmp_path.clone();
+        let write_json = json.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || std::fs::write(write_tmp, write_json))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
+        {
             tracing::warn!(
                 path = %tmp_path.display(),
                 error = %e,
@@ -230,14 +244,20 @@ async fn status_file_writer(state: std::sync::Arc<AppState>, path: std::path::Pa
             );
             continue;
         }
-        if let Err(e) = std::fs::rename(&tmp_path, &path) {
+        let rename_src = tmp_path.clone();
+        let rename_dst = path.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || std::fs::rename(rename_src, rename_dst))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
+        {
             tracing::warn!(
                 src = %tmp_path.display(),
                 dst = %path.display(),
                 error = %e,
                 "status_file: rename failed"
             );
-            let _ = std::fs::remove_file(&tmp_path);
+            let cleanup = tmp_path.clone();
+            let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(cleanup)).await;
             continue;
         }
 
@@ -260,7 +280,7 @@ async fn stale_detector(state: std::sync::Arc<AppState>, stale_secs: u64) {
     loop {
         interval.tick().await;
 
-        let mirrors = match state.db.list_all_mirror_status() {
+        let mirrors = match state.db_call(|db| db.list_all_mirror_status()).await {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(error = %e, "stale_detector: failed to read mirror status");
@@ -300,7 +320,13 @@ async fn stale_detector(state: std::sync::Arc<AppState>, stale_secs: u64) {
                 // fresh row — the worker has reported new data and our scan's
                 // verdict is potentially stale itself. Then write only if the
                 // verdict still differs from the persisted `stale` flag.
-                let fresh = match state.db.get_mirror_status(&mirror.worker, &mirror.name) {
+                let fresh_worker = mirror.worker.clone();
+                let fresh_name = mirror.name.clone();
+                let _update_guard = state.mirror_update_lock.lock().await;
+                let fresh = match state
+                    .db_call(move |db| db.get_mirror_status(&fresh_worker, &fresh_name))
+                    .await
+                {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::warn!(
@@ -332,10 +358,14 @@ async fn stale_detector(state: std::sync::Arc<AppState>, stale_secs: u64) {
                 let mut to_write = fresh.clone();
                 to_write.stale = fresh_is_stale;
 
-                if let Err(e) =
-                    state
-                        .db
-                        .update_mirror_status(&mirror.worker, &mirror.name, to_write.clone())
+                let update_worker = mirror.worker.clone();
+                let update_name = mirror.name.clone();
+                let update_value = to_write.clone();
+                if let Err(e) = state
+                    .db_call(move |db| {
+                        db.update_mirror_status(&update_worker, &update_name, update_value)
+                    })
+                    .await
                 {
                     tracing::warn!(
                         mirror = %mirror.name,

@@ -16,6 +16,11 @@ jobs:
   build:
     name: Build ${{ matrix.artifact }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     strategy:
       fail-fast: false
       matrix:
@@ -125,8 +130,8 @@ jobs:
       - name: Install cargo-zigbuild
         if: matrix.zigbuild
         run: |
-          pip3 install ziglang
-          cargo install cargo-zigbuild
+          pip3 install ziglang==0.16.0
+          cargo install cargo-zigbuild --version 0.23.0 --locked
 
       - name: Build
         run: |
@@ -143,6 +148,11 @@ jobs:
             -C "$DIR" tunasync tunasynctl
           sha256sum "${{ matrix.artifact }}.tar.gz" \
             > "${{ matrix.artifact }}.tar.gz.sha256"
+
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ matrix.artifact }}.tar.gz
 
       - uses: actions/upload-artifact@v4
         with:

@@ -262,6 +262,7 @@ fn make_app_with_token(token: &str) -> axum::Router {
     let http_client = reqwest::Client::new();
     let state = std::sync::Arc::new(AppState {
         db,
+        mirror_update_lock: tokio::sync::Mutex::new(()),
         http_client,
         sse_client: reqwest::Client::new(),
         api_token: token.to_string(),
@@ -1404,6 +1405,45 @@ async fn traffic_total_accumulates_once_per_success() {
         Some(150),
         "zero-transfer success must not inherit and re-add the previous run's bytes"
     );
+}
+
+#[tokio::test]
+async fn concurrent_duplicate_success_reports_accumulate_once() {
+    let app = make_app();
+    let worker_id = "w-traffic-concurrent";
+    let mirror = "traffic-concurrent";
+    setup_worker_and_mirror(&app, worker_id, mirror).await;
+    let path = format!("/workers/{worker_id}/jobs/{mirror}");
+    let now = chrono::Utc::now().to_rfc3339();
+    let report = |status: &str, transferred: u64| {
+        serde_json::json!({
+            "name": mirror, "worker": worker_id, "is_master": true,
+            "status": status,
+            "last_update": now, "last_started": now,
+            "last_ended": now, "next_schedule": now,
+            "upstream": "rsync://example.com/", "size": "", "error_msg": "",
+            "last_transferred_bytes": transferred
+        })
+    };
+
+    post_json(&app, &path, &report("pre-syncing", 0)).await;
+    post_json(&app, &path, &report("syncing", 0)).await;
+
+    let first_app = app.clone();
+    let first_path = path.clone();
+    let first_report = report("success", 100);
+    let second_app = app.clone();
+    let second_path = path.clone();
+    let second_report = first_report.clone();
+    let (first, second) = tokio::join!(
+        post_json(&first_app, &first_path, &first_report),
+        post_json(&second_app, &second_path, &second_report),
+    );
+    assert_eq!(first.0, StatusCode::OK);
+    assert_eq!(second.0, StatusCode::OK);
+
+    let (_, jobs) = get_json(&app, "/jobs/traffic-concurrent").await;
+    assert_eq!(jobs[0]["total_transferred_bytes"].as_u64(), Some(100));
 }
 
 // ── SSE log-stream proxy ────────────────────────────────────────────────────

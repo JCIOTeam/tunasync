@@ -40,6 +40,10 @@ use crate::db::{DbAdapter, DbError};
 /// Shared state injected into every axum handler via `State`.
 pub struct AppState {
     pub db: Box<dyn DbAdapter>,
+    /// Serializes mirror read/modify/write sequences without blocking unrelated
+    /// database reads, which remain safe to run concurrently through the
+    /// adapter's `Send + Sync` contract.
+    pub mirror_update_lock: tokio::sync::Mutex<()>,
     pub http_client: reqwest::Client,
     /// Client for proxying long-lived SSE streams from workers. Built with
     /// NO total timeout (a log stream legitimately stays open for hours) but
@@ -52,6 +56,24 @@ pub struct AppState {
     pub notify: crate::config::NotifyConfig,
     /// Shared API token (empty = auth disabled). See `ServerConfig::api_token`.
     pub api_token: String,
+}
+
+impl AppState {
+    /// Run a synchronous database operation on Tokio's blocking pool.
+    ///
+    /// All current adapters are synchronous; SQLite and Redis may block on a
+    /// mutex or network I/O. Keeping those calls off axum's async executor
+    /// prevents one slow storage operation from stalling unrelated requests.
+    pub(crate) async fn db_call<T, F>(self: &Arc<Self>, operation: F) -> crate::db::DbResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&dyn DbAdapter) -> crate::db::DbResult<T> + Send + 'static,
+    {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || operation(state.db.as_ref()))
+            .await
+            .map_err(|e| DbError::Storage(format!("database task failed: {e}")))?
+    }
 }
 
 /// JSON error response matching Go's `{ "error": "..." }` shape.
@@ -184,7 +206,7 @@ async fn ping() -> impl IntoResponse {
 
 /// `GET /jobs` — list all mirrors across all workers, in `WebMirrorStatus` format.
 async fn list_all_jobs(State(state): State<Arc<AppState>>) -> Response {
-    match state.db.list_all_mirror_status() {
+    match state.db_call(|db| db.list_all_mirror_status()).await {
         Err(e) => db_err(e),
         Ok(statuses) => {
             let web: Vec<WebMirrorStatus> = statuses
@@ -198,7 +220,7 @@ async fn list_all_jobs(State(state): State<Arc<AppState>>) -> Response {
 
 /// `HEAD /jobs` — check availability and count without returning body.
 async fn list_all_jobs_head(State(state): State<Arc<AppState>>) -> Response {
-    match state.db.list_all_mirror_status() {
+    match state.db_call(|db| db.list_all_mirror_status()).await {
         Err(e) => db_err(e),
         Ok(_) => StatusCode::OK.into_response(),
     }
@@ -209,7 +231,7 @@ async fn list_mirror_by_name(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Response {
-    match state.db.list_all_mirror_status() {
+    match state.db_call(|db| db.list_all_mirror_status()).await {
         Err(e) => db_err(e),
         Ok(statuses) => {
             let filtered: Vec<_> = statuses.into_iter().filter(|s| s.name == name).collect();
@@ -231,7 +253,10 @@ async fn get_job_history(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(20)
         .clamp(1, crate::db::SYNC_HISTORY_KEEP_PER_MIRROR);
-    match state.db.get_sync_history(&name, limit) {
+    match state
+        .db_call(move |db| db.get_sync_history(&name, limit))
+        .await
+    {
         Err(e) => db_err(e),
         Ok(entries) => Json(entries).into_response(),
     }
@@ -257,7 +282,7 @@ async fn proxy_job_log_stream(
     Path(name): Path<String>,
 ) -> Response {
     // Find the worker that owns this mirror.
-    let statuses = match state.db.list_all_mirror_status() {
+    let statuses = match state.db_call(|db| db.list_all_mirror_status()).await {
         Ok(s) => s,
         Err(e) => return db_err(e),
     };
@@ -268,7 +293,8 @@ async fn proxy_job_log_stream(
         )
             .into_response();
     };
-    let worker = match state.db.get_worker(&mirror.worker) {
+    let worker_id = mirror.worker.clone();
+    let worker = match state.db_call(move |db| db.get_worker(&worker_id)).await {
         Ok(w) => w,
         Err(DbError::NotFound(_)) => {
             return (
@@ -347,7 +373,7 @@ async fn flush_disabled_jobs(State(state): State<Arc<AppState>>) -> Response {
     if let Some(r) = check_maintenance(&state) {
         return r;
     }
-    match state.db.flush_disabled_jobs() {
+    match state.db_call(|db| db.flush_disabled_jobs()).await {
         Err(e) => db_err(e),
         Ok(()) => ok_msg("flushed").into_response(),
     }
@@ -355,7 +381,7 @@ async fn flush_disabled_jobs(State(state): State<Arc<AppState>>) -> Response {
 
 /// `GET /workers` — list all registered workers (token REDACTED).
 async fn list_workers(State(state): State<Arc<AppState>>) -> Response {
-    match state.db.list_workers() {
+    match state.db_call(|db| db.list_workers()).await {
         Err(e) => db_err(e),
         Ok(workers) => {
             // Redact tokens as Go does.
@@ -384,7 +410,7 @@ async fn register_worker(
 
     tracing::info!(id = %worker.id, "worker registered");
 
-    match state.db.create_worker(worker) {
+    match state.db_call(move |db| db.create_worker(worker)).await {
         Err(e) => db_err(e),
         Ok(w) => (StatusCode::OK, Json(w)).into_response(),
     }
@@ -395,7 +421,8 @@ async fn delete_worker(State(state): State<Arc<AppState>>, Path(id): Path<String
     if let Some(r) = check_maintenance(&state) {
         return r;
     }
-    match state.db.delete_worker(&id) {
+    let delete_id = id.clone();
+    match state.db_call(move |db| db.delete_worker(&delete_id)).await {
         Err(DbError::NotFound(_)) => bad_req(format!("invalid workerID {id}")),
         Err(e) => db_err(e),
         Ok(()) => {
@@ -407,7 +434,11 @@ async fn delete_worker(State(state): State<Arc<AppState>>, Path(id): Path<String
 
 /// `POST /workers/:id/heartbeat` — worker signals it is still alive.
 async fn heartbeat_worker(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    match state.db.refresh_worker(&id) {
+    let refresh_id = id.clone();
+    match state
+        .db_call(move |db| db.refresh_worker(&refresh_id))
+        .await
+    {
         Err(DbError::NotFound(_)) => bad_req(format!("invalid workerID {id}")),
         Err(e) => db_err(e),
         Ok(_) => ok_msg("pong").into_response(),
@@ -420,13 +451,14 @@ async fn list_jobs_of_worker(
     Path(id): Path<String>,
 ) -> Response {
     // Validate worker exists (matches Go's workerIDValidator middleware).
-    if let Err(e) = state.db.get_worker(&id) {
+    let validate_id = id.clone();
+    if let Err(e) = state.db_call(move |db| db.get_worker(&validate_id)).await {
         return match e {
             DbError::NotFound(_) => bad_req(format!("invalid workerID {id}")),
             other => db_err(other),
         };
     }
-    match state.db.list_mirror_status(&id) {
+    match state.db_call(move |db| db.list_mirror_status(&id)).await {
         Err(e) => db_err(e),
         Ok(statuses) => Json(statuses).into_response(),
     }
@@ -453,20 +485,26 @@ async fn update_job_of_worker(
         return bad_req("mirror Name should not be empty");
     }
 
-    // Validate worker, refresh last_online.
-    if let Err(e) = state.db.get_worker(&worker_id) {
-        return match e {
-            DbError::NotFound(_) => bad_req(format!("invalid workerID {worker_id}")),
-            other => db_err(other),
-        };
-    }
-    let _ = state.db.refresh_worker(&worker_id);
+    let _update_guard = state.mirror_update_lock.lock().await;
 
-    // Fetch previous state (if any; miss = zero-value defaults).
-    let cur = state
-        .db
-        .get_mirror_status(&worker_id, &incoming.name)
-        .unwrap_or_else(|_| zero_mirror_status(&incoming.name, &worker_id));
+    // Validate worker, refresh last_online, and fetch the previous mirror row
+    // together on the blocking pool.
+    let lookup_worker = worker_id.clone();
+    let lookup_mirror = incoming.name.clone();
+    let cur = match state
+        .db_call(move |db| {
+            db.get_worker(&lookup_worker)?;
+            let _ = db.refresh_worker(&lookup_worker);
+            Ok(db
+                .get_mirror_status(&lookup_worker, &lookup_mirror)
+                .unwrap_or_else(|_| zero_mirror_status(&lookup_mirror, &lookup_worker)))
+        })
+        .await
+    {
+        Ok(cur) => cur,
+        Err(DbError::NotFound(_)) => return bad_req(format!("invalid workerID {worker_id}")),
+        Err(e) => return db_err(e),
+    };
 
     let now = Utc::now();
 
@@ -534,8 +572,8 @@ async fn update_job_of_worker(
     // Best-effort: a history write failure must never fail the report.
     let was_active = matches!(cur.status, SyncStatus::PreSyncing | SyncStatus::Syncing);
     let is_terminal = matches!(incoming.status, SyncStatus::Success | SyncStatus::Failed);
-    if was_active && is_terminal {
-        let entry = crate::db::SyncHistoryEntry {
+    let history_entry = if was_active && is_terminal {
+        Some(crate::db::SyncHistoryEntry {
             mirror: incoming.name.clone(),
             worker: incoming.worker.clone(),
             status: incoming.status,
@@ -543,11 +581,10 @@ async fn update_job_of_worker(
             ended: incoming.last_ended,
             transferred_bytes: incoming.last_transferred_bytes,
             error_msg: incoming.error_msg.clone(),
-        };
-        if let Err(e) = state.db.record_sync_history(&entry) {
-            tracing::warn!(mirror = %incoming.name, error = %e, "record sync history failed");
-        }
-    }
+        })
+    } else {
+        None
+    };
 
     // Consecutive failures + stale tracking.
     match incoming.status {
@@ -614,9 +651,17 @@ async fn update_job_of_worker(
     }
 
     let mirror_name = incoming.name.clone();
+    let history_mirror = mirror_name.clone();
     match state
-        .db
-        .update_mirror_status(&worker_id, &mirror_name, incoming)
+        .db_call(move |db| {
+            if let Some(entry) = history_entry {
+                if let Err(e) = db.record_sync_history(&entry) {
+                    tracing::warn!(mirror = %history_mirror, error = %e, "record sync history failed");
+                }
+            }
+            db.update_mirror_status(&worker_id, &mirror_name, incoming)
+        })
+        .await
     {
         Err(e) => db_err(e),
         Ok(stored) => Json(stored).into_response(),
@@ -636,15 +681,27 @@ async fn update_mirror_size(
     Path((worker_id, _job)): Path<(String, String)>,
     Json(msg): Json<SizeMsg>,
 ) -> Response {
-    if let Err(e) = state.db.get_worker(&worker_id) {
+    let _update_guard = state.mirror_update_lock.lock().await;
+    let validate_worker = worker_id.clone();
+    if let Err(e) = state
+        .db_call(move |db| db.get_worker(&validate_worker))
+        .await
+    {
         return match e {
             DbError::NotFound(_) => bad_req(format!("invalid workerID {worker_id}")),
             other => db_err(other),
         };
     }
-    let _ = state.db.refresh_worker(&worker_id);
 
-    let mut status = match state.db.get_mirror_status(&worker_id, &msg.name) {
+    let lookup_worker = worker_id.clone();
+    let lookup_mirror = msg.name.clone();
+    let mut status = match state
+        .db_call(move |db| {
+            let _ = db.refresh_worker(&lookup_worker);
+            db.get_mirror_status(&lookup_worker, &lookup_mirror)
+        })
+        .await
+    {
         Err(e) => return db_err(e),
         Ok(s) => s,
     };
@@ -660,7 +717,10 @@ async fn update_mirror_size(
         "mirror size update"
     );
 
-    match state.db.update_mirror_status(&worker_id, &msg.name, status) {
+    match state
+        .db_call(move |db| db.update_mirror_status(&worker_id, &msg.name, status))
+        .await
+    {
         Err(e) => db_err(e),
         Ok(stored) => Json(stored).into_response(),
     }
@@ -672,40 +732,39 @@ async fn update_schedules_of_worker(
     Path(worker_id): Path<String>,
     Json(schedules): Json<MirrorSchedules>,
 ) -> Response {
-    if let Err(e) = state.db.get_worker(&worker_id) {
+    if schedules
+        .schedules
+        .iter()
+        .any(|schedule| schedule.mirror_name.is_empty())
+    {
+        return bad_req("mirror Name should not be empty");
+    }
+
+    let schedule_worker = worker_id.clone();
+    let _update_guard = state.mirror_update_lock.lock().await;
+    let result = state
+        .db_call(move |db| {
+            db.get_worker(&schedule_worker)?;
+            let _ = db.refresh_worker(&schedule_worker);
+            for schedule in schedules.schedules {
+                let mut cur = match db.get_mirror_status(&schedule_worker, &schedule.mirror_name) {
+                    Err(_) => continue,
+                    Ok(s) => s,
+                };
+                if cur.scheduled == schedule.next_schedule {
+                    continue;
+                }
+                cur.scheduled = schedule.next_schedule;
+                db.update_mirror_status(&schedule_worker, &schedule.mirror_name, cur)?;
+            }
+            Ok(())
+        })
+        .await;
+    if let Err(e) = result {
         return match e {
             DbError::NotFound(_) => bad_req(format!("invalid workerID {worker_id}")),
             other => db_err(other),
         };
-    }
-
-    for schedule in schedules.schedules {
-        if schedule.mirror_name.is_empty() {
-            return bad_req("mirror Name should not be empty");
-        }
-
-        let _ = state.db.refresh_worker(&worker_id);
-
-        let mut cur = match state
-            .db
-            .get_mirror_status(&worker_id, &schedule.mirror_name)
-        {
-            Err(_) => continue, // not tracked yet — skip
-            Ok(s) => s,
-        };
-
-        if cur.scheduled == schedule.next_schedule {
-            continue; // no change
-        }
-
-        cur.scheduled = schedule.next_schedule;
-
-        if let Err(e) = state
-            .db
-            .update_mirror_status(&worker_id, &schedule.mirror_name, cur)
-        {
-            return db_err(e);
-        }
     }
 
     // Go returns `{}` (empty JSON object) on success.
@@ -730,7 +789,8 @@ async fn handle_client_cmd(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    let worker = match state.db.get_worker(worker_id) {
+    let lookup_worker = worker_id.clone();
+    let worker = match state.db_call(move |db| db.get_worker(&lookup_worker)).await {
         Err(DbError::NotFound(_)) => {
             return bad_req(format!("worker {worker_id} is not registered yet"));
         }
@@ -773,19 +833,28 @@ async fn handle_client_cmd(
             .into_response(),
         Ok(resp) if resp.status().is_success() => {
             if matches!(client_cmd.cmd, CmdVerb::Disable | CmdVerb::Stop) {
-                if let Ok(mut cur) = state.db.get_mirror_status(worker_id, &client_cmd.mirror_id) {
-                    cur.status = match client_cmd.cmd {
-                        CmdVerb::Disable => SyncStatus::Disabled,
-                        CmdVerb::Stop => SyncStatus::Paused,
-                        _ => unreachable!(),
-                    };
-                    if let Err(e) =
-                        state
-                            .db
-                            .update_mirror_status(worker_id, &client_cmd.mirror_id, cur)
-                    {
-                        return db_err(e);
-                    }
+                let update_worker = worker_id.clone();
+                let update_mirror = client_cmd.mirror_id.clone();
+                let update_status = client_cmd.cmd;
+                let _update_guard = state.mirror_update_lock.lock().await;
+                if let Err(e) = state
+                    .db_call(move |db| {
+                        let mut cur = match db.get_mirror_status(&update_worker, &update_mirror) {
+                            Ok(cur) => cur,
+                            Err(DbError::NotFound(_)) => return Ok(()),
+                            Err(e) => return Err(e),
+                        };
+                        cur.status = match update_status {
+                            CmdVerb::Disable => SyncStatus::Disabled,
+                            CmdVerb::Stop => SyncStatus::Paused,
+                            _ => unreachable!(),
+                        };
+                        db.update_mirror_status(&update_worker, &update_mirror, cur)?;
+                        Ok(())
+                    })
+                    .await
+                {
+                    return db_err(e);
                 }
             }
             ok_msg(format!("successfully sent command to worker {worker_id}")).into_response()
@@ -872,20 +941,17 @@ async fn get_maintenance(State(state): State<Arc<AppState>>) -> impl IntoRespons
 /// Status codes for `tunasync_mirror_status`:
 ///   0 none | 1 pre-syncing | 2 syncing | 3 success | 4 failed | 5 paused | 6 disabled
 async fn metrics(State(state): State<Arc<AppState>>) -> Response {
-    let mirrors = match state.db.list_all_mirror_status() {
-        Ok(m) => m,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("# ERROR {e}\n")).into_response()
-        }
-    };
-    let workers = match state.db.list_workers() {
-        Ok(w) => w,
+    let (mirrors, worker_count) = match state
+        .db_call(|db| Ok((db.list_all_mirror_status()?, db.list_workers()?.len())))
+        .await
+    {
+        Ok(result) => result,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("# ERROR {e}\n")).into_response()
         }
     };
 
-    let body = render_metrics(&mirrors, workers.len());
+    let body = render_metrics(&mirrors, worker_count);
     (
         StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
@@ -1242,6 +1308,7 @@ mod router_tests {
         std::mem::forget(tmp);
         Arc::new(AppState {
             db: Box::new(db),
+            mirror_update_lock: tokio::sync::Mutex::new(()),
             http_client: reqwest::Client::new(),
             sse_client: reqwest::Client::new(),
             api_token: String::new(),
@@ -1294,5 +1361,28 @@ mod router_tests {
     #[tokio::test]
     async fn unknown_route_is_404() {
         assert_eq!(get("/no/such/path").await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_call_keeps_blocking_work_off_async_executor() {
+        let state = test_state();
+        let started = std::time::Instant::now();
+        let task = tokio::spawn(async move {
+            state
+                .db_call(|_| {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    Ok(())
+                })
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(75),
+            "blocking database work stalled the current-thread runtime"
+        );
+        task.await
+            .expect("database task join")
+            .expect("database call");
     }
 }

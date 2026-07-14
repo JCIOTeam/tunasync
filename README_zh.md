@@ -146,7 +146,7 @@ priority = 90   # 默认 50；越大越先执行
 "ftp.debian.org"   = 1
 ```
 
-该配置支持热重载（SIGHUP / `tunasynctl reload`），修改立即生效。全局 `concurrent` 限制仍然有效，`per_upstream_concurrent` 在其基础上叠加约束。
+该配置在下一次 SIGHUP / `tunasynctl reload` 时应用。新增、提高或删除限制会立即生效；降低已有上限需要重启 worker，因为运行中的 semaphore 无法安全撤回已经发出的 permit。全局 `concurrent` 限制仍然有效，`per_upstream_concurrent` 在其基础上叠加约束。
 
 ### 上游探测与回退
 
@@ -230,7 +230,7 @@ $ tunasync worker --check -c /etc/tunasync/worker.conf
 /etc/tunasync/worker.conf: OK — 42 mirror(s), 0 warning(s)
 ```
 
-不启动任何服务，仅校验配置文件：TOML 解析、include 合并、cron 表达式、IANA 时区、屏蔽时间窗（运行时只会告警跳过，不会启动失败）、镜像重名检测，并对每个镜像完成完整的 provider 构造。所有问题一次报告完，退出码为 0/1 便于脚本判断。推荐作为 systemd 单元的 `ExecStartPre=`，并在执行 `tunasynctl reload` 前先跑一遍。
+不启动任何服务，仅校验配置文件：TOML 解析、include 合并、监听/TLS 设置、cron 表达式、IANA 时区、屏蔽时间窗、镜像名称和路径、镜像重名、磁盘配额，并对每个镜像完成完整的 provider 构造。无效值会作为启动错误处理，不再通过告警后静默跳过。能够合并的问题会尽量一次报告，退出码为 0/1 便于脚本判断。推荐作为 systemd 单元的 `ExecStartPre=`，并在执行 `tunasynctl reload` 前先跑一遍。
 
 ### 离线上报缓冲
 
@@ -249,7 +249,7 @@ $ curl http://manager:14242/jobs/debian/history?limit=5
 
 ### 维护模式
 
-将 manager 置于只读状态，所有变更 API（同步更新、控制命令）返回 503，直到关闭维护模式：
+将 manager 置于操作员只读状态。控制命令、删除 worker、清理 disabled 任务等破坏性/操作员接口返回 503，直到关闭维护模式；worker 注册、心跳、状态、大小和调度上报仍会继续，使运行中的同步保持可观测，并避免 manager 状态与 worker 偏离：
 
 ```bash
 tunasynctl maintenance enable
@@ -481,7 +481,7 @@ TUNASYNCTL_LANG=en tunasynctl list --format table
 
 ### 安全
 
-需要加密通信时，在 manager 设置 `ssl_cert`/`ssl_key`，在 worker 设置 `ca_cert`，`api_base` 使用 `https://`。同机部署使用 HTTP 即可。
+需要加密通信时，在 manager 同时设置 `ssl_cert` 和 `ssl_key`，在 worker 设置 `ca_cert`，并让 `api_base` 使用 `https://`。只提供证书或私钥其中一个会被拒绝。同机部署可使用绑定到 loopback 的 HTTP。
 
 ### 以 systemd 服务运行
 
@@ -499,6 +499,8 @@ sudo systemctl enable --now tunasync-manager tunasync-worker
 # 热重载 worker 配置
 sudo systemctl reload tunasync-worker
 ```
+
+`--with-systemd` 会关闭日志时间戳和 ANSI 颜色，因为 systemd journal 会自行添加时间戳。
 
 ### 使用 SysVinit (init.d) 运行
 
@@ -727,12 +729,14 @@ time() - tunasync_mirror_last_success_timestamp_seconds > 48 * 3600
 
 #### `total_transferred_bytes` 累加逻辑
 
-worker 从每次 rsync `--stats` 日志解析 `Total transferred file size`（`crates/common/src/util.rs` 中的 `extract_transferred_bytes_from_rsync_log`），作为 `last_transferred_bytes` 上报。manager 端（`crates/manager/src/server.rs` 的 `update_job_of_worker`）每当 `last_started` 变化且 `last_transferred_bytes > 0` 时，把新值累加到运行总数：
+worker 从每次 rsync `--stats` 日志解析 `Total transferred file size`（`crates/common/src/util.rs` 中的 `extract_transferred_bytes_from_rsync_log`），作为 `last_transferred_bytes` 上报。manager 端（`crates/manager/src/server.rs` 的 `update_job_of_worker`）只在状态进入 `Success` 的那一次累加新值：
 
 ```rust
-if incoming.last_transferred_bytes > 0 && incoming.last_started != cur.last_started {
+if incoming.status == SyncStatus::Success && cur.status != SyncStatus::Success {
     incoming.total_transferred_bytes =
         cur.total_transferred_bytes + incoming.last_transferred_bytes;
+} else {
+    incoming.total_transferred_bytes = cur.total_transferred_bytes;
 }
 ```
 
@@ -759,14 +763,14 @@ GET http://<worker-host>:<worker-port>/jobs/<mirror-name>/log/stream
 
 未知的镜像名返回 `404`。
 
-> **安全提示**：与 worker 的命令端点（`POST /`）一样，本接口**默认不带鉴权**——任何能访问 worker HTTP 端口的人都可以读取实时同步日志、下发 Stop/Disable/Reload 命令。请把 worker 绑定到内网地址（`listen_addr`）、用防火墙把端口限制在 manager 主机来源、并/或用私有 CA 启用 TLS（`ca_cert`）。**不要**把 worker 端口直接暴露到公网。如果在三个组件上都配置了 `api_token`，则该接口同样会要求 `Authorization: Bearer`，manager 在代理日志流时会自动带上。
+> **安全提示**：`api_token` 为空时，worker 命令端点（`POST /`）和本 SSE 接口都不带鉴权；配置 `api_token` 后，两者都要求 `Authorization: Bearer <token>`，manager 在转发命令或代理日志时会自动附带该请求头。为保持兼容，省略 `listen_addr` 时仍会绑定 `0.0.0.0`；同机部署应显式设置为 `127.0.0.1`，跨主机部署则应绑定私网接口并用防火墙限制来源。跨主机通信时应使用私有 CA 启用 TLS。**不要**把 worker 端口直接暴露到公网。
 
 ### 接口输出示例
 
-`curl` 命令行：
+向 worker 默认端口发起命令行请求：
 
 ```sh
-curl -N http://localhost:14242/jobs/debian/log/stream
+curl -N http://localhost:6000/jobs/debian/log/stream
 ```
 
 输出（每条 `data:` 行就是 rsync 子进程的一行 stdout/stderr）：
@@ -805,6 +809,8 @@ data: dropped 47 line(s); subscriber too slow
 
 ### 浏览器 `EventSource` 用法
 
+未启用 token 鉴权时，可以直接使用浏览器原生 `EventSource`：
+
 ```js
 const es = new EventSource("/jobs/debian/log/stream");
 
@@ -824,7 +830,7 @@ es.onerror = (e) => {
 };
 ```
 
-> 这个接口在 worker 上，不在 manager 上。一台 manager 后面挂多台 worker 的话，需要通过 manager 的 `GET /workers/:id/jobs` 找到镜像所在的 worker，然后再去连那台 worker 的 `/jobs/:name/log/stream`。
+浏览器原生 `EventSource` 无法设置 `Authorization` 请求头。启用 `api_token` 后，应使用支持自定义请求头、基于 `fetch` 的 SSE 客户端，或者由可信的同源反向代理完成鉴权。直接接口位于 worker；一般浏览器部署应优先使用下方的 manager 代理。
 
 ### Manager 端代理（推荐用于浏览器前端）
 
@@ -834,7 +840,7 @@ manager 也暴露了同样的路径，会透明地代理到拥有该镜像的 wo
 GET http://<manager-host>:<manager-port>/jobs/<mirror-name>/log/stream
 ```
 
-manager 会先查出镜像归属哪个 worker，打开该 worker 的流（如果配置了 `ca_cert` 会复用 TLS 证书锁定），并将事件原样无缓冲转发出来（同时设置 `X-Accel-Buffering: no` 以兼容前置的 nginx）。这样 Web 前端只需要访问 **manager** 来源即可，worker 端口可以保持仅对 manager 主机开放，配合上面那条安全提示。响应：未知镜像 `404`、归属 worker 不可达 `502`，否则原样转发 worker 的事件流。
+manager 会先查出镜像归属哪个 worker，打开该 worker 的流（如果配置了 `ca_cert` 会复用 TLS 证书锁定），并将事件原样无缓冲转发出来（同时设置 `X-Accel-Buffering: no` 以兼容前置的 nginx）。这样 Web 前端只需要访问 **manager** 来源即可，worker 端口可以保持仅对 manager 主机开放。启用 `api_token` 后，客户端访问该 manager 路由时同样必须通过鉴权。响应：未知镜像 `404`、归属 worker 不可达 `502`，否则原样转发 worker 的事件流。
 
 ## 许可证
 
