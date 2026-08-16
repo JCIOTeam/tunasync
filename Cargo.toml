@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/protocol",
+    "crates/netns",
+    "crates/netns-broker",
     "crates/common",
     "crates/manager",
     "crates/worker",
@@ -21,6 +23,7 @@ description = "Mirror job management tool — Rust port of tuna/tunasync, wire-c
 [workspace.dependencies]
 # In-tree crates
 tunasync-protocol = { path = "crates/protocol" }
+tunasync-netns    = { path = "crates/netns" }
 tunasync-common   = { path = "crates/common" }
 tunasync-manager  = { path = "crates/manager" }
 tunasync-worker   = { path = "crates/worker" }
@@ -78,6 +81,7 @@ os_pipe     = "1"
 url         = { version = "2", features = ["serde"] }
 once_cell   = "1"
 bytes       = "1"
+sha2        = "0.10"
 
 [profile.release]
 lto           = "thin"

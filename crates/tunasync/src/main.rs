@@ -92,6 +92,10 @@ enum Command {
         /// Intended for `ExecStartPre=` and pre-reload checks.
         #[arg(long)]
         check: bool,
+
+        /// Generate deterministic root broker policy and exit.
+        #[arg(long, value_name = "PATH", conflicts_with = "check")]
+        emit_netns_policy: Option<PathBuf>,
     },
 }
 
@@ -168,6 +172,7 @@ async fn main() -> Result<()> {
             config,
             pidfile,
             check,
+            emit_netns_policy,
         } => {
             tunasync_common::logger::init(cli.verbose, cli.with_systemd, true);
 
@@ -198,6 +203,12 @@ async fn main() -> Result<()> {
                     report.warnings.len()
                 );
                 std::process::exit(1);
+            }
+
+            if let Some(output) = emit_netns_policy {
+                tunasync_worker::netns_policy::emit_policy(config, output)?;
+                println!("wrote network namespace policy to {}", output.display());
+                return Ok(());
             }
 
             tracing::info!(?config, "starting tunasync worker");

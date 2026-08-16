@@ -508,7 +508,7 @@ impl Worker {
 
         for (mut provider, hooks) in provider_list {
             let name = provider.name().to_owned();
-            let upstream = provider.upstream().to_owned();
+            let upstream = crate::redact_url_diagnostic(provider.upstream());
             let is_master = provider.is_master();
 
             // Hand the provider its per-mirror live-log publisher so the runner
@@ -1274,6 +1274,34 @@ impl Worker {
             return;
         }
 
+        if new_cfg.netns_broker.generation == self.cfg.netns_broker.generation {
+            match crate::netns_policy::policy_content_changed(&self.cfg, &new_cfg) {
+                Ok(true) => {
+                    tracing::error!(
+                        generation = %new_cfg.netns_broker.generation,
+                        "hot-reload: namespaced launch policy changed without a new generation - keeping current config"
+                    );
+                    return;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "hot-reload: failed to compare namespace policy content - keeping current config"
+                    );
+                    return;
+                }
+            }
+        }
+
+        if let Err(e) = crate::verify_netns_broker_for_config(&new_cfg).await {
+            tracing::error!(
+                error = %e,
+                "hot-reload: namespace broker readiness check failed - keeping current config"
+            );
+            return;
+        }
+
         if new_cfg.global.name != self.cfg.global.name {
             tracing::warn!(
                 old = %self.cfg.global.name,
@@ -1296,6 +1324,8 @@ impl Worker {
             || self.cfg.global.dangerous_global_rsync_success_exit_codes
                 != new_cfg.global.dangerous_global_rsync_success_exit_codes
             || self.cfg.global.staging_dir != new_cfg.global.staging_dir
+            || serde_json::to_vec(&self.cfg.netns_broker).ok()
+                != serde_json::to_vec(&new_cfg.netns_broker).ok()
             || serde_json::to_vec(&(
                 &self.cfg.cgroup,
                 &self.cfg.zfs,
@@ -1480,7 +1510,7 @@ impl Worker {
                     }
 
                     provider.set_log_publisher(self.log_broadcaster.publisher_for(name));
-                    let upstream = provider.upstream().to_owned();
+                    let upstream = crate::redact_url_diagnostic(provider.upstream());
                     let is_master = provider.is_master();
 
                     let now_utc = Utc::now();
@@ -1550,7 +1580,7 @@ impl Worker {
                         .expect("new provider prepared before applying reload");
                     self.cfg.mirrors.push(trans.config.clone());
                     provider.set_log_publisher(self.log_broadcaster.publisher_for(name));
-                    let upstream = provider.upstream().to_owned();
+                    let upstream = crate::redact_url_diagnostic(provider.upstream());
                     let is_master = provider.is_master();
 
                     self.mirror_statuses.insert(
@@ -1682,6 +1712,7 @@ impl Worker {
         // Update global config (interval/retry defaults etc.) from new file.
         self.cfg.global = new_cfg.global;
         self.cfg.manager = new_cfg.manager;
+        self.cfg.netns_broker = new_cfg.netns_broker;
         if new_cfg.server.addr != self.cfg.server.addr
             || new_cfg.server.port != self.cfg.server.port
             || new_cfg.server.ssl_cert != self.cfg.server.ssl_cert

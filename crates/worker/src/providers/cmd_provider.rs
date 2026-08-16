@@ -12,7 +12,9 @@ use async_trait::async_trait;
 use regex::Regex;
 
 use crate::hooks::DockerConfig;
+use crate::provider::LaunchPlanSpec;
 use crate::provider::MirrorProvider;
+use crate::provider::ProbeError;
 use crate::runner;
 
 /// Configuration for a command provider instance.
@@ -47,7 +49,7 @@ pub struct CmdProvider {
     pub atomic_staging_path: PathBuf,
     data_size: Mutex<String>,
     /// PID of the currently running child process (set before wait, cleared after).
-    current_pid: Arc<Mutex<Option<u32>>>,
+    current_pid: Arc<Mutex<Option<crate::runner::ProcessHandle>>>,
     /// Docker container name, set when DockerHook wraps the command.
     docker_container_name: Option<String>,
     /// Docker wrapping config — set by `build_providers()` when Docker is active.
@@ -57,6 +59,7 @@ pub struct CmdProvider {
     cgroup_hook: Option<std::sync::Arc<crate::hooks::CgroupHook>>,
     /// Per-mirror live-log broadcast sender (powers the streaming log API).
     log_publisher: Option<crate::log_stream::LogPublisher>,
+    broker_config: Option<crate::runner::BrokerConfig>,
 }
 
 impl CmdProvider {
@@ -144,6 +147,7 @@ impl CmdProvider {
             #[cfg(target_os = "linux")]
             cgroup_hook: None,
             log_publisher: None,
+            broker_config: None,
         })
     }
 
@@ -243,18 +247,24 @@ impl MirrorProvider for CmdProvider {
             Some(log_file.as_path())
         };
 
-        let proc = runner::spawn(
+        let placement = self
+            .broker_config
+            .as_ref()
+            .map(|broker| broker.placement("sync"))
+            .unwrap_or_default();
+        let proc = runner::spawn_placed(
             &argv,
             &sync_target,
             &spawn_env,
             log_path,
             self.log_publisher.clone(),
+            &placement,
         )
         .await?;
 
         // Store PID so terminate() can send SIGTERM.
-        if let Some(pid) = proc.pid() {
-            *self.current_pid.lock().unwrap() = Some(pid);
+        if let Some(handle) = proc.handle() {
+            *self.current_pid.lock().unwrap() = Some(handle);
         }
         // Place the child PID into the cgroup (Linux only).
         #[cfg(target_os = "linux")]
@@ -346,9 +356,9 @@ impl MirrorProvider for CmdProvider {
                 }
             }
             // Extract PID before awaiting so the MutexGuard is dropped (not Send).
-            let pid = *self.current_pid.lock().unwrap();
-            if let Some(pid) = pid {
-                runner::terminate_process_group(pid).await;
+            let handle = self.current_pid.lock().unwrap().clone();
+            if let Some(handle) = handle {
+                runner::terminate_process(handle).await?;
             }
         }
         Ok(())
@@ -372,15 +382,14 @@ impl MirrorProvider for CmdProvider {
 
     /// Probe upstream reachability before syncing.
     ///
-    /// For cmd providers the upstream URL might be HTTP(S), rsync://, ftp,
-    /// or anything the user's script supports — there is no single probe
-    /// command that works universally. We default to attempting an rsync
-    /// probe if the URL begins with `rsync://`, an HTTP HEAD otherwise.
+    /// Namespace-isolated command providers accept only rsync/http/https probe
+    /// URLs. Host commands may use other upstream schemes, but no generic
+    /// reachability probe is available for them.
     /// On a 5xx or network error we treat the URL as unreachable.
     /// Each probe is wrapped in a 15-second tokio::time::timeout, and the
     /// primary + fallbacks run concurrently — see RsyncProvider's
     /// probe_upstream for the rationale.
-    async fn probe_upstream(&self) -> anyhow::Result<()> {
+    async fn probe_upstream(&self) -> Result<(), ProbeError> {
         if !self.check_upstream {
             return Ok(());
         }
@@ -391,8 +400,11 @@ impl MirrorProvider for CmdProvider {
         let mut futures: FuturesUnordered<_> = urls
             .iter()
             .map(|&url| async move {
-                let res =
-                    tokio::time::timeout(std::time::Duration::from_secs(15), probe_url(url)).await;
+                let res = tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    probe_url(url, self.broker_config.as_ref(), &self.working_dir),
+                )
+                .await;
                 (url, res)
             })
             .collect();
@@ -404,26 +416,32 @@ impl MirrorProvider for CmdProvider {
                     if url != self.upstream.as_str() {
                         tracing::info!(
                             mirror = %self.name,
-                            primary = %self.upstream,
-                            reachable = %url,
+                            primary = %crate::redact_url_diagnostic(&self.upstream),
+                            reachable = %crate::redact_url_diagnostic(url),
                             "primary upstream unreachable; fallback responded"
                         );
                     }
                     return Ok(());
                 }
                 Ok(Err(e)) => {
-                    last_err = Some(format!("{url}: {e}"));
+                    if e.downcast_ref::<runner::IsolationError>().is_some() {
+                        return Err(ProbeError::Infrastructure(e.to_string()));
+                    }
+                    last_err = Some(format!("{}: {e}", crate::redact_url_diagnostic(url)));
                 }
                 Err(_) => {
-                    last_err = Some(format!("{url}: probe timed out after 15s"));
+                    last_err = Some(format!(
+                        "{}: probe timed out after 15s",
+                        crate::redact_url_diagnostic(url)
+                    ));
                 }
             }
         }
-        anyhow::bail!(
+        Err(ProbeError::Unreachable(format!(
             "all {} upstream(s) unreachable; last: {}",
             urls.len(),
             last_err.as_deref().unwrap_or("no probes attempted")
-        )
+        )))
     }
 
     fn set_docker_config(&mut self, config: DockerConfig) {
@@ -437,6 +455,30 @@ impl MirrorProvider for CmdProvider {
 
     fn set_log_publisher(&mut self, p: crate::log_stream::LogPublisher) {
         self.log_publisher = Some(p);
+    }
+
+    fn set_broker_config(&mut self, config: crate::runner::BrokerConfig) {
+        self.broker_config = Some(config);
+    }
+
+    fn launch_plan_specs(&self) -> Vec<LaunchPlanSpec> {
+        let dest = if self.atomic_publish_enabled {
+            self.atomic_staging_path.clone()
+        } else {
+            self.working_dir.clone()
+        };
+        let mut specs = vec![LaunchPlanSpec {
+            operation: "sync".into(),
+            argv: self.command.clone(),
+            cwd: dest.clone(),
+            env: self.tunasync_env(self.atomic_publish_enabled.then_some(dest.as_path())),
+        }];
+        if self.check_upstream {
+            for url in std::iter::once(&self.upstream).chain(&self.upstream_fallback) {
+                specs.push(probe_spec(url, &self.working_dir));
+            }
+        }
+        specs
     }
 
     #[cfg(target_os = "linux")]
@@ -454,18 +496,31 @@ impl CmdProvider {
 
 /// Probe a single URL for reachability — used by `CmdProvider::probe_upstream`.
 ///
-/// For `rsync://` URLs we delegate to the rsync probe in
-/// `rsync_provider::probe_rsync_url` (already wrapped with --contimeout and
-/// kill-on-drop). For other schemes (http, https, ftp, file, custom) we do
-/// an HTTP HEAD via reqwest; on any 2xx-or-3xx response or a redirect chain
-/// we consider it reachable. ftp/file/etc. are accepted optimistically
-/// (we return Ok without probing) — these are typically used with
-/// user scripts that don't lend themselves to a generic health check.
-async fn probe_url(url: &str) -> anyhow::Result<()> {
+/// For `rsync://` URLs we delegate to the rsync probe. HTTP(S) uses HEAD;
+/// other schemes fail closed because they have no generic health check.
+async fn probe_url(
+    url: &str,
+    broker: Option<&crate::runner::BrokerConfig>,
+    working_dir: &std::path::Path,
+) -> anyhow::Result<()> {
     if url.starts_with("rsync://") {
-        return super::rsync_provider::probe_rsync_url(url).await;
+        return super::rsync_provider::probe_configured_url(url, broker, working_dir).await;
     }
     if url.starts_with("http://") || url.starts_with("https://") {
+        if let Some(broker) = broker {
+            let spec = super::rsync_provider::http_probe_spec(url, working_dir);
+            let placement = broker.placement(spec.operation);
+            let proc = runner::spawn_placed(
+                &spec.argv,
+                working_dir,
+                &HashMap::new(),
+                None,
+                None,
+                &placement,
+            )
+            .await?;
+            return proc.wait(&[]).await;
+        }
         // Share a single reqwest::Client across all probe calls. Each Client
         // maintains its own connection pool; rebuilding it on every probe
         // throws away DNS cache and TLS sessions unnecessarily, adding latency
@@ -483,15 +538,18 @@ async fn probe_url(url: &str) -> anyhow::Result<()> {
             .head(url)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("http HEAD failed: {e}"))?;
+            .map_err(|error| anyhow::anyhow!("http HEAD failed: {}", error.without_url()))?;
         let status = resp.status();
         if status.is_success() || status.is_redirection() {
             return Ok(());
         }
         anyhow::bail!("http HEAD returned status {status}");
     }
-    // ftp://, file://, custom schemes: optimistic — assume reachable.
-    Ok(())
+    anyhow::bail!("unsupported probe URL scheme")
+}
+
+fn probe_spec(url: &str, working_dir: &std::path::Path) -> LaunchPlanSpec {
+    super::rsync_provider::probe_plan_spec(url, working_dir)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

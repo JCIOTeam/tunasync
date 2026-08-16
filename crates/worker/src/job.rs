@@ -454,17 +454,18 @@ async fn run_sync_with_retry(
     // Upstream probe: if check_upstream is set, verify at least one of the
     // configured URLs is reachable before wasting bandwidth on a full sync.
     if let Err(e) = provider.probe_upstream().await {
-        tracing::warn!(mirror = %name, error = %e, "upstream probe failed; skipping sync");
+        let infrastructure = matches!(e, crate::provider::ProbeError::Infrastructure(_));
+        tracing::warn!(mirror = %name, error = %e, infrastructure, "upstream probe failed");
         let _ = status_tx
             .send(JobMessage {
                 job_generation,
                 status: SyncStatus::Failed,
                 name: name.to_owned(),
-                msg: format!("upstream unreachable: {e}"),
+                msg: e.to_string(),
                 schedule: true,
                 size: String::new(),
                 transferred_bytes: 0,
-                skip_sync: true,
+                skip_sync: !infrastructure,
             })
             .await;
         return false;

@@ -144,8 +144,28 @@ jobs:
       - name: Package
         run: |
           DIR="target/${{ matrix.target }}/release"
-          tar -czf "${{ matrix.artifact }}.tar.gz" \
-            -C "$DIR" tunasync tunasynctl
+          PKG="${{ runner.temp }}/${{ matrix.artifact }}"
+          mkdir -p "$PKG/bin" "$PKG/systemd/tunasync-worker.service.d"
+          install -m 0755 "$DIR/tunasync" "$DIR/tunasynctl" \
+            "$DIR/tunasync-netns-broker" "$PKG/bin/"
+          install -m 0644 \
+            initscripts/tunasync-worker.service \
+            initscripts/tunasync-netns-broker.service \
+            "$PKG/systemd/"
+          install -m 0644 initscripts/tunasync-worker-netns.conf \
+            "$PKG/systemd/tunasync-worker.service.d/netns.conf"
+          tar -czf "${{ matrix.artifact }}.tar.gz" -C "$PKG" .
+          tar -tzf "${{ matrix.artifact }}.tar.gz" | sort
+          for path in \
+            ./bin/tunasync \
+            ./bin/tunasynctl \
+            ./bin/tunasync-netns-broker \
+            ./systemd/tunasync-worker.service \
+            ./systemd/tunasync-netns-broker.service \
+            ./systemd/tunasync-worker.service.d/netns.conf
+          do
+            tar -tzf "${{ matrix.artifact }}.tar.gz" | grep -Fx "$path"
+          done
           sha256sum "${{ matrix.artifact }}.tar.gz" \
             > "${{ matrix.artifact }}.tar.gz.sha256"
 

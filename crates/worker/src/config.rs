@@ -125,6 +125,10 @@ pub struct WorkerConfig {
     #[serde(default)]
     pub cgroup: CgroupConfig,
 
+    /// Client settings for the privileged network namespace broker.
+    #[serde(default)]
+    pub netns_broker: NetnsBrokerConfig,
+
     /// ZFS snapshot hooks.
     #[serde(default)]
     pub zfs: ZfsConfig,
@@ -479,6 +483,34 @@ pub struct CgroupConfig {
     pub subsystem: String,
 }
 
+/// Unprivileged worker-side broker connection settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetnsBrokerConfig {
+    #[serde(default = "NetnsBrokerConfig::default_socket")]
+    pub socket: String,
+    #[serde(default = "NetnsBrokerConfig::default_generation")]
+    pub generation: String,
+}
+
+impl NetnsBrokerConfig {
+    fn default_socket() -> String {
+        tunasync_netns::DEFAULT_SOCKET.into()
+    }
+
+    fn default_generation() -> String {
+        "default".into()
+    }
+}
+
+impl Default for NetnsBrokerConfig {
+    fn default() -> Self {
+        Self {
+            socket: Self::default_socket(),
+            generation: Self::default_generation(),
+        }
+    }
+}
+
 /// ZFS snapshot hooks.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ZfsConfig {
@@ -557,6 +589,13 @@ pub struct MirrorConfig {
 
     #[serde(default)]
     pub env: HashMap<String, String>,
+
+    /// Linux network namespace name under `/run/netns`; never a path.
+    /// Isolated commands must be root-controlled ELF binaries: shebang scripts
+    /// are unsupported, and the target cannot daemonize or change its session
+    /// or process group because the broker must retain kill/reap ownership.
+    #[serde(default)]
+    pub network_namespace: String,
 
     /// `"master"` | `"slave"` | `""` (default = master).
     #[serde(default)]
@@ -795,6 +834,11 @@ fn merge_mirror(parent: MirrorConfig, child: MirrorConfig) -> MirrorConfig {
             parent.env
         } else {
             child.env
+        },
+        network_namespace: if child.network_namespace.is_empty() {
+            parent.network_namespace
+        } else {
+            child.network_namespace
         },
         role: if child.role.is_empty() {
             parent.role

@@ -140,7 +140,10 @@ impl ManagerClient {
                 Ok(resp) => {
                     let code = resp.status();
                     let body = resp.text().await.unwrap_or_default();
-                    last_err = anyhow::anyhow!("POST {url} returned {code}: {body}");
+                    last_err = anyhow::anyhow!(
+                        "POST {} returned {code}: {body}",
+                        crate::redact_url_diagnostic(&url)
+                    );
                 }
                 Err(e) => last_err = e.into(),
             }
@@ -177,15 +180,21 @@ impl ManagerClient {
             .json(status)
             .send()
             .await
-            .with_context(|| format!("POST {url}"))?;
+            .with_context(|| format!("POST {}", crate::redact_url_diagnostic(&url)))?;
         let code = resp.status();
         if !code.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("POST {url} returned {code}: {body}");
+            anyhow::bail!(
+                "POST {} returned {code}: {body}",
+                crate::redact_url_diagnostic(&url)
+            );
         }
-        resp.json::<WorkerStatus>()
-            .await
-            .with_context(|| format!("decode registration response from {url}"))
+        resp.json::<WorkerStatus>().await.with_context(|| {
+            format!(
+                "decode registration response from {}",
+                crate::redact_url_diagnostic(&url)
+            )
+        })
     }
 
     // ------------------------------------------------------------------
@@ -217,7 +226,7 @@ impl ManagerClient {
         } else if result.errors.len() < result.attempted {
             // At least one base succeeded — partial failure is acceptable.
             for (url, e) in &result.errors {
-                tracing::warn!(url = %url, error = %e, "partial status report failure");
+                tracing::warn!(url = %crate::redact_url_diagnostic(url), error = %e, "partial status report failure");
             }
             self.pending
                 .lock()
@@ -306,7 +315,7 @@ impl ManagerClient {
             Ok(())
         } else if result.errors.len() < result.attempted {
             for (url, e) in &result.errors {
-                tracing::warn!(url = %url, error = %e, "partial size report failure");
+                tracing::warn!(url = %crate::redact_url_diagnostic(url), error = %e, "partial size report failure");
             }
             self.pending
                 .lock()
@@ -347,7 +356,7 @@ impl ManagerClient {
             Ok(())
         } else if result.errors.len() < result.attempted {
             for (url, e) in &result.errors {
-                tracing::warn!(url = %url, error = %e, "partial schedule report failure");
+                tracing::warn!(url = %crate::redact_url_diagnostic(url), error = %e, "partial schedule report failure");
             }
             self.pending.lock().await.schedules = Some(schedules.clone());
             Ok(())
@@ -379,7 +388,7 @@ impl ManagerClient {
                 .await
             {
                 Err(e) => {
-                    tracing::warn!(url = %url, error = %e, "manager request failed");
+                    tracing::warn!(url = %crate::redact_url_diagnostic(&url), error = %e, "manager request failed");
                     errors.push((base.clone(), e.into()));
                 }
                 Ok(resp) => {
@@ -388,7 +397,11 @@ impl ManagerClient {
                         let body = resp.text().await.unwrap_or_default();
                         errors.push((
                             base.clone(),
-                            anyhow::anyhow!("POST {url} returned {}: {body}", status),
+                            anyhow::anyhow!(
+                                "POST {} returned {}: {body}",
+                                crate::redact_url_diagnostic(&url),
+                                status
+                            ),
                         ));
                     }
                     // success — no need to record it

@@ -6,19 +6,23 @@ After=network.target
 Type=simple
 User=tunasync
 ExecStartPre=/usr/bin/tunasync worker --check -c /etc/tunasync/worker.conf --with-systemd
-ExecStart=/usr/bin/tunasync worker -c /etc/tunasync/worker.conf --with-systemd
+ExecStart=/usr/bin/tunasync worker -c /etc/tunasync/worker.conf --pidfile /run/tunasync-worker/tunasync.worker.pid --with-systemd
 ExecReload=/bin/kill -SIGHUP $MAINPID
 Restart=on-failure
 RestartSec=5
-RuntimeDirectory=tunasync
+KillMode=control-group
+RuntimeDirectory=tunasync-worker
 StateDirectory=tunasync
 LogsDirectory=tunasync
 
-# Hardening
+# Hardening. Sites using mirror or staging paths outside /srv/mirrors must add
+# those exact paths with ReadWritePaths= in a local systemd drop-in.
 ProtectSystem=strict
-ReadWritePaths=/srv/mirrors
 ProtectHome=yes
 NoNewPrivileges=yes
+ReadWritePaths=/srv/mirrors
+TasksMax=512
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target

@@ -37,6 +37,52 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
+  privileged-netns-smoke:
+    name: Privileged network namespace smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install network namespace tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y iproute2
+      - name: Build isolated smoke targets
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/tunasync-netns-target
+        run: |
+          cargo build -p tunasync-netns-broker --bins
+          cargo test -p tunasync-netns-broker --no-run
+      - name: Install root-controlled smoke executables
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/tunasync-netns-target
+        run: |
+          sudo install -d -o root -g root -m 0755 /usr/local/libexec
+          TEST_BIN=$(printf '%s\n' "$CARGO_TARGET_DIR"/debug/deps/privileged_smoke-* | \
+            while read -r candidate; do
+              if [ -x "$candidate" ] && [ "${candidate##*.}" != "d" ]; then
+                printf '%s\n' "$candidate"
+                break
+              fi
+            done)
+          test -n "$TEST_BIN"
+          sudo install -o root -g root -m 0755 \
+            "$CARGO_TARGET_DIR/debug/tunasync-netns-broker" \
+            /usr/local/libexec/tunasync-netns-broker-smoke
+          sudo install -o root -g root -m 0755 \
+            "$CARGO_TARGET_DIR/debug/tunasync-netns-smoke-helper" \
+            /usr/local/libexec/tunasync-netns-smoke-helper
+          sudo install -o root -g root -m 0755 "$TEST_BIN" \
+            /usr/local/libexec/tunasync-netns-privileged-smoke-test
+      - name: Run privileged broker smoke test
+        run: |
+          sudo env \
+            TUNASYNC_NETNS_BROKER=/usr/local/libexec/tunasync-netns-broker-smoke \
+            TUNASYNC_NETNS_SMOKE_HELPER=/usr/local/libexec/tunasync-netns-smoke-helper \
+            /usr/local/libexec/tunasync-netns-privileged-smoke-test \
+            privileged_setns_execution_smoke_test \
+            --ignored --nocapture --exact
+
   security-audit:
     name: Dependency security audit
     runs-on: ubuntu-latest

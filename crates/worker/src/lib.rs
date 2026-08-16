@@ -14,6 +14,7 @@ pub mod http_server;
 pub mod job;
 pub mod log_stream;
 pub mod manager_client;
+pub mod netns_policy;
 pub mod priority_semaphore;
 pub mod provider;
 pub mod providers;
@@ -137,6 +138,15 @@ pub(crate) fn validate_worker_config(cfg: &config::WorkerConfig) -> Vec<String> 
     if let Err(e) = cfg.server.bind_addr() {
         errors.push(e);
     }
+    if let Err(e) = tunasync_netns::validate_absolute_normalized_path(
+        &cfg.netns_broker.socket,
+        "netns_broker.socket",
+    ) {
+        errors.push(e);
+    }
+    if cfg.netns_broker.generation.is_empty() || cfg.netns_broker.generation.len() > 128 {
+        errors.push("netns_broker.generation must contain 1..=128 characters".into());
+    }
 
     if !cfg.global.timezone.is_empty() {
         if let Err(e) = cfg.global.timezone.parse::<chrono_tz::Tz>() {
@@ -163,6 +173,13 @@ pub(crate) fn validate_worker_config(cfg: &config::WorkerConfig) -> Vec<String> 
     }
 
     let mut seen = std::collections::HashSet::new();
+    let has_network_namespace = cfg
+        .mirrors
+        .iter()
+        .any(|mc| !mc.network_namespace.is_empty());
+    if has_network_namespace && cfg.cgroup.enable {
+        errors.push("cgroup.enable cannot be combined with network_namespace in phase 2".into());
+    }
     for mc in &cfg.mirrors {
         if !seen.insert(mc.name.as_str()) {
             errors.push(format!("duplicate mirror name {:?}", mc.name));
@@ -172,6 +189,122 @@ pub(crate) fn validate_worker_config(cfg: &config::WorkerConfig) -> Vec<String> 
         }
         if let Some(e) = validate_relative_path(&mc.mirror_subdir, "mirror_subdir", &mc.name) {
             errors.push(e);
+        }
+        if !mc.network_namespace.is_empty() {
+            #[cfg(not(target_os = "linux"))]
+            errors.push(format!(
+                "mirror {:?}: network_namespace is only supported on Linux",
+                mc.name
+            ));
+            if let Err(e) = tunasync_netns::validate_namespace_name(&mc.network_namespace) {
+                errors.push(format!("mirror {:?}: {e}", mc.name));
+            }
+            if cfg.docker.enable && !mc.docker_image.is_empty() {
+                errors.push(format!(
+                    "mirror {:?}: Docker and network_namespace cannot both be active",
+                    mc.name
+                ));
+            }
+            for (field, upstream) in std::iter::once(("upstream", &mc.upstream)).chain(
+                mc.upstream_fallback
+                    .iter()
+                    .map(|url| ("upstream_fallback", url)),
+            ) {
+                if upstream.is_empty() {
+                    continue;
+                }
+                match url::Url::parse(upstream) {
+                    Ok(url) if url_has_forbidden_credentials(upstream, &url) => {
+                        errors.push(format!(
+                            "mirror {:?}: network namespace {field} URL must not contain userinfo, password, query, or fragment: {:?}",
+                            mc.name,
+                            redact_url_diagnostic(upstream)
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(_) if upstream.contains(['?', '#']) => errors.push(format!(
+                        "mirror {:?}: network namespace {field} URL must not contain userinfo, password, query, or fragment: {:?}",
+                        mc.name,
+                        redact_url_diagnostic(upstream)
+                    )),
+                    Err(_) => {}
+                }
+            }
+            for key in mc.env.keys() {
+                if let Err(e) = tunasync_netns::validate_env_key(key) {
+                    errors.push(format!("mirror {:?}: {e}", mc.name));
+                }
+            }
+            let cwd = mc.effective_mirror_dir(&cfg.global);
+            if let Err(e) = tunasync_netns::validate_absolute_normalized_path(
+                &cwd.to_string_lossy(),
+                "mirror working directory",
+            ) {
+                errors.push(format!("mirror {:?}: {e}", mc.name));
+            }
+            if mc.provider == ProviderKind::Command {
+                match shell_words::split(&mc.command) {
+                    Ok(argv)
+                        if argv
+                            .first()
+                            .is_some_and(|program| std::path::Path::new(program).is_absolute()) => {}
+                    Ok(_) => errors.push(format!(
+                        "mirror {:?}: network namespace command executable must be an absolute path",
+                        mc.name
+                    )),
+                    Err(e) => errors.push(format!(
+                        "mirror {:?}: cannot parse network namespace command: {e}",
+                        mc.name
+                    )),
+                }
+            }
+            if matches!(
+                mc.provider,
+                ProviderKind::Rsync | ProviderKind::TwoStageRsync
+            ) && !mc.command.is_empty()
+                && !std::path::Path::new(&mc.command).is_absolute()
+            {
+                errors.push(format!(
+                    "mirror {:?}: custom network namespace rsync command must be an absolute path",
+                    mc.name
+                ));
+            }
+            let log_dir = if mc.log_dir.is_empty() {
+                &cfg.global.log_dir
+            } else {
+                &mc.log_dir
+            };
+            if mc.provider == ProviderKind::Command && log_dir.is_empty() {
+                errors.push(format!(
+                    "mirror {:?}: network namespace command provider requires an absolute log directory",
+                    mc.name
+                ));
+            }
+            if !log_dir.is_empty() {
+                if let Err(e) = tunasync_netns::validate_absolute_normalized_path(
+                    log_dir,
+                    "mirror log directory",
+                ) {
+                    errors.push(format!("mirror {:?}: {e}", mc.name));
+                }
+            }
+            if mc.check_upstream {
+                for upstream in std::iter::once(&mc.upstream).chain(&mc.upstream_fallback) {
+                    if !matches!(
+                        url::Url::parse(upstream)
+                            .ok()
+                            .map(|url| url.scheme().to_owned())
+                            .as_deref(),
+                        Some("rsync" | "http" | "https")
+                    ) {
+                        errors.push(format!(
+                            "mirror {:?}: network namespace command probes only support rsync/http/https URLs, got {:?}",
+                            mc.name,
+                            redact_url_diagnostic(upstream)
+                        ));
+                    }
+                }
+            }
         }
         if !mc.disk_quota.is_empty()
             && tunasync_common::util::parse_size_bytes(&mc.disk_quota).is_none()
@@ -297,6 +430,8 @@ pub async fn run(config_path: std::path::PathBuf) -> Result<()> {
         build_one_provider(mc, &cfg)?;
     }
 
+    verify_netns_broker_for_config(&cfg).await?;
+
     let listen_ip = cfg.server.bind_addr().map_err(anyhow::Error::msg)?.ip();
     if !listen_ip.is_loopback() && cfg.manager.api_token.is_empty() {
         tracing::warn!(
@@ -321,6 +456,48 @@ pub async fn run(config_path: std::path::PathBuf) -> Result<()> {
 
     let w = worker::Worker::new(cfg, config_path, build_providers, http_client);
     w.run().await.context("worker run failed")
+}
+
+pub(crate) async fn verify_netns_broker_for_config(cfg: &config::WorkerConfig) -> Result<()> {
+    if cfg
+        .mirrors
+        .iter()
+        .all(|mirror| mirror.network_namespace.is_empty())
+    {
+        return Ok(());
+    }
+    runner::verify_broker_ready(
+        std::path::Path::new(&cfg.netns_broker.socket),
+        &cfg.netns_broker.generation,
+    )
+    .await
+    .context("network namespace broker is not ready for this worker configuration")
+}
+
+pub(crate) fn redact_url_diagnostic(value: &str) -> String {
+    let Ok(mut url) = url::Url::parse(value) else {
+        return value
+            .split(['?', '#'])
+            .next()
+            .unwrap_or_default()
+            .to_string();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
+fn url_has_forbidden_credentials(value: &str, url: &url::Url) -> bool {
+    let has_raw_userinfo = value
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+        .is_some_and(|authority| authority.contains('@'));
+    has_raw_userinfo
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
 }
 
 /// Build (provider, hooks) pairs from the worker config.
@@ -394,6 +571,7 @@ pub fn build_one_provider(
     let log_path_arc =
         log_path_shared.unwrap_or_else(|| Arc::new(Mutex::new(log_dir.join("latest.log"))));
     provider.set_log_path_shared(Arc::clone(&log_path_arc));
+    configure_provider_broker(provider.as_mut(), mc, cfg);
 
     // Docker hook — also wires up argv wrapping on the provider.
     // Docker and cgroup are mutually exclusive — matches Go:
@@ -522,6 +700,22 @@ pub fn build_one_provider(
     }
 
     Ok((provider, hooks))
+}
+
+fn configure_provider_broker(
+    provider: &mut dyn provider::MirrorProvider,
+    mc: &config::MirrorConfig,
+    cfg: &config::WorkerConfig,
+) {
+    if mc.network_namespace.is_empty() {
+        return;
+    }
+    provider.set_broker_config(runner::BrokerConfig {
+        socket: PathBuf::from(&cfg.netns_broker.socket),
+        generation: cfg.netns_broker.generation.clone(),
+        mirror: mc.name.clone(),
+        namespace: mc.network_namespace.clone(),
+    });
 }
 
 /// Compute the full environment map for Docker `-e` flags.
@@ -682,6 +876,91 @@ mod tests {
     }
 
     #[test]
+    fn network_namespace_validation_rejects_conflicts_and_bad_probe_schemes() {
+        let mirror = MirrorConfig {
+            name: "isolated".into(),
+            provider: ProviderKind::Command,
+            command: "/bin/true".into(),
+            upstream: "ftp://example.invalid/pub".into(),
+            check_upstream: true,
+            network_namespace: "warp0".into(),
+            docker_image: "example/image".into(),
+            ..Default::default()
+        };
+        let mut cfg = validated_config(mirror);
+        cfg.global.mirror_dir = "/srv/mirrors".into();
+        cfg.global.log_dir = "/var/log/tunasync".into();
+        cfg.docker.enable = true;
+        cfg.cgroup.enable = true;
+        let errors = crate::validate_worker_config(&cfg);
+        assert!(errors.iter().any(|e| e.contains("cgroup.enable")));
+        assert!(errors.iter().any(|e| e.contains("Docker")));
+        assert!(errors.iter().any(|e| e.contains("rsync/http/https")));
+    }
+
+    #[test]
+    fn network_namespace_validation_rejects_credential_bearing_url_components() {
+        for upstream in [
+            "https://@example.invalid/data",
+            "https://user@example.invalid/data",
+            "https://user:password@example.invalid/data",
+            "https://example.invalid/data?token=secret",
+            "https://example.invalid/data#secret",
+        ] {
+            let mirror = MirrorConfig {
+                name: "isolated".into(),
+                provider: ProviderKind::Command,
+                command: "/bin/true".into(),
+                upstream: upstream.into(),
+                network_namespace: "warp0".into(),
+                ..Default::default()
+            };
+            let mut cfg = validated_config(mirror);
+            cfg.global.mirror_dir = "/srv/mirrors".into();
+            cfg.global.log_dir = "/var/log/tunasync".into();
+            let errors = crate::validate_worker_config(&cfg);
+            assert!(
+                errors.iter().any(|e| e.contains("must not contain")),
+                "accepted {upstream:?}: {errors:?}"
+            );
+        }
+
+        let mirror = MirrorConfig {
+            name: "isolated".into(),
+            provider: ProviderKind::Command,
+            command: "/bin/true".into(),
+            upstream: "https://example.invalid/data".into(),
+            upstream_fallback: vec!["https://user:secret@example.invalid/fallback".into()],
+            network_namespace: "warp0".into(),
+            ..Default::default()
+        };
+        let mut cfg = validated_config(mirror);
+        cfg.global.mirror_dir = "/srv/mirrors".into();
+        cfg.global.log_dir = "/var/log/tunasync".into();
+        let diagnostic = crate::validate_worker_config(&cfg).join(" ");
+        assert!(diagnostic.contains("upstream_fallback"));
+        assert!(!diagnostic.contains("secret"));
+    }
+
+    #[test]
+    fn inherited_network_namespace_is_flattened() {
+        let cfg: WorkerConfig = tunasync_common::config::parse_toml(
+            r#"
+[[mirrors]]
+name = "parent"
+network_namespace = "warp0"
+
+[[mirrors.mirrors]]
+name = "child"
+upstream = "rsync://example.invalid/module/"
+"#,
+        )
+        .unwrap();
+        let flat = crate::config::flatten_mirrors(&cfg.mirrors_conf);
+        assert_eq!(flat[0].network_namespace, "warp0");
+    }
+
+    #[test]
     fn expand_log_dir_name() {
         let mc = MirrorConfig::default();
         let result = crate::expand_log_dir_template("/var/log/{{.Name}}", &mc);
@@ -717,5 +996,19 @@ mod tests {
         let result =
             crate::expand_log_dir_template("/var/log/{{.Provider}}/{{.Name}}/{{.Role}}", &mc);
         assert_eq!(result, "/var/log/two-stage-rsync/archlinux/master");
+    }
+
+    #[test]
+    fn url_diagnostics_remove_secrets_and_nonessential_components() {
+        assert_eq!(
+            crate::redact_url_diagnostic(
+                "rsync://user:password@example.invalid/module?token=secret#fragment"
+            ),
+            "rsync://example.invalid/module"
+        );
+        assert_eq!(
+            crate::redact_url_diagnostic("not-a-url?token=secret#fragment"),
+            "not-a-url"
+        );
     }
 }

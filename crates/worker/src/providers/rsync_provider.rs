@@ -9,7 +9,9 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 
 use crate::hooks::DockerConfig;
+use crate::provider::LaunchPlanSpec;
 use crate::provider::MirrorProvider;
+use crate::provider::ProbeError;
 use crate::runner;
 
 /// Rsync provider.
@@ -49,7 +51,7 @@ pub struct RsyncProvider {
     pub success_exit_codes: Vec<i32>,
     data_size: Mutex<String>,
     transferred_bytes: Mutex<u64>,
-    current_pid: Arc<Mutex<Option<u32>>>,
+    current_pid: Arc<Mutex<Option<crate::runner::ProcessHandle>>>,
     /// Docker container name, set when DockerHook wraps the command.
     docker_container_name: Option<String>,
     /// Docker wrapping config — set by `build_providers()` when Docker is active.
@@ -64,6 +66,7 @@ pub struct RsyncProvider {
     /// stderr line is pushed into the replay buffer + broadcast channel
     /// powering the streaming HTTP API.
     log_publisher: Option<crate::log_stream::LogPublisher>,
+    broker_config: Option<crate::runner::BrokerConfig>,
 }
 
 impl RsyncProvider {
@@ -73,7 +76,10 @@ impl RsyncProvider {
         global: &crate::config::GlobalConfig,
     ) -> Result<Self> {
         if !mc.upstream.ends_with('/') {
-            anyhow::bail!("rsync upstream URL must end with '/': {:?}", mc.upstream);
+            anyhow::bail!(
+                "rsync upstream URL must end with '/': {:?}",
+                crate::redact_url_diagnostic(&mc.upstream)
+            );
         }
 
         let working_dir = mc.effective_mirror_dir(global);
@@ -187,6 +193,7 @@ impl RsyncProvider {
             #[cfg(target_os = "linux")]
             cgroup_hook: None,
             log_publisher: None,
+            broker_config: None,
         })
     }
 
@@ -198,7 +205,12 @@ impl RsyncProvider {
     /// Build the rsync argv targeting a specific destination directory.
     /// Used by `run()` so atomic-publish can redirect output to `.staging`.
     fn build_argv_for_dest(&self, dest: &std::path::Path) -> Vec<String> {
-        let mut argv = vec![self.rsync_cmd.clone()];
+        let executable = if self.broker_config.is_some() && self.rsync_cmd == "rsync" {
+            "/usr/bin/rsync".to_string()
+        } else {
+            self.rsync_cmd.clone()
+        };
+        let mut argv = vec![executable];
         argv.extend(self.options.iter().cloned());
         argv.push(self.upstream.clone());
         argv.push(dest.to_string_lossy().into());
@@ -303,18 +315,24 @@ impl MirrorProvider for RsyncProvider {
             Some(log_file.as_path())
         };
 
-        let proc = runner::spawn(
+        let placement = self
+            .broker_config
+            .as_ref()
+            .map(|broker| broker.placement("sync"))
+            .unwrap_or_default();
+        let proc = runner::spawn_placed(
             &argv,
             &sync_target,
             &spawn_env,
             log_path,
             self.log_publisher.clone(),
+            &placement,
         )
         .await
         .with_context(|| format!("spawn rsync for {}", self.name))?;
 
-        if let Some(pid) = proc.pid() {
-            *self.current_pid.lock().unwrap() = Some(pid);
+        if let Some(handle) = proc.handle() {
+            *self.current_pid.lock().unwrap() = Some(handle);
         }
         // Place the child PID into the cgroup (Linux only). Must happen between
         // spawn() and wait() so the process is in the cgroup before it executes.
@@ -385,9 +403,9 @@ impl MirrorProvider for RsyncProvider {
                 }
             }
             // Extract PID before awaiting so the MutexGuard is dropped (not Send).
-            let pid = *self.current_pid.lock().unwrap();
-            if let Some(pid) = pid {
-                runner::terminate_process_group(pid).await;
+            let handle = self.current_pid.lock().unwrap().clone();
+            if let Some(handle) = handle {
+                runner::terminate_process(handle).await?;
             }
         }
         Ok(())
@@ -436,7 +454,7 @@ impl MirrorProvider for RsyncProvider {
     /// budget across all URLs.
     ///
     /// When `check_upstream` is false (default) this is a no-op.
-    async fn probe_upstream(&self) -> anyhow::Result<()> {
+    async fn probe_upstream(&self) -> Result<(), ProbeError> {
         if !self.check_upstream {
             return Ok(());
         }
@@ -447,9 +465,11 @@ impl MirrorProvider for RsyncProvider {
         let mut futures: FuturesUnordered<_> = urls
             .iter()
             .map(|&url| async move {
-                let res =
-                    tokio::time::timeout(std::time::Duration::from_secs(15), probe_rsync_url(url))
-                        .await;
+                let res = tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    probe_configured_url(url, self.broker_config.as_ref(), &self.working_dir),
+                )
+                .await;
                 (url, res)
             })
             .collect();
@@ -461,26 +481,32 @@ impl MirrorProvider for RsyncProvider {
                     if url != self.upstream.as_str() {
                         tracing::info!(
                             mirror = %self.name,
-                            primary = %self.upstream,
-                            reachable = %url,
+                            primary = %crate::redact_url_diagnostic(&self.upstream),
+                            reachable = %crate::redact_url_diagnostic(url),
                             "primary upstream unreachable; fallback responded"
                         );
                     }
                     return Ok(());
                 }
                 Ok(Err(e)) => {
-                    last_err = Some(format!("{url}: {e}"));
+                    if e.downcast_ref::<runner::IsolationError>().is_some() {
+                        return Err(ProbeError::Infrastructure(e.to_string()));
+                    }
+                    last_err = Some(format!("{}: {e}", crate::redact_url_diagnostic(url)));
                 }
                 Err(_) => {
-                    last_err = Some(format!("{url}: probe timed out after 15s"));
+                    last_err = Some(format!(
+                        "{}: probe timed out after 15s",
+                        crate::redact_url_diagnostic(url)
+                    ));
                 }
             }
         }
-        anyhow::bail!(
+        Err(ProbeError::Unreachable(format!(
             "all {} upstream(s) unreachable; last: {}",
             urls.len(),
             last_err.as_deref().unwrap_or("no probes attempted")
-        )
+        )))
     }
 
     fn set_docker_config(&mut self, config: DockerConfig) {
@@ -494,6 +520,30 @@ impl MirrorProvider for RsyncProvider {
 
     fn set_log_publisher(&mut self, p: crate::log_stream::LogPublisher) {
         self.log_publisher = Some(p);
+    }
+
+    fn set_broker_config(&mut self, config: crate::runner::BrokerConfig) {
+        self.broker_config = Some(config);
+    }
+
+    fn launch_plan_specs(&self) -> Vec<LaunchPlanSpec> {
+        let dest = if self.atomic_publish_enabled {
+            self.atomic_staging_path.clone()
+        } else {
+            self.working_dir.clone()
+        };
+        let mut specs = vec![LaunchPlanSpec {
+            operation: "sync".into(),
+            argv: self.build_argv_for_dest(&dest),
+            cwd: dest.clone(),
+            env: self.rsync_env.clone(),
+        }];
+        if self.check_upstream {
+            for url in std::iter::once(&self.upstream).chain(&self.upstream_fallback) {
+                specs.push(probe_plan_spec(url, &self.working_dir));
+            }
+        }
+        specs
     }
 
     #[cfg(target_os = "linux")]
@@ -746,73 +796,127 @@ fn two_step_rename_fallback(
 ///
 /// Returns `Ok(())` if the exit code is 0; otherwise an error containing
 /// the exit code or stderr's first line for diagnostics.
-pub(crate) async fn probe_rsync_url(url: &str) -> anyhow::Result<()> {
-    let mut child = tokio::process::Command::new("rsync")
-        .args(["--contimeout=10", "--list-only", "--timeout=10", url])
-        // Capture stderr so we can include a useful message on failure
-        // without dumping it to the worker's terminal.
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        // Kill on drop: if the outer tokio::time::timeout fires and drops
-        // this future, the child process must die rather than orphan.
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to spawn rsync probe: {e}"))?;
-
-    // Drain stderr concurrently with wait().
-    //
-    // Without this, rsync writing more than the OS pipe buffer (64 KiB on
-    // Linux) blocks on write(2). The child can't exit because its stderr
-    // is full; child.wait() blocks because the child hasn't exited. The
-    // outer 15s timeout would eventually fire and kill the process, but
-    // we'd wait the full 15s on what should be a 1s failure (e.g. a
-    // verbose --list-only on a huge module printing thousands of lines).
-    //
-    // Spawn a background drain task so the pipe is read continuously.
-    // The take() removes stderr from the Child so we own it independently
-    // of child.wait(); the drain task ends when EOF arrives (i.e. when
-    // rsync closes its stderr, which happens on exit).
-    use tokio::io::AsyncReadExt;
-    let stderr_drain = child.stderr.take().map(|mut s| {
-        tokio::spawn(async move {
-            let mut buf = Vec::with_capacity(4096);
-            let _ = s.read_to_end(&mut buf).await;
-            buf
-        })
-    });
-
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to wait for rsync probe: {e}"))?;
-
-    // Best-effort: wait briefly for the drain task so we can include a
-    // stderr excerpt in the error message. Don't block forever — the
-    // process has already exited at this point, the pipe should EOF
-    // almost immediately.
-    let stderr_excerpt = if let Some(handle) = stderr_drain {
-        tokio::time::timeout(std::time::Duration::from_millis(500), handle)
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .map(|bytes| {
-                let s = String::from_utf8_lossy(&bytes);
-                s.lines().next().unwrap_or("").to_string()
-            })
-    } else {
-        None
-    };
-
-    if status.success() {
-        return Ok(());
+pub(crate) async fn probe_rsync_url(
+    url: &str,
+    broker: Option<&crate::runner::BrokerConfig>,
+    working_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    let mut spec = rsync_probe_spec(url, working_dir);
+    if broker.is_none() {
+        spec.argv[0] = "rsync".into();
     }
-    let code = status.code().unwrap_or(-1);
-    match stderr_excerpt {
-        Some(line) if !line.is_empty() => {
-            anyhow::bail!("rsync probe exited {code} for {url}: {line}")
+    let placement = broker
+        .map(|broker| broker.placement(spec.operation.clone()))
+        .unwrap_or_default();
+    let proc = runner::spawn_placed(
+        &spec.argv,
+        working_dir,
+        &HashMap::new(),
+        None,
+        None,
+        &placement,
+    )
+    .await?;
+    proc.wait(&[]).await
+}
+
+pub(crate) async fn probe_configured_url(
+    url: &str,
+    broker: Option<&crate::runner::BrokerConfig>,
+    working_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    if url.starts_with("rsync://") {
+        return probe_rsync_url(url, broker, working_dir).await;
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        if let Some(broker) = broker {
+            let spec = http_probe_spec(url, working_dir);
+            let placement = broker.placement(spec.operation.clone());
+            let proc = runner::spawn_placed(
+                &spec.argv,
+                working_dir,
+                &HashMap::new(),
+                None,
+                None,
+                &placement,
+            )
+            .await?;
+            return proc.wait(&[]).await;
         }
-        _ => anyhow::bail!("rsync probe exited {code} for {url}"),
+        use once_cell::sync::Lazy;
+        static HTTP_PROBE_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::limited(5))
+                .build()
+                .expect("build static http probe client")
+        });
+        let response = HTTP_PROBE_CLIENT
+            .head(url)
+            .send()
+            .await
+            .map_err(|error| anyhow::anyhow!("http HEAD failed: {}", error.without_url()))?;
+        if response.status().is_success() || response.status().is_redirection() {
+            return Ok(());
+        }
+        anyhow::bail!("http HEAD returned status {}", response.status());
     }
+    anyhow::bail!("unsupported probe URL scheme")
+}
+
+pub(crate) fn probe_plan_spec(url: &str, working_dir: &std::path::Path) -> LaunchPlanSpec {
+    if url.starts_with("rsync://") {
+        rsync_probe_spec(url, working_dir)
+    } else {
+        http_probe_spec(url, working_dir)
+    }
+}
+
+pub(crate) fn http_probe_spec(url: &str, working_dir: &std::path::Path) -> LaunchPlanSpec {
+    LaunchPlanSpec {
+        operation: format!("probe-http-{}", short_operation_hash(url)),
+        argv: vec![
+            "/usr/bin/curl".into(),
+            "--fail".into(),
+            "--head".into(),
+            "--location".into(),
+            "--max-redirs".into(),
+            "5".into(),
+            "--connect-timeout".into(),
+            "10".into(),
+            "--max-time".into(),
+            "10".into(),
+            "--silent".into(),
+            "--show-error".into(),
+            url.into(),
+        ],
+        cwd: working_dir.to_path_buf(),
+        env: HashMap::new(),
+    }
+}
+
+pub(crate) fn rsync_probe_spec(url: &str, working_dir: &std::path::Path) -> LaunchPlanSpec {
+    LaunchPlanSpec {
+        operation: format!("probe-rsync-{}", short_operation_hash(url)),
+        argv: vec![
+            "/usr/bin/rsync".into(),
+            "--contimeout=10".into(),
+            "--list-only".into(),
+            "--timeout=10".into(),
+            url.into(),
+        ],
+        cwd: working_dir.to_path_buf(),
+        env: HashMap::new(),
+    }
+}
+
+pub(crate) fn short_operation_hash(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(value.as_bytes());
+    digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 impl RsyncProvider {
@@ -838,7 +942,12 @@ mod upstream_probe_tests {
     #[tokio::test]
     #[ignore = "requires rsync binary in PATH"]
     async fn probe_unreachable_url_fails_fast() {
-        let result = probe_rsync_url("rsync://127.0.0.1:1/nonexistent").await;
+        let result = probe_rsync_url(
+            "rsync://127.0.0.1:1/nonexistent",
+            None,
+            std::path::Path::new("/tmp"),
+        )
+        .await;
         assert!(
             result.is_err(),
             "expected probe to fail for unreachable URL, got Ok"

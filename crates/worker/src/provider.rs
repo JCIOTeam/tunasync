@@ -11,6 +11,22 @@ use async_trait::async_trait;
 
 use crate::hooks::DockerConfig;
 
+#[derive(Debug, thiserror::Error)]
+pub enum ProbeError {
+    #[error("upstream unreachable: {0}")]
+    Unreachable(String),
+    #[error("isolation infrastructure failure: {0}")]
+    Infrastructure(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct LaunchPlanSpec {
+    pub operation: String,
+    pub argv: Vec<String>,
+    pub cwd: PathBuf,
+    pub env: std::collections::HashMap<String, String>,
+}
+
 /// What the worker scheduler needs from a provider.
 #[async_trait]
 pub trait MirrorProvider: Send + Sync {
@@ -51,8 +67,14 @@ pub trait MirrorProvider: Send + Sync {
     /// (rsync --list-only timeout, HTTP HEAD failure, etc).
     /// Default no-op = no probe. Providers that opt in (`check_upstream = true`)
     /// override this; failure causes the sync to be skipped, not retried.
-    async fn probe_upstream(&self) -> anyhow::Result<()> {
+    async fn probe_upstream(&self) -> Result<(), ProbeError> {
         Ok(())
+    }
+    /// Wire up privileged network namespace execution for syncs and probes.
+    fn set_broker_config(&mut self, _config: crate::runner::BrokerConfig) {}
+    /// Finite broker-authorized operations for deterministic policy emission.
+    fn launch_plan_specs(&self) -> Vec<LaunchPlanSpec> {
+        Vec::new()
     }
     /// Wire up Docker wrapping — called in `build_providers()` when Docker is
     /// active for this mirror. The provider uses the config to wrap its argv

@@ -1,0 +1,32 @@
+[package]
+name = "tunasync-netns-broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Privileged Linux network namespace broker for tunasync workers"
+
+[[bin]]
+name = "tunasync-netns-broker"
+path = "src/main.rs"
+
+[[bin]]
+name = "tunasync-netns-smoke-helper"
+path = "src/smoke_helper.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tunasync-netns = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

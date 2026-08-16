@@ -12,7 +12,9 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 
 use crate::hooks::DockerConfig;
+use crate::provider::LaunchPlanSpec;
 use crate::provider::MirrorProvider;
+use crate::provider::ProbeError;
 use crate::runner;
 
 /// Stage-1 profiles — matches Go's `rsyncStage1Profiles`.
@@ -77,7 +79,7 @@ pub struct TwoStageRsyncProvider {
     /// Resolved staging directory for atomic publish.
     pub atomic_staging_path: PathBuf,
     data_size: Mutex<String>,
-    current_pid: Arc<Mutex<Option<u32>>>,
+    current_pid: Arc<Mutex<Option<crate::runner::ProcessHandle>>>,
     docker_container_name: Option<String>,
     /// Docker wrapping config — set by `build_providers()` when Docker is active.
     docker_config: Option<DockerConfig>,
@@ -86,6 +88,7 @@ pub struct TwoStageRsyncProvider {
     cgroup_hook: Option<std::sync::Arc<crate::hooks::CgroupHook>>,
     /// Per-mirror live-log broadcast sender (powers the streaming log API).
     log_publisher: Option<crate::log_stream::LogPublisher>,
+    broker_config: Option<crate::runner::BrokerConfig>,
 }
 
 impl TwoStageRsyncProvider {
@@ -96,7 +99,7 @@ impl TwoStageRsyncProvider {
         if !mc.upstream.ends_with('/') {
             anyhow::bail!(
                 "two-stage-rsync upstream URL must end with '/': {:?}",
-                mc.upstream
+                crate::redact_url_diagnostic(&mc.upstream)
             );
         }
 
@@ -230,11 +233,17 @@ impl TwoStageRsyncProvider {
             #[cfg(target_os = "linux")]
             cgroup_hook: None,
             log_publisher: None,
+            broker_config: None,
         })
     }
 
     fn build_argv(&self, opts: &[String], dest: &std::path::Path) -> Vec<String> {
-        let mut argv = vec![self.rsync_cmd.clone()];
+        let executable = if self.broker_config.is_some() && self.rsync_cmd == "rsync" {
+            "/usr/bin/rsync".to_string()
+        } else {
+            self.rsync_cmd.clone()
+        };
+        let mut argv = vec![executable];
         argv.extend(opts.iter().cloned());
         argv.push(self.upstream.clone());
         argv.push(dest.to_string_lossy().into());
@@ -275,12 +284,25 @@ impl TwoStageRsyncProvider {
         } else {
             Some(log_file.as_path())
         };
-        let proc = runner::spawn(&argv, dest, &spawn_env, lp, self.log_publisher.clone())
-            .await
-            .with_context(|| format!("spawn rsync stage {stage} for {}", self.name))?;
+        let operation = if stage == 1 { "stage1" } else { "stage2" };
+        let placement = self
+            .broker_config
+            .as_ref()
+            .map(|broker| broker.placement(operation))
+            .unwrap_or_default();
+        let proc = runner::spawn_placed(
+            &argv,
+            dest,
+            &spawn_env,
+            lp,
+            self.log_publisher.clone(),
+            &placement,
+        )
+        .await
+        .with_context(|| format!("spawn rsync stage {stage} for {}", self.name))?;
 
-        if let Some(pid) = proc.pid() {
-            *self.current_pid.lock().unwrap() = Some(pid);
+        if let Some(handle) = proc.handle() {
+            *self.current_pid.lock().unwrap() = Some(handle);
         }
         // Place the child PID into the cgroup (Linux only). Both stages are
         // placed individually since each stage is a separate spawn/wait cycle.
@@ -387,9 +409,9 @@ impl MirrorProvider for TwoStageRsyncProvider {
                 }
             }
             // Extract PID before awaiting so the MutexGuard is dropped (not Send).
-            let pid = *self.current_pid.lock().unwrap();
-            if let Some(pid) = pid {
-                runner::terminate_process_group(pid).await;
+            let handle = self.current_pid.lock().unwrap().clone();
+            if let Some(handle) = handle {
+                runner::terminate_process(handle).await?;
             }
         }
         Ok(())
@@ -406,6 +428,41 @@ impl MirrorProvider for TwoStageRsyncProvider {
 
     fn set_log_publisher(&mut self, p: crate::log_stream::LogPublisher) {
         self.log_publisher = Some(p);
+    }
+
+    fn set_broker_config(&mut self, config: crate::runner::BrokerConfig) {
+        self.broker_config = Some(config);
+    }
+
+    fn launch_plan_specs(&self) -> Vec<LaunchPlanSpec> {
+        let dest = if self.atomic_publish_enabled {
+            self.atomic_staging_path.clone()
+        } else {
+            self.working_dir.clone()
+        };
+        let mut specs = vec![
+            LaunchPlanSpec {
+                operation: "stage1".into(),
+                argv: self.build_argv(&self.stage1_options, &dest),
+                cwd: dest.clone(),
+                env: self.rsync_env.clone(),
+            },
+            LaunchPlanSpec {
+                operation: "stage2".into(),
+                argv: self.build_argv(&self.stage2_options, &dest),
+                cwd: dest,
+                env: self.rsync_env.clone(),
+            },
+        ];
+        if self.check_upstream {
+            for url in std::iter::once(&self.upstream).chain(&self.upstream_fallback) {
+                specs.push(super::rsync_provider::probe_plan_spec(
+                    url,
+                    &self.working_dir,
+                ));
+            }
+        }
+        specs
     }
 
     #[cfg(target_os = "linux")]
@@ -431,7 +488,7 @@ impl MirrorProvider for TwoStageRsyncProvider {
 
     /// Probe upstream reachability before syncing. See `RsyncProvider::probe_upstream`
     /// for the rationale (per-URL 15s timeout, concurrent probing).
-    async fn probe_upstream(&self) -> anyhow::Result<()> {
+    async fn probe_upstream(&self) -> Result<(), ProbeError> {
         if !self.check_upstream {
             return Ok(());
         }
@@ -444,7 +501,11 @@ impl MirrorProvider for TwoStageRsyncProvider {
             .map(|&url| async move {
                 let res = tokio::time::timeout(
                     std::time::Duration::from_secs(15),
-                    super::rsync_provider::probe_rsync_url(url),
+                    super::rsync_provider::probe_configured_url(
+                        url,
+                        self.broker_config.as_ref(),
+                        &self.working_dir,
+                    ),
                 )
                 .await;
                 (url, res)
@@ -458,22 +519,32 @@ impl MirrorProvider for TwoStageRsyncProvider {
                     if url != self.upstream.as_str() {
                         tracing::info!(
                             mirror = %self.name,
-                            primary = %self.upstream,
-                            reachable = %url,
+                            primary = %crate::redact_url_diagnostic(&self.upstream),
+                            reachable = %crate::redact_url_diagnostic(url),
                             "primary upstream unreachable; fallback responded"
                         );
                     }
                     return Ok(());
                 }
-                Ok(Err(e)) => last_err = Some(format!("{url}: {e}")),
-                Err(_) => last_err = Some(format!("{url}: probe timed out after 15s")),
+                Ok(Err(e)) => {
+                    if e.downcast_ref::<runner::IsolationError>().is_some() {
+                        return Err(ProbeError::Infrastructure(e.to_string()));
+                    }
+                    last_err = Some(format!("{}: {e}", crate::redact_url_diagnostic(url)));
+                }
+                Err(_) => {
+                    last_err = Some(format!(
+                        "{}: probe timed out after 15s",
+                        crate::redact_url_diagnostic(url)
+                    ))
+                }
             }
         }
-        anyhow::bail!(
+        Err(ProbeError::Unreachable(format!(
             "all {} upstream(s) unreachable; last: {}",
             urls.len(),
             last_err.as_deref().unwrap_or("no probes attempted")
-        )
+        )))
     }
 }
 
@@ -552,6 +623,20 @@ mod tests {
         mc.upstream_fallback = vec!["rsync://fallback.example.com/data/".into()];
         let p = super::TwoStageRsyncProvider::from_config(&mc, &global).expect("from_config");
         assert_eq!(p.upstream_fallback.len(), 1);
+    }
+
+    #[test]
+    fn constructor_error_redacts_upstream_credentials() {
+        let global = base_global();
+        let mut mc = base_mirror();
+        mc.upstream = "rsync://user:top-secret@example.com/data".into();
+        let error = super::TwoStageRsyncProvider::from_config(&mc, &global)
+            .err()
+            .expect("invalid upstream must fail")
+            .to_string();
+        assert!(!error.contains("user"));
+        assert!(!error.contains("top-secret"));
+        assert!(error.contains("rsync://example.com/data"));
     }
 
     /// disk_quota = "500M" parses correctly.
