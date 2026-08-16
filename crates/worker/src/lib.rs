@@ -18,6 +18,7 @@ pub mod netns_policy;
 pub mod priority_semaphore;
 pub mod provider;
 pub mod providers;
+pub mod report_actor;
 pub mod runner;
 pub mod schedule;
 pub mod scheduling;
@@ -131,6 +132,16 @@ fn validate_relative_path(value: &str, field: &str, mirror: &str) -> Option<Stri
 
 pub(crate) fn validate_worker_config(cfg: &config::WorkerConfig) -> Vec<String> {
     let mut errors = Vec::new();
+
+    let report_limit = cfg.global.effective_report_max_resources();
+    if cfg.mirrors.len() > report_limit {
+        errors.push(format!(
+            "configured mirror count {} exceeds effective global.report_max_resources limit {}; increase report_max_resources (maximum {}) or reduce mirrors",
+            cfg.mirrors.len(),
+            report_limit,
+            config::MAX_REPORT_RESOURCES
+        ));
+    }
 
     if let Err(e) = cfg.server.validate_tls() {
         errors.push(e);
@@ -873,6 +884,33 @@ mod tests {
         let errors = crate::validate_worker_config(&validated_config(invalid_cron_and_timezone));
         assert!(errors.iter().any(|e| e.contains("invalid cron")));
         assert!(errors.iter().any(|e| e.contains("timezone")));
+    }
+
+    #[test]
+    fn flattened_mirror_count_must_fit_complete_schedule_snapshot_limit() {
+        let mut cfg = WorkerConfig::default();
+        cfg.global.report_max_resources = 1;
+        cfg.mirrors = vec![
+            MirrorConfig {
+                name: "first".into(),
+                ..Default::default()
+            },
+            MirrorConfig {
+                name: "second".into(),
+                ..Default::default()
+            },
+        ];
+
+        let errors = crate::validate_worker_config(&cfg);
+        assert!(errors.iter().any(|error| {
+            error.contains("configured mirror count 2")
+                && error.contains("report_max_resources limit 1")
+        }));
+
+        cfg.global.report_max_resources = 0;
+        assert!(crate::validate_worker_config(&cfg)
+            .iter()
+            .all(|error| !error.contains("report_max_resources")));
     }
 
     #[test]

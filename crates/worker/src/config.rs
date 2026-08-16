@@ -201,6 +201,13 @@ pub struct GlobalConfig {
     #[serde(default)]
     pub concurrent: usize,
 
+    /// Report retention bound N. Independently limits (a) retained status/size
+    /// report entries and (b) rows in the single latest schedule snapshot.
+    /// Schedule snapshots are rejected whole rather than truncated. Explicit
+    /// zero uses the default 1024; all effective values are clamped to 1..=4096.
+    #[serde(default = "default_report_max_resources")]
+    pub report_max_resources: usize,
+
     /// Default interval between syncs, in minutes.
     #[serde(default)]
     pub interval: u64,
@@ -308,7 +315,27 @@ pub struct GlobalConfig {
     pub staging_dir: String,
 }
 
+pub(crate) const DEFAULT_REPORT_MAX_RESOURCES: usize = 1024;
+pub(crate) const MAX_REPORT_RESOURCES: usize = 4096;
+
+fn default_report_max_resources() -> usize {
+    DEFAULT_REPORT_MAX_RESOURCES
+}
+
+pub(crate) fn effective_report_max_resources(configured: usize) -> usize {
+    let configured = if configured == 0 {
+        DEFAULT_REPORT_MAX_RESOURCES
+    } else {
+        configured
+    };
+    configured.clamp(1, MAX_REPORT_RESOURCES)
+}
+
 impl GlobalConfig {
+    pub fn effective_report_max_resources(&self) -> usize {
+        effective_report_max_resources(self.report_max_resources)
+    }
+
     pub fn interval_duration(&self) -> Duration {
         Duration::from_secs(self.interval * 60)
     }
@@ -1144,6 +1171,14 @@ mod tests {
             tunasync_common::config::parse_toml("[global]\ninterval = 60").unwrap();
         assert_eq!(cfg.global.interval_mode, IntervalMode::FixedDelay);
         assert!(cfg.global.fixed_rate_anchor.is_empty());
+    }
+
+    #[test]
+    fn report_max_resources_uses_default_and_clamps_to_hard_maximum() {
+        assert_eq!(effective_report_max_resources(0), 1024);
+        assert_eq!(effective_report_max_resources(1), 1);
+        assert_eq!(effective_report_max_resources(4096), 4096);
+        assert_eq!(effective_report_max_resources(usize::MAX), 4096);
     }
 
     #[test]

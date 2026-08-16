@@ -4,7 +4,7 @@
 //! and communicates with the worker scheduler via two channels:
 //!
 //! - `ctrl_tx` → job: control commands (start, stop, disable, restart, ping, halt)
-//! - `status_tx` → worker: status updates (manager is notified from the worker loop)
+//! - `status_tx` → worker: local status updates (manager reports are enqueued to the report actor)
 //!
 //! State transitions:
 //! ```text

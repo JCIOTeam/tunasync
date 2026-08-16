@@ -9,25 +9,31 @@
 //!  │                                                          │
 //!  │  ┌──────────┐   status_tx   ┌────────────────────────┐  │
 //!  │  │ MirrorJob │──────────────▶│  Scheduler loop        │  │
-//!  │  └──────────┘               │  (report to manager,   │  │
-//!  │       ▲                     │   enqueue next run)     │  │
-//!  │       │ CtrlAction          └────────────────────────┘  │
+//!  │  └──────────┘               │  (local state + next    │  │
+//!  │       ▲                     │   run only)             │  │
+//!  │       │ CtrlAction          └───────────┬────────────┘  │
 //!  │       │                              ▲                   │
 //!  │  ┌──────────┐   WorkerCmd            │                   │
 //!  │  │ HTTP srv │────────────────────────┘                   │
 //!  │  └──────────┘                                            │
+//!  │                              │ synchronous enqueue       │
+//!  │                              ▼                           │
+//!  │                       ┌──────────────┐                    │
+//!  │                       │ Report actor │──network──▶ manager│
+//!  │                       └──────────────┘                    │
 //!  └──────────────────────────────────────────────────────────┘
 //! ```
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::sync::{mpsc, watch, RwLock, Semaphore};
 use tracing::{error, info, warn};
 
 use crate::priority_semaphore::PrioritySemaphore;
@@ -37,14 +43,22 @@ use tunasync_protocol::{
 };
 
 use crate::config::WorkerConfig;
+use crate::diff_config::{diff_mirror_config, DiffOp, MirrorCfgTrans};
 use crate::hooks::JobHook;
 use crate::http_server::{build_router, cmd_to_ctrl, WorkerHttpState};
 use crate::job::{CtrlAction, JobMessage, JobState, MirrorJob};
 use crate::log_stream::LogBroadcaster;
 use crate::manager_client::ManagerClient;
 use crate::provider::MirrorProvider;
+use crate::report_actor::{
+    ActorResultState, BootstrapCommand, ReconfigureCommand, ReconfigureOutcome, ReconfigureResult,
+    ReportActor, ReportHandle, RestoreOutcome, RestoreResult,
+};
 use crate::schedule::ScheduleQueue;
 use crate::scheduling::{parse_fixed_rate_anchor, SchedulingPolicy};
+
+type PreparedProvider = (Box<dyn MirrorProvider>, Vec<Box<dyn JobHook>>);
+type PreparedProviders = HashMap<String, PreparedProvider>;
 
 /// Extract the upstream host from a sync URL, for per-upstream concurrency.
 ///
@@ -374,7 +388,14 @@ pub struct Worker {
     /// retired by reload are ignored when their generation no longer matches.
     job_generations: HashMap<String, u64>,
     next_job_generation: u64,
-    manager: Arc<ManagerClient>,
+    report_handle: ReportHandle,
+    report_actor: Option<ReportActor>,
+    report_task: Option<tokio::task::JoinHandle<()>>,
+    report_results: watch::Receiver<ActorResultState>,
+    applied_restore_revision: u64,
+    applied_reconfigure_revision: u64,
+    next_manager_generation: u64,
+    pending_manager_config: Option<(u64, crate::config::ManagerApiConfig)>,
     api_token: Arc<RwLock<String>>,
     #[allow(dead_code)] // cloned into job tasks; field not read directly
     status_tx: mpsc::Sender<JobMessage>,
@@ -389,6 +410,8 @@ pub struct Worker {
     per_upstream_semaphores: HashMap<String, Arc<Semaphore>>,
     schedule: ScheduleQueue,
     mirror_statuses: HashMap<String, MirrorStatus>,
+    /// Local mutation generation captured by asynchronous persisted-state restore.
+    local_versions: HashMap<String, u64>,
     /// Shared mirror name set — kept in sync with `self.jobs` so the HTTP
     /// handler can validate mirror_id before accepting a command.
     mirror_names: Arc<RwLock<HashSet<String>>>,
@@ -481,11 +504,19 @@ impl Worker {
             .into_iter()
             .map(String::from)
             .collect();
-        let manager = Arc::new(ManagerClient::new(
+        let max_resources = cfg.global.effective_report_max_resources();
+        let manager = Arc::new(ManagerClient::new_with_pending_limit(
             bases,
             http_client.clone(),
             cfg.manager.api_token.clone(),
+            max_resources,
         ));
+        let (report_handle, report_actor, report_results) = ReportActor::new(
+            Arc::clone(&manager),
+            cfg.global.name.clone(),
+            Duration::from_secs(60),
+            max_resources,
+        );
         let api_token = Arc::new(RwLock::new(cfg.manager.api_token.clone()));
 
         let provider_list = build_jobs(&cfg);
@@ -493,6 +524,7 @@ impl Worker {
         let mut job_generations = HashMap::new();
         let mut next_job_generation = 0_u64;
         let mut mirror_statuses = HashMap::new();
+        let mut local_versions = HashMap::new();
 
         // Live-log broadcast registry — wired to every provider below so the
         // HTTP server can stream sync output in real time.
@@ -526,6 +558,7 @@ impl Worker {
                     ..Default::default()
                 },
             );
+            local_versions.insert(name.clone(), 0);
 
             // Look up the per-upstream semaphore for this provider's host.
             let upstream_sem =
@@ -553,7 +586,8 @@ impl Worker {
             jobs.insert(name, job);
         }
 
-        // Schedule queue is populated in restore_job_state() after startup.
+        // The queue is populated from local policy before asynchronous manager
+        // bootstrap so manager I/O can never delay scheduling.
         let schedule = ScheduleQueue::new();
 
         let mirror_names = Arc::new(RwLock::new(jobs.keys().cloned().collect()));
@@ -575,7 +609,14 @@ impl Worker {
             jobs,
             job_generations,
             next_job_generation,
-            manager,
+            report_handle,
+            report_actor: Some(report_actor),
+            report_task: None,
+            report_results,
+            applied_restore_revision: 0,
+            applied_reconfigure_revision: 0,
+            next_manager_generation: 0,
+            pending_manager_config: None,
             api_token,
             status_tx,
             status_rx,
@@ -585,6 +626,7 @@ impl Worker {
             per_upstream_semaphores,
             schedule,
             mirror_statuses,
+            local_versions,
             mirror_names,
             log_broadcaster,
             blackouts_by_mirror,
@@ -595,12 +637,32 @@ impl Worker {
         }
     }
 
-    /// Register with manager, start HTTP server, run scheduler loop.
+    /// Start the actor and HTTP server immediately, then run the scheduler.
     ///
     /// Returns only on fatal error or graceful shutdown (SIGTERM/SIGINT).
-    pub async fn run(mut self) -> Result<()> {
-        let worker_status = self.register_worker().await?;
-        let worker_id = worker_status.id.clone();
+    pub async fn run(self) -> Result<()> {
+        self.run_until_shutdown(
+            wait_for_shutdown_signal(),
+            |state, bind_addr, server_cfg| {
+                tokio::spawn(run_http_server(state, bind_addr, server_cfg));
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn run_until_shutdown<F, H>(mut self, shutdown: F, start_http_server: H) -> Result<Self>
+    where
+        F: Future<Output = ()>,
+        H: FnOnce(WorkerHttpState, std::net::SocketAddr, crate::config::ServerConfig),
+    {
+        let worker_id = self.cfg.global.name.clone();
+
+        let report_actor = self
+            .report_actor
+            .take()
+            .expect("report actor starts exactly once");
+        self.report_task = Some(tokio::spawn(report_actor.run()));
 
         // Spawn HTTP server task.
         let http_state = WorkerHttpState {
@@ -611,34 +673,20 @@ impl Worker {
             log_broadcaster: Arc::clone(&self.log_broadcaster),
         };
         let bind_addr = self.cfg.server.bind_addr().map_err(anyhow::Error::msg)?;
-        tokio::spawn(run_http_server(
-            http_state,
-            bind_addr,
-            self.cfg.server.clone(),
-        ));
+        start_http_server(http_state, bind_addr, self.cfg.server.clone());
 
-        // Fetch persisted job status from manager and restore Paused/Disabled state.
-        // Matches Go's `fetchJobStatus()` in `runSchedule`.
-        self.restore_job_state(&worker_id).await;
-
-        // Announce initial schedules to manager.
-        self.report_schedules(&worker_id).await;
-
-        // Spawn periodic heartbeat (every 60 s) to keep last_online fresh.
-        let mgr = Arc::clone(&self.manager);
-        let wid = worker_id.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
-            interval.tick().await; // skip the immediate first tick
-            loop {
-                interval.tick().await;
-                match mgr.heartbeat(&wid).await {
-                    Err(e) => warn!(worker = %wid, error = %e, "heartbeat failed"),
-                    // Manager reachable — replay any reports buffered while
-                    // it was down (no-op when the buffer is empty).
-                    Ok(()) => mgr.flush_pending(&wid).await,
-                }
-            }
+        self.initialize_local_schedules();
+        self.report_schedules();
+        let registration = WorkerStatus {
+            id: worker_id.clone(),
+            url: self.cfg.server.public_url(&self.cfg),
+            token: String::new(),
+            last_online: zero_time(),
+            last_register: zero_time(),
+        };
+        self.report_handle.bootstrap(BootstrapCommand {
+            registration,
+            restore_versions: self.local_versions.clone(),
         });
 
         // Set up Unix signal handlers.
@@ -664,282 +712,193 @@ impl Worker {
             }
         }
 
-        // Main scheduler loop (exits on SIGTERM/SIGINT).
-        self.run_schedule(worker_id).await;
+        self.run_schedule_until(worker_id, shutdown).await;
 
-        Ok(())
+        Ok(self)
     }
 
-    /// Fetch persisted job status from manager and restore Paused/Disabled mirrors.
-    ///
-    /// Mirrors Go's `fetchJobStatus()` + initial schedule setup in `runSchedule()`:
-    ///
-    /// - Disabled → send Disable, remove from schedule
-    /// - Paused   → send Stop, remove from schedule
-    /// - Fixed-delay mirrors preserve legacy last-completion/immediate semantics
-    /// - Cron/fixed-rate mirrors schedule their next strictly future occurrence
-    ///
-    /// This is the ONLY place that populates the schedule queue on startup.
-    async fn restore_job_state(&mut self, worker_id: &str) {
-        // Collect all job names; we'll subtract the ones seen in manager response.
-        let mut unseen: HashSet<String> = self.jobs.keys().cloned().collect();
-
-        match self.manager.fetch_job_status(worker_id).await {
-            Ok(statuses) => {
-                for status in &statuses {
-                    unseen.remove(&status.name);
-
-                    // Update local mirror_status with persisted data.
-                    if let Some(entry) = self.mirror_statuses.get_mut(&status.name) {
-                        *entry = status.clone();
-                    }
-
-                    match status.status {
-                        // Paused/Disabled mirrors stay paused — remove from schedule.
-                        SyncStatus::Disabled => {
-                            if let Some(job) = self.jobs.get(&status.name) {
-                                job.try_send(CtrlAction::Disable);
-                            }
-                            self.schedule.remove(&status.name);
-                            if let Some(entry) = self.mirror_statuses.get_mut(&status.name) {
-                                entry.scheduled = zero_time();
-                            }
-                            tracing::info!(mirror = %status.name, "restored Disabled state");
-                            continue; // do not enqueue
-                        }
-                        SyncStatus::Paused => {
-                            if let Some(job) = self.jobs.get(&status.name) {
-                                job.try_send(CtrlAction::Stop);
-                            }
-                            self.schedule.remove(&status.name);
-                            if let Some(entry) = self.mirror_statuses.get_mut(&status.name) {
-                                entry.scheduled = zero_time();
-                            }
-                            tracing::info!(mirror = %status.name, "restored Paused state");
-                            continue; // do not enqueue
-                        }
-                        // Syncing/PreSyncing means the previous run was interrupted.
-                        // Correct the stale status so the manager and UI don't show
-                        // a phantom "syncing" state, then fall through to scheduling.
-                        SyncStatus::Syncing | SyncStatus::PreSyncing => {
-                            tracing::warn!(
-                                mirror = %status.name,
-                                status = %status.status,
-                                "stale syncing status from previous run — correcting to Failed"
-                            );
-                            if let Some(entry) = self.mirror_statuses.get_mut(&status.name) {
-                                entry.status = SyncStatus::Failed;
-                                entry.error_msg = "previous sync was interrupted".into();
-                                entry.last_ended = Utc::now();
-                            }
-                            // Report the corrected status to manager immediately.
-                            if let Some(entry) = self.mirror_statuses.get(&status.name) {
-                                if let Err(e) = self.manager.report_status(worker_id, entry).await {
-                                    warn!(mirror = %status.name, error = %e, "failed to report corrected status");
-                                }
-                            }
-                            // Fall through — schedule a re-sync below.
-                        }
-                        _ => {}
-                    }
-
-                    // Compute the next intended UTC occurrence from the policy
-                    // and write it to `mirror_statuses.scheduled` so the
-                    // manager UI shows a real upcoming time instead of
-                    // 0001-01-01T00:00:00Z until the first sync completes.
-                    let job_cfg = self.cfg.mirrors.iter().find(|m| m.name == status.name);
-
-                    let now_utc = Utc::now();
-                    let next_dt = job_cfg
-                        .and_then(|mc| self.scheduling_by_mirror.get(&mc.name))
-                        .and_then(|policy| {
-                            let last_completion =
-                                (!tunasync_protocol::is_zero_time(&status.last_update))
-                                    .then_some(status.last_update);
-                            policy.next_startup_after(now_utc, last_completion)
-                        })
-                        .unwrap_or(now_utc);
-
-                    // Persist the scheduled time so it's visible on
-                    // /workers/:id/jobs and propagates to manager.
-                    if let Some(entry) = self.mirror_statuses.get_mut(&status.name) {
-                        entry.scheduled = next_dt;
-                    }
-
-                    tracing::info!(
-                        mirror = %status.name,
-                        next_run_secs = (next_dt - now_utc).to_std().unwrap_or_default().as_secs(),
-                        scheduled = %next_dt,
-                        "scheduled (from last_update)"
-                    );
-                    self.schedule.push(status.name.clone(), next_dt);
-                }
-                tracing::info!(mirrors = statuses.len(), "restored job states from manager");
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to fetch job status from manager — applying new-mirror startup policy");
-                // Fall through: unseen still contains all job names, so they
-                // all get scheduled now below.
-            }
-        }
-
-        // New mirrors retain legacy immediate startup only for fixed-delay.
-        // Cron and fixed-rate always wait for the next strictly future slot.
-        for name in &unseen {
+    fn initialize_local_schedules(&mut self) {
+        let names: Vec<String> = self.jobs.keys().cloned().collect();
+        for name in names {
             let now = Utc::now();
             let scheduled = self
                 .scheduling_by_mirror
-                .get(name)
+                .get(&name)
                 .and_then(|policy| policy.next_startup_after(now, None))
                 .unwrap_or(now);
-            tracing::info!(mirror = %name, scheduled = %scheduled, "new mirror scheduled");
-            if let Some(entry) = self.mirror_statuses.get_mut(name) {
-                entry.scheduled = scheduled;
+            if let Some(status) = self.mirror_statuses.get_mut(&name) {
+                status.scheduled = scheduled;
             }
-            self.schedule.push(name.clone(), scheduled);
+            self.schedule.push(name, scheduled);
         }
     }
 
-    /// `POST /workers` — register with every configured manager.
-    async fn register_worker(&self) -> Result<WorkerStatus> {
-        let public_url = self.cfg.server.public_url(&self.cfg);
-        let status = WorkerStatus {
-            id: self.cfg.global.name.clone(),
-            url: public_url,
-            token: String::new(), // manager generates / stores the token
-            last_online: zero_time(),
-            last_register: zero_time(),
+    fn bump_local_version(&mut self, name: &str) {
+        if let Some(version) = self.local_versions.get_mut(name) {
+            *version = version
+                .checked_add(1)
+                .expect("local state version exhausted");
+        }
+    }
+
+    fn apply_restore_result(&mut self, result: RestoreResult) {
+        let statuses = match result.outcome {
+            RestoreOutcome::Success(statuses) => statuses,
+            RestoreOutcome::Failed(error) => {
+                warn!(%error, "failed to fetch persisted job status; keeping local startup schedules");
+                return;
+            }
         };
-        let mut registered = None;
-        for attempt in 0..10 {
-            match self.manager.register(&status).await {
-                Ok(r) => {
-                    registered = Some(r);
-                    break;
+
+        let mut applied = 0;
+        for persisted in statuses {
+            let Some(captured) = result.captured_versions.get(&persisted.name) else {
+                continue;
+            };
+            if self.local_versions.get(&persisted.name) != Some(captured)
+                || !self.jobs.contains_key(&persisted.name)
+            {
+                continue;
+            }
+
+            let name = persisted.name.clone();
+            self.mirror_statuses.insert(name.clone(), persisted.clone());
+            match persisted.status {
+                SyncStatus::Disabled => {
+                    if let Some(job) = self.jobs.get(&name) {
+                        job.try_send(CtrlAction::Disable);
+                    }
+                    self.schedule.remove(&name);
+                    if let Some(status) = self.mirror_statuses.get_mut(&name) {
+                        status.scheduled = zero_time();
+                    }
                 }
-                Err(e) => {
-                    warn!(attempt, error = %e, "registration attempt failed");
-                    if attempt < 9 {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                SyncStatus::Paused => {
+                    if let Some(job) = self.jobs.get(&name) {
+                        job.try_send(CtrlAction::Stop);
+                    }
+                    self.schedule.remove(&name);
+                    if let Some(status) = self.mirror_statuses.get_mut(&name) {
+                        status.scheduled = zero_time();
+                    }
+                }
+                state => {
+                    if matches!(state, SyncStatus::Syncing | SyncStatus::PreSyncing) {
+                        if let Some(status) = self.mirror_statuses.get_mut(&name) {
+                            status.status = SyncStatus::Failed;
+                            status.error_msg = "previous sync was interrupted".into();
+                            status.last_ended = Utc::now();
+                        }
+                    }
+                    let now = Utc::now();
+                    let last_completion =
+                        (!tunasync_protocol::is_zero_time(&persisted.last_update))
+                            .then_some(persisted.last_update);
+                    let scheduled = self
+                        .scheduling_by_mirror
+                        .get(&name)
+                        .and_then(|policy| policy.next_startup_after(now, last_completion))
+                        .unwrap_or(now);
+                    if let Some(status) = self.mirror_statuses.get_mut(&name) {
+                        status.scheduled = scheduled;
+                    }
+                    self.schedule.push(name.clone(), scheduled);
+                    if matches!(state, SyncStatus::Syncing | SyncStatus::PreSyncing) {
+                        if let Some(status) = self.mirror_statuses.get(&name) {
+                            self.report_handle.report_status(status.clone());
+                        }
                     }
                 }
             }
+            self.bump_local_version(&name);
+            applied += 1;
         }
-        let worker_status = registered.context("failed to register after 10 attempts")?;
-        info!(worker = %worker_status.id, "registered with manager");
-        Ok(worker_status)
+        tracing::info!(applied, "applied untouched persisted job states");
+        self.report_schedules();
     }
 
-    /// Send current schedule table to the manager.
-    async fn report_schedules(&self, worker_id: &str) {
-        let schedules: Vec<MirrorSchedule> = self
-            .mirror_statuses
-            .values()
-            .map(|s| MirrorSchedule {
-                mirror_name: s.name.clone(),
-                next_schedule: s.scheduled,
-            })
-            .collect();
-
-        if let Err(e) = self
-            .manager
-            .report_schedules(worker_id, &MirrorSchedules { schedules })
-            .await
-        {
-            warn!(error = %e, "failed to report schedules to manager");
-        }
+    /// Enqueue the current complete schedule table for the report actor.
+    fn report_schedules(&self) {
+        let report_handle = self.report_handle.clone();
+        let row_count = self.mirror_statuses.len();
+        let statuses = &self.mirror_statuses;
+        report_handle.report_schedules_with(row_count, || MirrorSchedules {
+            schedules: statuses
+                .values()
+                .map(|status| MirrorSchedule {
+                    mirror_name: status.name.clone(),
+                    next_schedule: status.scheduled,
+                })
+                .collect(),
+        });
     }
 
-    /// Main scheduler loop — matches Go's `runSchedule`.
-    /// Exits gracefully on SIGTERM or SIGINT.
-    async fn run_schedule(&mut self, worker_id: String) {
-        // Shutdown signal future (SIGTERM or SIGINT).
-        #[cfg(unix)]
-        let shutdown = {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-            let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
-            // Return a future that resolves when either signal fires.
-            async move {
-                tokio::select! {
-                    _ = sigterm.recv() => {},
-                    _ = sigint.recv()  => {},
+    /// Submit every currently due occurrence without awaiting manager I/O.
+    fn dispatch_due_jobs(&mut self) {
+        while let Some(entry) = self.schedule.peek() {
+            let now_utc = Utc::now();
+            if entry.scheduled_at > now_utc {
+                break;
+            }
+            let entry = self.schedule.pop().unwrap();
+            self.bump_local_version(&entry.name);
+
+            // Blackout windows gate starts but never interrupt active syncs.
+            let policy = self.scheduling_by_mirror.get(&entry.name);
+            let in_blackout = self
+                .blackouts_by_mirror
+                .get(&entry.name)
+                .map(|windows| {
+                    let tz = self
+                        .timezones_by_mirror
+                        .get(&entry.name)
+                        .copied()
+                        .unwrap_or(chrono_tz::UTC);
+                    let check_at = blackout_check_at(policy, entry.scheduled_at, now_utc);
+                    let local = check_at.with_timezone(&tz);
+                    crate::blackout::is_in_blackout(windows, &local)
+                })
+                .unwrap_or(false);
+
+            if in_blackout {
+                let retry_at = policy
+                    .and_then(|policy| policy.next_after_blackout(now_utc))
+                    .unwrap_or(now_utc + chrono::Duration::minutes(5));
+                tracing::info!(mirror = %entry.name, scheduled = %retry_at, "in blackout window — rescheduling");
+                if let Some(status) = self.mirror_statuses.get_mut(&entry.name) {
+                    status.scheduled = retry_at;
+                }
+                self.schedule.push(entry.name, retry_at);
+                self.report_schedules();
+            } else if let Some(job) = self.jobs.get(&entry.name) {
+                if !job.try_send(CtrlAction::Start) {
+                    // A popped Start that never reaches the job must be retried
+                    // or the mirror would silently stop scheduling forever.
+                    tracing::warn!(
+                        mirror = %entry.name,
+                        "could not queue scheduled Start (ctrl channel full or task dead) — retrying in 30s"
+                    );
+                    let retry_at = now_utc + chrono::Duration::seconds(30);
+                    if let Some(status) = self.mirror_statuses.get_mut(&entry.name) {
+                        status.scheduled = retry_at;
+                    }
+                    self.schedule.push(entry.name, retry_at);
+                    self.report_schedules();
                 }
             }
-        };
-        #[cfg(not(unix))]
-        let mut shutdown = tokio::signal::ctrl_c();
+        }
+    }
 
+    async fn run_schedule_until<F>(&mut self, worker_id: String, shutdown: F)
+    where
+        F: Future<Output = ()>,
+    {
         tokio::pin!(shutdown);
+        let mut report_results_open = true;
 
         loop {
             // Fire any jobs that are due.
-            while let Some(entry) = self.schedule.peek() {
-                let now_utc = Utc::now();
-                if entry.scheduled_at <= now_utc {
-                    let entry = self.schedule.pop().unwrap();
-
-                    // Blackout check: if this mirror is inside a blackout window,
-                    // push it back by 5 minutes instead of starting it.
-                    // In-progress syncs are never interrupted — only new starts are gated.
-                    // Uses precomputed caches so we don't re-parse the TOML
-                    // strings or timezone name on every scheduler tick.
-                    //
-                    // The blackout windows are interpreted in the mirror's
-                    // effective timezone (`MirrorConfig::timezone` or
-                    // `GlobalConfig::timezone`, falling back to UTC). We
-                    // convert `Utc::now()` to that timezone before passing
-                    // it to `is_active_at`, which is itself generic over Tz.
-                    let policy = self.scheduling_by_mirror.get(&entry.name);
-                    let in_blackout = self
-                        .blackouts_by_mirror
-                        .get(&entry.name)
-                        .map(|windows| {
-                            let tz = self
-                                .timezones_by_mirror
-                                .get(&entry.name)
-                                .copied()
-                                .unwrap_or(chrono_tz::UTC);
-                            let check_at = blackout_check_at(policy, entry.scheduled_at, now_utc);
-                            let local = check_at.with_timezone(&tz);
-                            crate::blackout::is_in_blackout(windows, &local)
-                        })
-                        .unwrap_or(false);
-
-                    if in_blackout {
-                        let retry_at = policy
-                            .and_then(|policy| policy.next_after_blackout(now_utc))
-                            .unwrap_or(now_utc + chrono::Duration::minutes(5));
-                        tracing::info!(mirror = %entry.name, scheduled = %retry_at, "in blackout window — rescheduling");
-                        if let Some(status) = self.mirror_statuses.get_mut(&entry.name) {
-                            status.scheduled = retry_at;
-                        }
-                        self.schedule.push(entry.name, retry_at);
-                        self.report_schedules(&worker_id).await;
-                    } else if let Some(job) = self.jobs.get(&entry.name) {
-                        if !job.try_send(CtrlAction::Start) {
-                            // The ctrl channel is full (e.g. buffered Pings
-                            // during a long-running sync) or the task died.
-                            // The entry was already popped and the job will
-                            // never emit a terminal message for a Start it
-                            // never received — without this re-push the
-                            // mirror would silently stop syncing forever.
-                            tracing::warn!(
-                                mirror = %entry.name,
-                                "could not queue scheduled Start (ctrl channel                                  full or task dead) — retrying in 30s"
-                            );
-                            let retry_at = now_utc + chrono::Duration::seconds(30);
-                            if let Some(status) = self.mirror_statuses.get_mut(&entry.name) {
-                                status.scheduled = retry_at;
-                            }
-                            self.schedule.push(entry.name, retry_at);
-                            self.report_schedules(&worker_id).await;
-                        }
-                    }
-                } else {
-                    break;
-                }
-            }
+            self.dispatch_due_jobs();
 
             // Compute sleep duration until next scheduled job.
             let sleep_dur = self
@@ -953,12 +912,25 @@ impl Worker {
             tokio::select! {
                 // A job reported a status update.
                 Some(msg) = self.status_rx.recv() => {
-                    self.handle_job_message(msg, &worker_id).await;
+                    self.handle_job_message(msg, &worker_id);
                 }
 
                 // Manager/CLI sent us a command via HTTP.
                 Some(cmd) = self.cmd_rx.recv() => {
                     self.handle_worker_cmd(cmd, &worker_id).await;
+                }
+
+                result = self.report_results.changed(), if report_results_open => {
+                    match result {
+                        Ok(()) => {
+                            let results = self.report_results.borrow_and_update().clone();
+                            self.apply_actor_results(results).await;
+                        }
+                        Err(_) => {
+                            warn!("report actor result channel closed; disabling result intake");
+                            report_results_open = false;
+                        }
+                    }
                 }
 
                 // Time to check the schedule again.
@@ -1000,8 +972,13 @@ impl Worker {
                     // Drain any final status messages the tasks emitted on
                     // their way out so the manager sees terminal states.
                     while let Ok(msg) = self.status_rx.try_recv() {
-                        self.handle_job_message(msg, &worker_id).await;
+                        self.handle_job_message(msg, &worker_id);
                     }
+                    for status in self.mirror_statuses.values() {
+                        self.report_handle.report_status(status.clone());
+                    }
+                    self.report_schedules();
+                    self.shutdown_report_actor().await;
                     info!("shutdown complete");
                     return;
                 }
@@ -1010,7 +987,7 @@ impl Worker {
     }
 
     /// Process a status update from a job task.
-    async fn handle_job_message(&mut self, msg: JobMessage, worker_id: &str) {
+    fn handle_job_message(&mut self, msg: JobMessage, worker_id: &str) {
         if !is_active_job_message(&self.job_generations, &msg) {
             tracing::debug!(
                 mirror = %msg.name,
@@ -1020,6 +997,7 @@ impl Worker {
             return;
         }
 
+        self.bump_local_version(&msg.name);
         let status_entry = self
             .mirror_statuses
             .entry(msg.name.clone())
@@ -1039,47 +1017,12 @@ impl Worker {
         if msg.status != SyncStatus::None {
             status_entry.status = msg.status;
             status_entry.error_msg = msg.msg.clone();
-        }
-        // Propagate the skip hint so the manager can decide not to increment
-        // consecutive_failures. Cleared (false) for all normal messages.
-        status_entry.skip_failure_count = msg.skip_sync;
-        if !msg.size.is_empty() {
-            status_entry.size = msg.size.clone();
-        }
-        if msg.status == SyncStatus::Success {
-            // A Success message is authoritative for this run's transferred
-            // bytes — including 0 (nothing changed upstream / stats parse
-            // failed). Without the unconditional overwrite, a zero-transfer
-            // success would keep the PREVIOUS run's value and the manager
-            // would accumulate it again on this run's Success transition.
-            status_entry.last_transferred_bytes = msg.transferred_bytes;
-        } else if msg.transferred_bytes > 0 {
-            status_entry.last_transferred_bytes = msg.transferred_bytes;
-        }
-
-        // Report status to manager.
-        let status_to_report = status_entry.clone();
-        if let Err(e) = self
-            .manager
-            .report_status(worker_id, &status_to_report)
-            .await
-        {
-            warn!(
-                mirror = %msg.name,
-                status = %msg.status,
-                error = %e,
-                "failed to report status to manager"
-            );
-        }
-
-        // Report size separately when a sync succeeds and has a non-empty size.
-        if msg.status == SyncStatus::Success && !msg.size.is_empty() {
-            if let Err(e) = self
-                .manager
-                .report_size(worker_id, &msg.name, &msg.size)
-                .await
-            {
-                warn!(mirror = %msg.name, error = %e, "failed to report size to manager");
+            status_entry.skip_failure_count = msg.skip_sync;
+            if !msg.size.is_empty() {
+                status_entry.size = msg.size.clone();
+            }
+            if msg.status == SyncStatus::Success || msg.transferred_bytes > 0 {
+                status_entry.last_transferred_bytes = msg.transferred_bytes;
             }
         }
 
@@ -1097,15 +1040,28 @@ impl Worker {
                 if let Some(s) = self.mirror_statuses.get_mut(&msg.name) {
                     s.scheduled = next_dt;
                 }
-
-                // Report updated schedule to manager (matches Go: updateSchedInfo after every jobMessage with schedule=true).
-                self.report_schedules(worker_id).await;
             }
+        }
+
+        // All local state and the next fixed-delay reference are committed
+        // before report enqueue. Scheduling-only None messages do not replay
+        // the previous terminal status.
+        if msg.status != SyncStatus::None {
+            if let Some(status) = self.mirror_statuses.get(&msg.name) {
+                self.report_handle.report_status(status.clone());
+            }
+            if msg.status == SyncStatus::Success && !msg.size.is_empty() {
+                self.report_handle
+                    .report_size(msg.name.clone(), msg.size.clone());
+            }
+        }
+        if msg.schedule {
+            self.report_schedules();
         }
     }
 
     /// Dispatch an incoming `WorkerCmd` to the appropriate job.
-    async fn handle_worker_cmd(&mut self, cmd: WorkerCmd, worker_id: &str) {
+    async fn handle_worker_cmd(&mut self, cmd: WorkerCmd, _worker_id: &str) {
         use CmdVerb::*;
         match cmd.cmd {
             Reload => {
@@ -1118,6 +1074,14 @@ impl Worker {
                 }
             }
             _ => {
+                if cmd.mirror_id.is_empty() {
+                    let names: Vec<String> = self.jobs.keys().cloned().collect();
+                    for name in names {
+                        self.bump_local_version(&name);
+                    }
+                } else {
+                    self.bump_local_version(&cmd.mirror_id);
+                }
                 // Mirror Go: "No matter what command, the existing job
                 // schedule should be flushed" — always remove from schedule.
                 if !cmd.mirror_id.is_empty() {
@@ -1128,9 +1092,10 @@ impl Worker {
                         }
                     }
                 } else if matches!(cmd.cmd, Stop | Disable) {
-                    for name in self.jobs.keys() {
-                        self.schedule.remove(name);
-                        if let Some(status) = self.mirror_statuses.get_mut(name) {
+                    let names: Vec<String> = self.jobs.keys().cloned().collect();
+                    for name in names {
+                        self.schedule.remove(&name);
+                        if let Some(status) = self.mirror_statuses.get_mut(&name) {
                             status.scheduled = zero_time();
                         }
                     }
@@ -1190,6 +1155,7 @@ impl Worker {
                                             job_generation,
                                         );
                                         self.jobs.insert(name.clone(), new_job);
+                                        self.bump_local_version(name);
                                         // Fall through — send Start to the new job.
                                         if let Some(new_job) = self.jobs.get(name) {
                                             new_job.try_send(CtrlAction::Start);
@@ -1228,7 +1194,7 @@ impl Worker {
                     tracing::warn!(mirror = %cmd.mirror_id, "cmd for unknown mirror");
                 }
                 if matches!(cmd.cmd, Stop | Disable) {
-                    self.report_schedules(worker_id).await;
+                    self.report_schedules();
                 }
             }
         }
@@ -1240,77 +1206,76 @@ impl Worker {
     /// current mirror list and applies Add / Modify / Delete operations.
     /// Mirrors Go's `Worker.ReloadMirrorConfig`.
     async fn handle_reload(&mut self) {
-        use crate::diff_config::{diff_mirror_config, DiffOp, MirrorCfgTrans};
-
-        // Re-read the config file from disk.
-        let mut new_cfg: crate::config::WorkerConfig = match tunasync_common::config::load_toml(
-            &self.config_path,
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(error = %e, "hot-reload: failed to read config — keeping current");
-                return;
-            }
+        let Some(mut new_cfg) = self.load_reload_config().await else {
+            return;
+        };
+        let Some((diff, mut prepared)) = self.prepare_reload_changes(&new_cfg) else {
+            return;
         };
 
-        // Merge include files and flatten nested mirror configs,
-        // matching the startup path in lib.rs exactly.
+        self.apply_upstream_concurrency(&mut new_cfg);
+        self.apply_mirror_changes(&diff, &mut prepared, &new_cfg)
+            .await;
+        self.apply_global_concurrency(&mut new_cfg);
+        self.prepare_manager_reconfigure(&mut new_cfg);
+        self.finish_reload(new_cfg).await;
+    }
+
+    async fn load_reload_config(&self) -> Option<WorkerConfig> {
+        let mut new_cfg: WorkerConfig = match tunasync_common::config::load_toml(&self.config_path)
+        {
+            Ok(config) => config,
+            Err(e) => {
+                tracing::error!(error = %e, "hot-reload: failed to read config — keeping current");
+                return None;
+            }
+        };
         let include_errors = crate::load_include_mirrors(&mut new_cfg);
         if !include_errors.is_empty() {
-            tracing::error!(
-                errors = ?include_errors,
-                "hot-reload: include loading failed — keeping current config"
-            );
-            return;
+            tracing::error!(errors = ?include_errors, "hot-reload: include loading failed — keeping current config");
+            return None;
         }
         new_cfg.mirrors = crate::config::flatten_mirrors(&new_cfg.mirrors_conf);
 
+        let report_limit = self.cfg.global.effective_report_max_resources();
+        let requested_report_limit = new_cfg.global.effective_report_max_resources();
+        if requested_report_limit != report_limit {
+            tracing::warn!(current = report_limit, requested = requested_report_limit, "hot-reload: report_max_resources change requires a restart - keeping current limit");
+            new_cfg.global.report_max_resources = self.cfg.global.report_max_resources;
+        }
         let config_errors = crate::validate_worker_config(&new_cfg);
         if !config_errors.is_empty() {
-            tracing::error!(
-                errors = ?config_errors,
-                "hot-reload: config validation failed — keeping current config"
-            );
-            return;
+            tracing::error!(errors = ?config_errors, "hot-reload: config validation failed — keeping current config");
+            return None;
         }
-
         if new_cfg.netns_broker.generation == self.cfg.netns_broker.generation {
             match crate::netns_policy::policy_content_changed(&self.cfg, &new_cfg) {
                 Ok(true) => {
-                    tracing::error!(
-                        generation = %new_cfg.netns_broker.generation,
-                        "hot-reload: namespaced launch policy changed without a new generation - keeping current config"
-                    );
-                    return;
+                    tracing::error!(generation = %new_cfg.netns_broker.generation, "hot-reload: namespaced launch policy changed without a new generation - keeping current config");
+                    return None;
                 }
                 Ok(false) => {}
                 Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        "hot-reload: failed to compare namespace policy content - keeping current config"
-                    );
-                    return;
+                    tracing::error!(error = %e, "hot-reload: failed to compare namespace policy content - keeping current config");
+                    return None;
                 }
             }
         }
-
         if let Err(e) = crate::verify_netns_broker_for_config(&new_cfg).await {
-            tracing::error!(
-                error = %e,
-                "hot-reload: namespace broker readiness check failed - keeping current config"
-            );
-            return;
+            tracing::error!(error = %e, "hot-reload: namespace broker readiness check failed - keeping current config");
+            return None;
         }
-
         if new_cfg.global.name != self.cfg.global.name {
-            tracing::warn!(
-                old = %self.cfg.global.name,
-                new = %new_cfg.global.name,
-                "hot-reload: worker name change requires a restart — keeping current name"
-            );
+            tracing::warn!(old = %self.cfg.global.name, new = %new_cfg.global.name, "hot-reload: worker name change requires a restart — keeping current name");
             new_cfg.global.name = self.cfg.global.name.clone();
         }
+        Some(new_cfg)
+    }
 
+    fn prepare_reload_changes(
+        &self,
+        new_cfg: &WorkerConfig,
+    ) -> Option<(Vec<MirrorCfgTrans>, PreparedProviders)> {
         let provider_globals_changed = self.cfg.global.log_dir != new_cfg.global.log_dir
             || self.cfg.global.mirror_dir != new_cfg.global.mirror_dir
             || self.cfg.global.interval != new_cfg.global.interval
@@ -1340,7 +1305,6 @@ impl Worker {
                     &new_cfg.docker,
                 ))
                 .ok();
-
         let scheduling_globals_changed = self.cfg.global.interval_mode
             != new_cfg.global.interval_mode
             || self.cfg.global.fixed_rate_anchor != new_cfg.global.fixed_rate_anchor
@@ -1348,284 +1312,259 @@ impl Worker {
 
         let mut diff = diff_mirror_config(&self.cfg.mirrors, &new_cfg.mirrors);
         if provider_globals_changed {
-            let already_changed: HashSet<&str> = diff
-                .iter()
-                .map(|trans| trans.config.name.as_str())
-                .collect();
-            let inherited_changes: Vec<MirrorCfgTrans> = new_cfg
-                .mirrors
-                .iter()
-                .filter(|mc| {
-                    self.cfg.mirrors.iter().any(|old| old.name == mc.name)
-                        && !already_changed.contains(mc.name.as_str())
-                })
-                .cloned()
-                .map(|config| MirrorCfgTrans {
-                    op: DiffOp::Modify,
-                    config,
-                })
-                .collect();
-            diff.extend(inherited_changes);
+            self.extend_inherited_modifications(&mut diff, new_cfg, |_| true);
         }
         if scheduling_globals_changed {
-            let already_changed: HashSet<&str> = diff
-                .iter()
-                .map(|trans| trans.config.name.as_str())
-                .collect();
-            let inherited_changes: Vec<MirrorCfgTrans> = new_cfg
-                .mirrors
-                .iter()
-                .filter(|mc| {
-                    self.cfg.mirrors.iter().any(|old| old.name == mc.name)
-                        && !already_changed.contains(mc.name.as_str())
-                        && global_scheduling_change_affects(mc, &self.cfg.global, &new_cfg.global)
-                })
-                .cloned()
-                .map(|config| MirrorCfgTrans {
-                    op: DiffOp::Modify,
-                    config,
-                })
-                .collect();
-            diff.extend(inherited_changes);
+            self.extend_inherited_modifications(&mut diff, new_cfg, |mc| {
+                global_scheduling_change_affects(mc, &self.cfg.global, &new_cfg.global)
+            });
         }
-
         if diff.is_empty() {
             tracing::info!("hot-reload: mirror config unchanged; applying global settings");
         } else {
             tracing::info!(changes = diff.len(), "hot-reload: applying config diff");
         }
 
-        // Prepare every replacement before mutating any live job. This makes
-        // provider construction transactional across the whole reload: one
-        // invalid mirror cannot leave half the worker on the new config and
-        // half on the old config.
         let mut prepared = HashMap::new();
         for trans in &diff {
             if matches!(trans.op, DiffOp::Add | DiffOp::Modify) {
-                match (self.build_one_provider)(&trans.config, &new_cfg) {
+                match (self.build_one_provider)(&trans.config, new_cfg) {
                     Ok(built) => {
                         prepared.insert(trans.config.name.clone(), built);
                     }
                     Err(e) => {
-                        tracing::error!(
-                            mirror = %trans.config.name,
-                            error = %e,
-                            "hot-reload: provider preparation failed — keeping current config"
-                        );
-                        return;
+                        tracing::error!(mirror = %trans.config.name, error = %e, "hot-reload: provider preparation failed — keeping current config");
+                        return None;
                     }
                 }
             }
         }
+        Some((diff, prepared))
+    }
 
-        // Apply per-upstream concurrency changes before spawning replacement
-        // jobs so Add/Modify transitions in this reload see the new limits.
-        {
-            let old_limits = &self.cfg.global.per_upstream_concurrent;
-            let requested_limits = new_cfg.global.per_upstream_concurrent.clone();
+    fn extend_inherited_modifications<F>(
+        &self,
+        diff: &mut Vec<MirrorCfgTrans>,
+        new_cfg: &WorkerConfig,
+        affects: F,
+    ) where
+        F: Fn(&crate::config::MirrorConfig) -> bool,
+    {
+        let already_changed: HashSet<&str> = diff
+            .iter()
+            .map(|trans| trans.config.name.as_str())
+            .collect();
+        let inherited_changes = new_cfg
+            .mirrors
+            .iter()
+            .filter(|mc| {
+                self.cfg.mirrors.iter().any(|old| old.name == mc.name)
+                    && !already_changed.contains(mc.name.as_str())
+                    && affects(mc)
+            })
+            .cloned()
+            .map(|config| MirrorCfgTrans {
+                op: DiffOp::Modify,
+                config,
+            })
+            .collect::<Vec<_>>();
+        diff.extend(inherited_changes);
+    }
 
-            let removed: Vec<String> = old_limits
-                .keys()
-                .filter(|h| !requested_limits.contains_key(*h))
-                .cloned()
-                .collect();
-            for host in &removed {
-                self.per_upstream_semaphores.remove(host);
-                tracing::info!(
-                    host = %host,
-                    "hot-reload: removed per-upstream concurrency limit"
-                );
-            }
-
-            for (host, &new_limit) in &requested_limits {
-                let new_limit = new_limit.max(1);
-                match old_limits.get(host) {
-                    None => {
-                        self.per_upstream_semaphores
-                            .insert(host.clone(), Arc::new(Semaphore::new(new_limit)));
-                    }
-                    Some(&old) => {
-                        let old_limit = old.max(1);
-                        if new_limit > old_limit {
-                            if let Some(sem) = self.per_upstream_semaphores.get(host) {
-                                sem.add_permits(new_limit - old_limit);
-                            }
-                        } else if new_limit < old_limit {
-                            new_cfg
-                                .global
-                                .per_upstream_concurrent
-                                .insert(host.clone(), old_limit);
-                            tracing::warn!(
-                                host = %host,
-                                from = old_limit,
-                                to = new_limit,
-                                "hot-reload: cannot shrink per-upstream concurrency limit until restart"
-                            );
+    fn apply_upstream_concurrency(&mut self, new_cfg: &mut WorkerConfig) {
+        let old_limits = &self.cfg.global.per_upstream_concurrent;
+        let requested_limits = new_cfg.global.per_upstream_concurrent.clone();
+        let removed = old_limits
+            .keys()
+            .filter(|host| !requested_limits.contains_key(*host))
+            .cloned()
+            .collect::<Vec<_>>();
+        for host in &removed {
+            self.per_upstream_semaphores.remove(host);
+            tracing::info!(host = %host, "hot-reload: removed per-upstream concurrency limit");
+        }
+        for (host, &new_limit) in &requested_limits {
+            let new_limit = new_limit.max(1);
+            match old_limits.get(host) {
+                None => {
+                    self.per_upstream_semaphores
+                        .insert(host.clone(), Arc::new(Semaphore::new(new_limit)));
+                }
+                Some(&old) => {
+                    let old_limit = old.max(1);
+                    if new_limit > old_limit {
+                        if let Some(sem) = self.per_upstream_semaphores.get(host) {
+                            sem.add_permits(new_limit - old_limit);
                         }
+                    } else if new_limit < old_limit {
+                        new_cfg
+                            .global
+                            .per_upstream_concurrent
+                            .insert(host.clone(), old_limit);
+                        tracing::warn!(host = %host, from = old_limit, to = new_limit, "hot-reload: cannot shrink per-upstream concurrency limit until restart");
                     }
                 }
             }
         }
+    }
 
-        for trans in &diff {
-            let name = &trans.config.name;
+    async fn apply_mirror_changes(
+        &mut self,
+        diff: &[MirrorCfgTrans],
+        prepared: &mut PreparedProviders,
+        new_cfg: &WorkerConfig,
+    ) {
+        for trans in diff {
             match trans.op {
-                DiffOp::Delete => {
-                    self.stop_and_join_job(name).await;
-                    self.mirror_statuses.remove(name);
-                    // ALSO remove from cfg.mirrors. Without this, the next
-                    // hot-reload's diff_mirror_config compares the new TOML
-                    // against a stale list still containing the deleted
-                    // mirror, generating spurious diffs and (for re-added
-                    // mirrors with the same name) misclassifying Add as
-                    // Modify with a stale provider config.
-                    self.cfg.mirrors.retain(|m| &m.name != name);
-                    tracing::info!(mirror = %name, "hot-reload: deleted job");
-                }
-                DiffOp::Modify => {
-                    let (mut provider, hooks) = prepared
-                        .remove(name)
-                        .expect("modified provider prepared before applying reload");
-
-                    // Remember the old job's state so we can preserve it.
-                    let old_state = self.jobs.get(name).map(|j| j.state());
-
-                    // Preserve historical telemetry (last_update, size,
-                    // last_started, last_ended, transferred_bytes counters)
-                    // so a cosmetic config change (e.g. tweaking interval)
-                    // doesn't wipe a long-running mirror's record. Only
-                    // the fields that are computed from the new provider
-                    // — upstream, is_master — are refreshed below.
-                    let preserved = self.mirror_statuses.get(name).cloned();
-
-                    // Stop and join the old job before spawning its replacement.
-                    self.stop_and_join_job(name).await;
-                    self.mirror_statuses.remove(name);
-
-                    // Update config.
-                    if let Some(pos) = self.cfg.mirrors.iter().position(|m| &m.name == name) {
-                        self.cfg.mirrors[pos] = trans.config.clone();
-                    } else {
-                        self.cfg.mirrors.push(trans.config.clone());
-                    }
-
-                    provider.set_log_publisher(self.log_broadcaster.publisher_for(name));
-                    let upstream = crate::redact_url_diagnostic(provider.upstream());
-                    let is_master = provider.is_master();
-
-                    let now_utc = Utc::now();
-                    let next_schedule =
-                        next_reload_schedule(&trans.config, &new_cfg.global, now_utc);
-                    let merged = if let Some(mut prev) = preserved {
-                        prev.upstream = upstream;
-                        prev.is_master = is_master;
-                        prev.scheduled = next_schedule;
-                        prev
-                    } else {
-                        MirrorStatus {
-                            name: name.clone(),
-                            worker: new_cfg.global.name.clone(),
-                            is_master,
-                            upstream,
-                            scheduled: next_schedule,
-                            ..Default::default()
-                        }
-                    };
-                    self.mirror_statuses.insert(name.clone(), merged);
-
-                    let upstream_sem2 = upstream_host(provider.upstream())
-                        .and_then(|h| self.per_upstream_semaphores.get(&h).cloned());
-                    let job_generation = self.allocate_job_generation(name);
-                    let job = MirrorJob::spawn(
-                        provider,
-                        hooks,
-                        self.status_tx.clone(),
-                        Arc::clone(&self.semaphore),
-                        upstream_sem2,
-                        trans.config.priority,
-                        job_generation,
-                    );
-                    self.jobs.insert(name.clone(), job);
-
-                    // Preserve the old job's state (matches Go's ReloadMirrorConfig
-                    // which checks the previous state when re-spawning a modified job).
-                    match old_state {
-                        Some(JobState::Paused) => {
-                            if let Some(job) = self.jobs.get(name) {
-                                job.try_send(CtrlAction::Stop);
-                            }
-                            if let Some(status) = self.mirror_statuses.get_mut(name) {
-                                status.scheduled = zero_time();
-                            }
-                            tracing::info!(mirror = %name, "hot-reload: modified job — kept Paused");
-                        }
-                        Some(JobState::Disabled) => {
-                            if let Some(job) = self.jobs.get(name) {
-                                job.try_send(CtrlAction::Disable);
-                            }
-                            if let Some(status) = self.mirror_statuses.get_mut(name) {
-                                status.scheduled = zero_time();
-                            }
-                            tracing::info!(mirror = %name, "hot-reload: modified job — kept Disabled");
-                        }
-                        _ => {
-                            tracing::info!(mirror = %name, "hot-reload: modified job — scheduling");
-                            self.schedule.push(name.clone(), next_schedule);
-                        }
-                    }
-                }
-                DiffOp::Add => {
-                    let (mut provider, hooks) = prepared
-                        .remove(name)
-                        .expect("new provider prepared before applying reload");
-                    self.cfg.mirrors.push(trans.config.clone());
-                    provider.set_log_publisher(self.log_broadcaster.publisher_for(name));
-                    let upstream = crate::redact_url_diagnostic(provider.upstream());
-                    let is_master = provider.is_master();
-
-                    self.mirror_statuses.insert(
-                        name.clone(),
-                        MirrorStatus {
-                            name: name.clone(),
-                            worker: new_cfg.global.name.clone(),
-                            is_master,
-                            upstream,
-                            scheduled: next_reload_schedule(
-                                &trans.config,
-                                &new_cfg.global,
-                                Utc::now(),
-                            ),
-                            ..Default::default()
-                        },
-                    );
-
-                    let upstream_sem3 = upstream_host(provider.upstream())
-                        .and_then(|h| self.per_upstream_semaphores.get(&h).cloned());
-                    let job_generation = self.allocate_job_generation(name);
-                    let job = MirrorJob::spawn(
-                        provider,
-                        hooks,
-                        self.status_tx.clone(),
-                        Arc::clone(&self.semaphore),
-                        upstream_sem3,
-                        trans.config.priority,
-                        job_generation,
-                    );
-                    self.jobs.insert(name.clone(), job);
-
-                    tracing::info!(mirror = %name, "hot-reload: new job");
-                    if let Some(status) = self.mirror_statuses.get(name) {
-                        self.schedule.push(name.clone(), status.scheduled);
-                    }
-                }
+                DiffOp::Delete => self.apply_deleted_mirror(&trans.config.name).await,
+                DiffOp::Modify => self.apply_modified_mirror(trans, prepared, new_cfg).await,
+                DiffOp::Add => self.apply_added_mirror(trans, prepared, new_cfg),
             }
         }
+    }
 
-        // Apply global concurrency changes. tokio's Semaphore exposes
-        // `add_permits` for grow-only changes but no `remove_permits` (you
-        // can't take back permits that may be currently held by running
-        // syncs), so we can grow live but not shrink. Shrinks require a
-        // worker restart — warn so the operator isn't surprised.
+    async fn apply_deleted_mirror(&mut self, name: &str) {
+        self.bump_local_version(name);
+        self.stop_and_join_job(name).await;
+        self.report_handle.forget_mirror(name.to_owned());
+        self.mirror_statuses.remove(name);
+        self.local_versions.remove(name);
+        self.cfg.mirrors.retain(|mirror| mirror.name != name);
+        tracing::info!(mirror = %name, "hot-reload: deleted job");
+    }
+
+    async fn apply_modified_mirror(
+        &mut self,
+        trans: &MirrorCfgTrans,
+        prepared: &mut PreparedProviders,
+        new_cfg: &WorkerConfig,
+    ) {
+        let name = &trans.config.name;
+        self.bump_local_version(name);
+        let (mut provider, hooks) = prepared
+            .remove(name)
+            .expect("modified provider prepared before applying reload");
+        let old_state = self.jobs.get(name).map(MirrorJob::state);
+        let preserved = self.mirror_statuses.get(name).cloned();
+        self.stop_and_join_job(name).await;
+        self.mirror_statuses.remove(name);
+        if let Some(pos) = self
+            .cfg
+            .mirrors
+            .iter()
+            .position(|mirror| &mirror.name == name)
+        {
+            self.cfg.mirrors[pos] = trans.config.clone();
+        } else {
+            self.cfg.mirrors.push(trans.config.clone());
+        }
+
+        provider.set_log_publisher(self.log_broadcaster.publisher_for(name));
+        let upstream = crate::redact_url_diagnostic(provider.upstream());
+        let is_master = provider.is_master();
+        let next_schedule = next_reload_schedule(&trans.config, &new_cfg.global, Utc::now());
+        let merged = if let Some(mut previous) = preserved {
+            previous.upstream = upstream;
+            previous.is_master = is_master;
+            previous.scheduled = next_schedule;
+            previous
+        } else {
+            MirrorStatus {
+                name: name.clone(),
+                worker: new_cfg.global.name.clone(),
+                is_master,
+                upstream,
+                scheduled: next_schedule,
+                ..Default::default()
+            }
+        };
+        self.mirror_statuses.insert(name.clone(), merged);
+        let upstream_sem = upstream_host(provider.upstream())
+            .and_then(|host| self.per_upstream_semaphores.get(&host).cloned());
+        let job_generation = self.allocate_job_generation(name);
+        let job = MirrorJob::spawn(
+            provider,
+            hooks,
+            self.status_tx.clone(),
+            Arc::clone(&self.semaphore),
+            upstream_sem,
+            trans.config.priority,
+            job_generation,
+        );
+        self.jobs.insert(name.clone(), job);
+
+        match old_state {
+            Some(JobState::Paused) => {
+                if let Some(job) = self.jobs.get(name) {
+                    job.try_send(CtrlAction::Stop);
+                }
+                if let Some(status) = self.mirror_statuses.get_mut(name) {
+                    status.scheduled = zero_time();
+                }
+                tracing::info!(mirror = %name, "hot-reload: modified job — kept Paused");
+            }
+            Some(JobState::Disabled) => {
+                if let Some(job) = self.jobs.get(name) {
+                    job.try_send(CtrlAction::Disable);
+                }
+                if let Some(status) = self.mirror_statuses.get_mut(name) {
+                    status.scheduled = zero_time();
+                }
+                tracing::info!(mirror = %name, "hot-reload: modified job — kept Disabled");
+            }
+            _ => {
+                tracing::info!(mirror = %name, "hot-reload: modified job — scheduling");
+                self.schedule.push(name.clone(), next_schedule);
+            }
+        }
+    }
+
+    fn apply_added_mirror(
+        &mut self,
+        trans: &MirrorCfgTrans,
+        prepared: &mut PreparedProviders,
+        new_cfg: &WorkerConfig,
+    ) {
+        let name = &trans.config.name;
+        self.local_versions.insert(name.clone(), 1);
+        let (mut provider, hooks) = prepared
+            .remove(name)
+            .expect("new provider prepared before applying reload");
+        self.cfg.mirrors.push(trans.config.clone());
+        provider.set_log_publisher(self.log_broadcaster.publisher_for(name));
+        let upstream = crate::redact_url_diagnostic(provider.upstream());
+        let is_master = provider.is_master();
+        self.mirror_statuses.insert(
+            name.clone(),
+            MirrorStatus {
+                name: name.clone(),
+                worker: new_cfg.global.name.clone(),
+                is_master,
+                upstream,
+                scheduled: next_reload_schedule(&trans.config, &new_cfg.global, Utc::now()),
+                ..Default::default()
+            },
+        );
+        let upstream_sem = upstream_host(provider.upstream())
+            .and_then(|host| self.per_upstream_semaphores.get(&host).cloned());
+        let job_generation = self.allocate_job_generation(name);
+        let job = MirrorJob::spawn(
+            provider,
+            hooks,
+            self.status_tx.clone(),
+            Arc::clone(&self.semaphore),
+            upstream_sem,
+            trans.config.priority,
+            job_generation,
+        );
+        self.jobs.insert(name.clone(), job);
+        tracing::info!(mirror = %name, "hot-reload: new job");
+        if let Some(status) = self.mirror_statuses.get(name) {
+            self.schedule.push(name.clone(), status.scheduled);
+        }
+    }
+
+    fn apply_global_concurrency(&mut self, new_cfg: &mut WorkerConfig) {
         let old_concurrent = self.cfg.global.concurrent.max(1);
         let new_concurrent = new_cfg.global.concurrent.max(1);
         if new_concurrent > old_concurrent {
@@ -1639,18 +1578,25 @@ impl Worker {
             );
         } else if new_concurrent < old_concurrent {
             new_cfg.global.concurrent = old_concurrent;
-            tracing::warn!(
-                from = old_concurrent,
-                to = new_concurrent,
-                "hot-reload: cannot shrink concurrency limit on a running worker — \
-                 keeping {old_concurrent} until restart"
-            );
+            tracing::warn!(from = old_concurrent, to = new_concurrent, "hot-reload: cannot shrink concurrency limit on a running worker — keeping {old_concurrent} until restart");
         }
+    }
 
+    fn prepare_manager_reconfigure(&mut self, new_cfg: &mut WorkerConfig) {
         let manager_changed = new_cfg.manager.api_base_list() != self.cfg.manager.api_base_list()
             || new_cfg.manager.api_token != self.cfg.manager.api_token
             || new_cfg.manager.ca_cert != self.cfg.manager.ca_cert;
-        if manager_changed {
+        let manager_matches_pending =
+            self.pending_manager_config
+                .as_ref()
+                .is_some_and(|(_, pending)| {
+                    pending.api_base_list() == new_cfg.manager.api_base_list()
+                        && pending.api_token == new_cfg.manager.api_token
+                        && pending.ca_cert == new_cfg.manager.ca_cert
+                });
+        let should_reconfigure =
+            !manager_matches_pending && (manager_changed || self.pending_manager_config.is_some());
+        if should_reconfigure {
             let client = if new_cfg.manager.ca_cert.is_empty() {
                 tunasync_common::http::HttpClientBuilder::new().build()
             } else {
@@ -1658,84 +1604,68 @@ impl Worker {
                     .ca_cert_pem_from_path(std::path::Path::new(&new_cfg.manager.ca_cert))
                     .and_then(|builder| builder.build())
             };
+            self.next_manager_generation = self
+                .next_manager_generation
+                .checked_add(1)
+                .expect("manager reconfigure generation exhausted");
+            let generation = self.next_manager_generation;
             match client {
                 Ok(client) => {
-                    let bases: Vec<String> = new_cfg
-                        .manager
-                        .api_base_list()
-                        .into_iter()
-                        .map(String::from)
-                        .collect();
-                    let candidate = ManagerClient::new(
-                        bases.clone(),
-                        client.clone(),
-                        new_cfg.manager.api_token.clone(),
-                    );
-                    let status = WorkerStatus {
-                        id: self.cfg.global.name.clone(),
-                        url: self.cfg.server.public_url(&self.cfg),
-                        token: String::new(),
-                        last_online: zero_time(),
-                        last_register: zero_time(),
+                    let requested = new_cfg.manager.clone();
+                    let command = ReconfigureCommand {
+                        generation,
+                        bases: requested
+                            .api_base_list()
+                            .into_iter()
+                            .map(String::from)
+                            .collect(),
+                        client,
+                        token: requested.api_token.clone(),
+                        registration: WorkerStatus {
+                            id: self.cfg.global.name.clone(),
+                            url: self.cfg.server.public_url(&self.cfg),
+                            token: String::new(),
+                            last_online: zero_time(),
+                            last_register: zero_time(),
+                        },
                     };
-                    match candidate.register(&status).await {
-                        Ok(_) => {
-                            self.manager.reconfigure(
-                                bases,
-                                client,
-                                new_cfg.manager.api_token.clone(),
-                            );
-                            *self.api_token.write().await = new_cfg.manager.api_token.clone();
-                            tracing::info!(
-                                "hot-reload: registered with and switched to updated manager configuration"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                "hot-reload: updated manager registration failed — keeping old manager config"
-                            );
-                            new_cfg.manager = self.cfg.manager.clone();
-                        }
+                    if self.report_handle.reconfigure(command) {
+                        self.pending_manager_config = Some((generation, requested));
+                        tracing::info!(generation, "hot-reload: queued manager reconfiguration");
+                    } else {
+                        tracing::error!(
+                            generation,
+                            "hot-reload: report actor rejected manager reconfiguration"
+                        );
                     }
                 }
                 Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        "hot-reload: failed to rebuild manager HTTP client — keeping old manager config"
-                    );
-                    new_cfg.manager = self.cfg.manager.clone();
+                    self.report_handle.supersede_reconfigure(generation);
+                    self.pending_manager_config = None;
+                    tracing::error!(generation, error = %e, "hot-reload: failed to rebuild manager HTTP client — keeping old manager config");
                 }
             }
         }
+        new_cfg.manager = self.cfg.manager.clone();
+    }
 
-        // Update global config (interval/retry defaults etc.) from new file.
-        self.cfg.global = new_cfg.global;
-        self.cfg.manager = new_cfg.manager;
-        self.cfg.netns_broker = new_cfg.netns_broker;
-        if new_cfg.server.addr != self.cfg.server.addr
+    async fn finish_reload(&mut self, new_cfg: WorkerConfig) {
+        let server_changed = new_cfg.server.addr != self.cfg.server.addr
             || new_cfg.server.port != self.cfg.server.port
             || new_cfg.server.ssl_cert != self.cfg.server.ssl_cert
             || new_cfg.server.ssl_key != self.cfg.server.ssl_key
-            || new_cfg.server.hostname != self.cfg.server.hostname
-        {
-            tracing::warn!(
-                "hot-reload: worker HTTP server settings changed but require a restart — keeping current listener"
-            );
+            || new_cfg.server.hostname != self.cfg.server.hostname;
+        self.cfg.global = new_cfg.global;
+        self.cfg.manager = new_cfg.manager;
+        self.cfg.netns_broker = new_cfg.netns_broker;
+        if server_changed {
+            tracing::warn!("hot-reload: worker HTTP server settings changed but require a restart — keeping current listener");
         }
-
-        // Keep mirror_names in sync so the HTTP handler can validate new mirrors.
         {
             let mut names = self.mirror_names.write().await;
             names.clear();
-            for name in self.jobs.keys() {
-                names.insert(name.clone());
-            }
+            names.extend(self.jobs.keys().cloned());
         }
-
-        // Rebuild the precomputed blackout, cron and timezone caches against
-        // the new mirror list so scheduler decisions reflect the hot-reloaded
-        // config.
         self.blackouts_by_mirror = build_blackout_cache(&self.cfg.mirrors);
         self.crons_by_mirror = build_cron_cache(&self.cfg.mirrors);
         self.timezones_by_mirror = build_timezone_cache(&self.cfg.mirrors, &self.cfg.global);
@@ -1745,9 +1675,94 @@ impl Worker {
             &self.crons_by_mirror,
             &self.timezones_by_mirror,
         );
-        let worker_id = self.cfg.global.name.clone();
-        self.report_schedules(&worker_id).await;
+        self.report_schedules();
     }
+
+    async fn handle_reconfigure_result(&mut self, result: ReconfigureResult) {
+        let Some((generation, pending)) = self.pending_manager_config.as_ref() else {
+            tracing::debug!(
+                generation = result.generation,
+                "ignoring manager result without pending config"
+            );
+            return;
+        };
+        if result.generation != *generation {
+            tracing::debug!(
+                generation = result.generation,
+                expected = *generation,
+                "ignoring stale manager reconfiguration result"
+            );
+            return;
+        }
+
+        match result.outcome {
+            ReconfigureOutcome::Success => {
+                self.cfg.manager = pending.clone();
+                *self.api_token.write().await = pending.api_token.clone();
+                self.pending_manager_config = None;
+                tracing::info!(
+                    generation = result.generation,
+                    "hot-reload: manager reconfiguration succeeded"
+                );
+            }
+            ReconfigureOutcome::Failed(error) => {
+                self.pending_manager_config = None;
+                tracing::error!(generation = result.generation, %error, "hot-reload: manager reconfiguration failed; retaining old connection");
+            }
+            ReconfigureOutcome::Superseded => {
+                tracing::debug!(
+                    generation = result.generation,
+                    "manager reconfiguration was superseded"
+                );
+            }
+        }
+    }
+
+    async fn apply_actor_results(&mut self, results: ActorResultState) {
+        if let Some(result) = results.restore {
+            if result.revision > self.applied_restore_revision {
+                self.applied_restore_revision = result.revision;
+                self.apply_restore_result(result.value);
+            }
+        }
+        if let Some(result) = results.reconfigure {
+            if result.revision > self.applied_reconfigure_revision {
+                self.applied_reconfigure_revision = result.revision;
+                self.handle_reconfigure_result(result.value).await;
+            }
+        }
+    }
+
+    async fn shutdown_report_actor(&mut self) {
+        let done = self.report_handle.shutdown();
+        let completed = tokio::time::timeout(Duration::from_secs(6), done).await;
+        if completed.is_err() {
+            tracing::warn!("report actor did not finish its 5s drain within 6s; abandoning best-effort reports");
+            if let Some(task) = &self.report_task {
+                task.abort();
+            }
+        }
+        if let Some(task) = self.report_task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
+    tokio::select! {
+        _ = sigterm.recv() => {}
+        _ = sigint.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 // HTTP server task
@@ -1815,6 +1830,935 @@ mod cron_schedule_tests {
     use crate::config::{GlobalConfig, MirrorConfig, ProviderKind};
     use crate::job::JobMessage;
     use tunasync_protocol::SyncStatus;
+
+    struct DueProvider {
+        name: String,
+        started: std::sync::Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provider::MirrorProvider for DueProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn upstream(&self) -> &str {
+            "rsync://localhost/test/"
+        }
+        fn is_master(&self) -> bool {
+            true
+        }
+        fn interval(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(60)
+        }
+        fn retry(&self) -> u32 {
+            0
+        }
+        fn timeout(&self) -> std::time::Duration {
+            std::time::Duration::ZERO
+        }
+        async fn run(&self) -> anyhow::Result<()> {
+            self.started.add_permits(1);
+            Ok(())
+        }
+        async fn terminate(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn set_docker_config(&mut self, _config: crate::hooks::DockerConfig) {}
+        fn set_log_path_shared(
+            &mut self,
+            _path: std::sync::Arc<std::sync::Mutex<std::path::PathBuf>>,
+        ) {
+        }
+    }
+
+    fn test_worker(manager_base: String) -> super::Worker {
+        let mut cfg = crate::config::WorkerConfig::default();
+        cfg.global.name = "w1".into();
+        cfg.global.interval = 1;
+        cfg.manager.api_base = manager_base;
+        cfg.mirrors = vec![MirrorConfig {
+            name: "mirror".into(),
+            interval: 1,
+            ..MirrorConfig::default()
+        }];
+        let mut worker = super::Worker::new(
+            cfg,
+            std::path::PathBuf::new(),
+            |_| Vec::new(),
+            reqwest::Client::new(),
+        );
+        worker.job_generations.insert("mirror".into(), 1);
+        worker.mirror_statuses.insert(
+            "mirror".into(),
+            tunasync_protocol::MirrorStatus {
+                name: "mirror".into(),
+                worker: "w1".into(),
+                ..Default::default()
+            },
+        );
+        worker
+    }
+
+    fn job_message(status: SyncStatus, schedule: bool) -> JobMessage {
+        JobMessage {
+            job_generation: 1,
+            status,
+            name: "mirror".into(),
+            msg: String::new(),
+            schedule,
+            size: String::new(),
+            transferred_bytes: 0,
+            skip_sync: false,
+        }
+    }
+
+    fn worker_config_toml(manager_base: &str, mirrors: &[&str]) -> String {
+        let mut config = format!(
+            "[global]\nname = \"w1\"\ninterval = 1\nconcurrent = 2\n\n[manager]\napi_base = {manager_base:?}\n\n[server]\nhostname = \"127.0.0.1\"\nlisten_addr = \"127.0.0.1\"\nlisten_port = 6000\n"
+        );
+        for mirror in mirrors {
+            config.push_str(&format!(
+                "\n[[mirrors]]\nname = {mirror:?}\nprovider = \"rsync\"\nupstream = \"rsync://localhost/test/\"\ninterval = 1\n"
+            ));
+        }
+        config
+    }
+
+    #[tokio::test]
+    async fn hanging_manager_does_not_shift_fixed_delay_or_block_second_completion() {
+        use axum::{extract::State, routing::post, Router};
+
+        async fn hang(
+            State(entered): State<std::sync::Arc<tokio::sync::Semaphore>>,
+        ) -> std::convert::Infallible {
+            entered.add_permits(1);
+            std::future::pending().await
+        }
+
+        let entered = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let app = Router::new()
+            .route("/workers/{worker}/jobs/{mirror}", post(hang))
+            .route("/workers/{worker}/schedules", post(hang))
+            .with_state(std::sync::Arc::clone(&entered));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut worker = test_worker(format!("http://{addr}"));
+        let actor = worker.report_actor.take().unwrap();
+        let actor_task = tokio::spawn(actor.run());
+
+        let first_reference = chrono::Utc::now();
+        worker.handle_job_message(job_message(SyncStatus::Success, true), "w1");
+        let first_next = worker.mirror_statuses["mirror"].scheduled;
+        assert!(first_next >= first_reference + chrono::Duration::seconds(59));
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.acquire())
+            .await
+            .expect("manager request did not start")
+            .unwrap()
+            .forget();
+
+        let second_reference = chrono::Utc::now();
+        tokio::time::timeout(std::time::Duration::from_millis(50), async {
+            worker.handle_job_message(job_message(SyncStatus::Failed, true), "w1");
+        })
+        .await
+        .expect("second completion was blocked by manager reporting");
+        let second_next = worker.mirror_statuses["mirror"].scheduled;
+        assert!(second_next >= second_reference + chrono::Duration::seconds(59));
+        assert!(second_next < second_reference + chrono::Duration::seconds(61));
+
+        actor_task.abort();
+        let _ = actor_task.await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn hanging_manager_does_not_delay_second_due_occurrence_submission() {
+        use axum::{extract::State, routing::post, Router};
+
+        async fn hang(
+            State(entered): State<std::sync::Arc<tokio::sync::Semaphore>>,
+        ) -> std::convert::Infallible {
+            entered.add_permits(1);
+            std::future::pending().await
+        }
+
+        let entered = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let app = Router::new()
+            .route("/workers/{worker}/jobs/{mirror}", post(hang))
+            .with_state(std::sync::Arc::clone(&entered));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let first_started = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let second_started = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let mut cfg = crate::config::WorkerConfig::default();
+        cfg.global.name = "w1".into();
+        cfg.manager.api_base = format!("http://{addr}");
+        cfg.mirrors = ["first", "second"]
+            .into_iter()
+            .map(|name| MirrorConfig {
+                name: name.into(),
+                interval: 1,
+                ..MirrorConfig::default()
+            })
+            .collect();
+        let providers = vec![
+            Box::new(DueProvider {
+                name: "first".into(),
+                started: std::sync::Arc::clone(&first_started),
+            }) as Box<dyn crate::provider::MirrorProvider>,
+            Box::new(DueProvider {
+                name: "second".into(),
+                started: std::sync::Arc::clone(&second_started),
+            }) as Box<dyn crate::provider::MirrorProvider>,
+        ];
+        let providers = std::sync::Mutex::new(Some(providers));
+        let mut worker = super::Worker::new(
+            cfg,
+            std::path::PathBuf::new(),
+            |_| {
+                providers
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .into_iter()
+                    .map(|provider| (provider, Vec::new()))
+                    .collect()
+            },
+            reqwest::Client::new(),
+        );
+        let actor = worker.report_actor.take().unwrap();
+        let actor_task = tokio::spawn(actor.run());
+        worker
+            .report_handle
+            .report_status(tunasync_protocol::MirrorStatus {
+                name: "network-block".into(),
+                worker: "w1".into(),
+                status: SyncStatus::Syncing,
+                ..Default::default()
+            });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.acquire())
+            .await
+            .expect("manager request did not start")
+            .unwrap()
+            .forget();
+
+        let due = chrono::Utc::now() - chrono::Duration::seconds(1);
+        worker.schedule.push("first".into(), due);
+        worker.schedule.push("second".into(), due);
+        tokio::time::timeout(std::time::Duration::from_millis(50), async {
+            worker.dispatch_due_jobs();
+        })
+        .await
+        .expect("due dispatch was blocked by manager reporting");
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_started.acquire())
+            .await
+            .expect("first due job was not submitted")
+            .unwrap()
+            .forget();
+        tokio::time::timeout(std::time::Duration::from_secs(1), second_started.acquire())
+            .await
+            .expect("second due job was not submitted")
+            .unwrap()
+            .forget();
+
+        for job in worker.jobs.values() {
+            job.retire();
+        }
+        actor_task.abort();
+        let _ = actor_task.await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn hanging_manager_does_not_block_status_intake_or_command_dispatch() {
+        use axum::{extract::State, routing::post, Router};
+
+        async fn hang(
+            State(entered): State<std::sync::Arc<tokio::sync::Semaphore>>,
+        ) -> std::convert::Infallible {
+            entered.add_permits(1);
+            std::future::pending().await
+        }
+
+        let entered = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let app = Router::new()
+            .route("/workers/{worker}/jobs/{mirror}", post(hang))
+            .with_state(std::sync::Arc::clone(&entered));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut worker = test_worker(format!("http://{addr}"));
+        let actor = worker.report_actor.take().unwrap();
+        let actor_task = tokio::spawn(actor.run());
+        worker.handle_job_message(job_message(SyncStatus::Syncing, false), "w1");
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.acquire())
+            .await
+            .expect("manager request did not start")
+            .unwrap()
+            .forget();
+
+        tokio::time::timeout(std::time::Duration::from_millis(50), async {
+            worker.handle_job_message(job_message(SyncStatus::Success, false), "w1");
+            worker
+                .handle_worker_cmd(
+                    tunasync_protocol::WorkerCmd {
+                        cmd: tunasync_protocol::CmdVerb::Ping,
+                        mirror_id: String::new(),
+                        args: Vec::new(),
+                        options: std::collections::HashMap::new(),
+                    },
+                    "w1",
+                )
+                .await;
+        })
+        .await
+        .expect("status helper or command dispatch was blocked by manager reporting");
+        assert_eq!(worker.mirror_statuses["mirror"].status, SyncStatus::Success);
+
+        actor_task.abort();
+        let _ = actor_task.await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn scheduling_only_message_does_not_repeat_terminal_status() {
+        let mut worker = test_worker("http://127.0.0.1:9".into());
+        let mut failed = job_message(SyncStatus::Failed, false);
+        failed.skip_sync = true;
+        failed.msg = "expected skip".into();
+        failed.size = "kept-size".into();
+        failed.transferred_bytes = 17;
+        worker.handle_job_message(failed, "w1");
+        let before = worker.report_handle.mailbox_counts();
+        worker.handle_job_message(job_message(SyncStatus::None, true), "w1");
+        let after = worker.report_handle.mailbox_counts();
+        let status = &worker.mirror_statuses["mirror"];
+        assert_eq!(status.status, SyncStatus::Failed);
+        assert_eq!(status.error_msg, "expected skip");
+        assert!(status.skip_failure_count);
+        assert_eq!(status.size, "kept-size");
+        assert_eq!(status.last_transferred_bytes, 17);
+        assert_eq!(after.0, before.0, "schedules must not occupy the FIFO");
+        assert!(after.3, "None should replace the schedule snapshot");
+    }
+
+    #[tokio::test]
+    async fn scheduling_only_message_preserves_skip_flag_in_delivered_status() {
+        use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+        use tokio::sync::mpsc;
+
+        async fn status_report(
+            State(tx): State<mpsc::Sender<tunasync_protocol::MirrorStatus>>,
+            Json(status): Json<tunasync_protocol::MirrorStatus>,
+        ) -> StatusCode {
+            tx.send(status).await.unwrap();
+            StatusCode::OK
+        }
+        async fn schedules_report() -> StatusCode {
+            StatusCode::OK
+        }
+
+        let (captured_tx, mut captured_rx) = mpsc::channel(8);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let app = Router::new()
+                .route("/workers/{worker}/jobs/{mirror}", post(status_report))
+                .route("/workers/{worker}/schedules", post(schedules_report))
+                .with_state(captured_tx);
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut worker = test_worker(format!("http://{addr}"));
+        let actor = worker.report_actor.take().unwrap();
+        worker.report_task = Some(tokio::spawn(actor.run()));
+        let mut failed = job_message(SyncStatus::Failed, false);
+        failed.skip_sync = true;
+        failed.msg = "expected skip".into();
+        worker.handle_job_message(failed, "w1");
+        worker.handle_job_message(job_message(SyncStatus::None, true), "w1");
+
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(1), captured_rx.recv())
+            .await
+            .expect("status delivery timed out")
+            .expect("status channel closed");
+        assert_eq!(delivered.status, SyncStatus::Failed);
+        assert_eq!(delivered.error_msg, "expected skip");
+        assert!(delivered.skip_failure_count);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            worker.run_schedule_until("w1".into(), std::future::ready(())),
+        )
+        .await
+        .expect("scheduler shutdown timed out");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn closed_report_result_channel_does_not_spin_scheduler() {
+        use tokio::sync::oneshot;
+
+        let mut worker = test_worker("http://127.0.0.1:9".into());
+        drop(worker.report_actor.take());
+        let status_tx = worker.status_tx.clone();
+        let cmd_tx = worker.cmd_tx.clone();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let loop_task = tokio::spawn(async move {
+            worker
+                .run_schedule_until("w1".into(), async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+            worker
+        });
+
+        status_tx
+            .send(job_message(SyncStatus::Success, false))
+            .await
+            .unwrap();
+        cmd_tx
+            .send(tunasync_protocol::WorkerCmd {
+                cmd: tunasync_protocol::CmdVerb::Stop,
+                mirror_id: "mirror".into(),
+                args: Vec::new(),
+                options: std::collections::HashMap::new(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        shutdown_tx.send(()).unwrap();
+
+        let worker = tokio::time::timeout(std::time::Duration::from_secs(7), loop_task)
+            .await
+            .expect("closed result channel kept scheduler from shutting down")
+            .unwrap();
+        assert_eq!(worker.mirror_statuses["mirror"].status, SyncStatus::Success);
+        assert!(tunasync_protocol::is_zero_time(
+            &worker.mirror_statuses["mirror"].scheduled
+        ));
+    }
+
+    #[tokio::test]
+    async fn delayed_restore_cannot_undo_newer_local_state() {
+        let mut worker = test_worker("http://127.0.0.1:9".into());
+        worker.initialize_local_schedules();
+        let captured_versions = worker.local_versions.clone();
+
+        worker
+            .handle_worker_cmd(
+                tunasync_protocol::WorkerCmd {
+                    cmd: tunasync_protocol::CmdVerb::Stop,
+                    mirror_id: "mirror".into(),
+                    args: Vec::new(),
+                    options: std::collections::HashMap::new(),
+                },
+                "w1",
+            )
+            .await;
+        worker.handle_job_message(job_message(SyncStatus::Success, true), "w1");
+        let scheduled = worker.mirror_statuses["mirror"].scheduled;
+
+        worker.apply_restore_result(crate::report_actor::RestoreResult {
+            captured_versions,
+            outcome: crate::report_actor::RestoreOutcome::Success(vec![
+                tunasync_protocol::MirrorStatus {
+                    name: "mirror".into(),
+                    worker: "w1".into(),
+                    status: SyncStatus::Disabled,
+                    ..Default::default()
+                },
+            ]),
+        });
+
+        assert_eq!(worker.mirror_statuses["mirror"].status, SyncStatus::Success);
+        assert_eq!(worker.mirror_statuses["mirror"].scheduled, scheduled);
+    }
+
+    #[tokio::test]
+    async fn production_startup_progresses_while_manager_bootstrap_hangs() {
+        use axum::{routing::get, routing::post, Router};
+        use tokio::sync::{oneshot, Semaphore};
+
+        async fn hang() -> std::convert::Infallible {
+            std::future::pending().await
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let app = Router::new()
+                .route("/workers", post(hang))
+                .route("/workers/{worker}/jobs", get(hang))
+                .route("/workers/{worker}/jobs/{mirror}", post(hang));
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        struct LoopProvider {
+            name: String,
+            started: std::sync::Arc<Semaphore>,
+        }
+        #[async_trait::async_trait]
+        impl crate::provider::MirrorProvider for LoopProvider {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn upstream(&self) -> &str {
+                "rsync://localhost/test/"
+            }
+            fn is_master(&self) -> bool {
+                true
+            }
+            fn interval(&self) -> std::time::Duration {
+                std::time::Duration::from_secs(60)
+            }
+            fn retry(&self) -> u32 {
+                0
+            }
+            fn timeout(&self) -> std::time::Duration {
+                std::time::Duration::ZERO
+            }
+            async fn run(&self) -> anyhow::Result<()> {
+                self.started.add_permits(1);
+                Ok(())
+            }
+            async fn terminate(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn set_docker_config(&mut self, _config: crate::hooks::DockerConfig) {}
+            fn set_log_path_shared(
+                &mut self,
+                _path: std::sync::Arc<std::sync::Mutex<std::path::PathBuf>>,
+            ) {
+            }
+        }
+
+        let started = std::sync::Arc::new(Semaphore::new(0));
+        let mut cfg = crate::config::WorkerConfig::default();
+        cfg.global.name = "w1".into();
+        cfg.global.concurrent = 2;
+        cfg.manager.api_base = format!("http://{addr}");
+        cfg.mirrors = ["first", "second"]
+            .into_iter()
+            .map(|name| MirrorConfig {
+                name: name.into(),
+                interval: 1,
+                ..Default::default()
+            })
+            .collect();
+        let providers = std::sync::Mutex::new(Some(vec![
+            Box::new(LoopProvider {
+                name: "first".into(),
+                started: std::sync::Arc::clone(&started),
+            }) as Box<dyn crate::provider::MirrorProvider>,
+            Box::new(LoopProvider {
+                name: "second".into(),
+                started: std::sync::Arc::clone(&started),
+            }) as Box<dyn crate::provider::MirrorProvider>,
+        ]));
+        let worker = super::Worker::new(
+            cfg,
+            std::path::PathBuf::new(),
+            |_| {
+                providers
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .into_iter()
+                    .map(|provider| (provider, Vec::new()))
+                    .collect()
+            },
+            reqwest::Client::new(),
+        );
+        let status_tx = worker.status_tx.clone();
+        let cmd_tx = worker.cmd_tx.clone();
+        let (http_ready_tx, http_ready_rx) = oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let loop_task = tokio::spawn(async move {
+            worker
+                .run_until_shutdown(
+                    async move {
+                        let _ = shutdown_rx.await;
+                    },
+                    move |_, _, _| {
+                        let _ = http_ready_tx.send(());
+                    },
+                )
+                .await
+                .unwrap()
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), http_ready_rx)
+            .await
+            .expect("HTTP startup seam was blocked by manager bootstrap")
+            .expect("HTTP startup seam dropped readiness");
+        let permits =
+            tokio::time::timeout(std::time::Duration::from_secs(1), started.acquire_many(2))
+                .await
+                .expect("two due jobs were not dispatched")
+                .unwrap();
+        permits.forget();
+        status_tx
+            .send(JobMessage {
+                job_generation: 1,
+                status: SyncStatus::Success,
+                name: "first".into(),
+                msg: String::new(),
+                schedule: false,
+                size: String::new(),
+                transferred_bytes: 0,
+                skip_sync: false,
+            })
+            .await
+            .unwrap();
+        cmd_tx
+            .send(tunasync_protocol::WorkerCmd {
+                cmd: tunasync_protocol::CmdVerb::Stop,
+                mirror_id: "second".into(),
+                args: Vec::new(),
+                options: std::collections::HashMap::new(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        shutdown_tx.send(()).unwrap();
+        let worker = tokio::time::timeout(std::time::Duration::from_secs(7), loop_task)
+            .await
+            .expect("scheduler loop did not shut down")
+            .unwrap();
+        assert_eq!(worker.mirror_statuses["first"].status, SyncStatus::Success);
+        assert!(tunasync_protocol::is_zero_time(
+            &worker.mirror_statuses["second"].scheduled
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reload_with_hanging_candidate_keeps_worker_loop_live() {
+        use axum::{routing::post, Json, Router};
+        use chrono::{Datelike, Timelike};
+        use tokio::sync::{oneshot, Semaphore};
+
+        async fn register(
+            Json(status): Json<tunasync_protocol::WorkerStatus>,
+        ) -> Json<tunasync_protocol::WorkerStatus> {
+            Json(status)
+        }
+        async fn hang() -> std::convert::Infallible {
+            std::future::pending().await
+        }
+
+        let old_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let old_addr = old_listener.local_addr().unwrap();
+        let old_server = tokio::spawn(async move {
+            axum::serve(
+                old_listener,
+                Router::new().route("/workers", post(register)),
+            )
+            .await
+            .unwrap();
+        });
+        let new_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let new_addr = new_listener.local_addr().unwrap();
+        let new_server = tokio::spawn(async move {
+            axum::serve(new_listener, Router::new().route("/workers", post(hang)))
+                .await
+                .unwrap();
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("worker.conf");
+        let delayed_at = chrono::Utc::now() + chrono::Duration::seconds(3);
+        let delayed_cron = format!(
+            "{} {} {} {} {} * {}",
+            delayed_at.second(),
+            delayed_at.minute(),
+            delayed_at.hour(),
+            delayed_at.day(),
+            delayed_at.month(),
+            delayed_at.year(),
+        );
+        let config_for = |manager_base: &str| {
+            worker_config_toml(manager_base, &["immediate", "delayed"]).replace(
+                "name = \"delayed\"\nprovider = \"rsync\"\nupstream = \"rsync://localhost/test/\"\ninterval = 1\n",
+                &format!(
+                    "name = \"delayed\"\nprovider = \"rsync\"\nupstream = \"rsync://localhost/test/\"\ninterval = 1\ncron = {delayed_cron:?}\n"
+                ),
+            )
+        };
+        std::fs::write(&config_path, config_for(&format!("http://{old_addr}"))).unwrap();
+
+        let immediate_started = std::sync::Arc::new(Semaphore::new(0));
+        let delayed_started = std::sync::Arc::new(Semaphore::new(0));
+        let providers = std::sync::Mutex::new(Some(vec![
+            Box::new(DueProvider {
+                name: "immediate".into(),
+                started: std::sync::Arc::clone(&immediate_started),
+            }) as Box<dyn crate::provider::MirrorProvider>,
+            Box::new(DueProvider {
+                name: "delayed".into(),
+                started: std::sync::Arc::clone(&delayed_started),
+            }) as Box<dyn crate::provider::MirrorProvider>,
+        ]));
+        let mut cfg: crate::config::WorkerConfig =
+            tunasync_common::config::load_toml(&config_path).unwrap();
+        cfg.mirrors = crate::config::flatten_mirrors(&cfg.mirrors_conf);
+        let worker = super::Worker::new(
+            cfg,
+            config_path.clone(),
+            |_| {
+                providers
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .into_iter()
+                    .map(|provider| (provider, Vec::new()))
+                    .collect()
+            },
+            reqwest::Client::new(),
+        );
+        let status_tx = worker.status_tx.clone();
+        let cmd_tx = worker.cmd_tx.clone();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let loop_task = tokio::spawn(async move {
+            worker
+                .run_until_shutdown(
+                    async move {
+                        let _ = shutdown_rx.await;
+                    },
+                    |_, _, _| {},
+                )
+                .await
+                .unwrap()
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            immediate_started.acquire(),
+        )
+        .await
+        .expect("immediate startup job was not dispatched")
+        .unwrap()
+        .forget();
+        std::fs::write(&config_path, config_for(&format!("http://{new_addr}"))).unwrap();
+        cmd_tx
+            .send(tunasync_protocol::WorkerCmd {
+                cmd: tunasync_protocol::CmdVerb::Reload,
+                mirror_id: String::new(),
+                args: Vec::new(),
+                options: std::collections::HashMap::new(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(4), delayed_started.acquire())
+            .await
+            .expect("delayed due occurrence was blocked by hanging reconfigure")
+            .unwrap()
+            .forget();
+
+        status_tx
+            .send(JobMessage {
+                job_generation: 2,
+                status: SyncStatus::Success,
+                name: "delayed".into(),
+                msg: String::new(),
+                schedule: false,
+                size: String::new(),
+                transferred_bytes: 0,
+                skip_sync: false,
+            })
+            .await
+            .unwrap();
+        cmd_tx
+            .send(tunasync_protocol::WorkerCmd {
+                cmd: tunasync_protocol::CmdVerb::Stop,
+                mirror_id: "delayed".into(),
+                args: Vec::new(),
+                options: std::collections::HashMap::new(),
+            })
+            .await
+            .unwrap();
+        status_tx
+            .send(JobMessage {
+                job_generation: 2,
+                status: SyncStatus::Success,
+                name: "delayed".into(),
+                msg: String::new(),
+                schedule: false,
+                size: String::new(),
+                transferred_bytes: 0,
+                skip_sync: false,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        shutdown_tx.send(()).unwrap();
+
+        let worker = tokio::time::timeout(std::time::Duration::from_secs(7), loop_task)
+            .await
+            .expect("worker loop was blocked by hanging reload candidate")
+            .unwrap();
+        assert_eq!(
+            worker.mirror_statuses["delayed"].status,
+            SyncStatus::Success
+        );
+        assert!(worker.pending_manager_config.is_some());
+        assert_eq!(worker.cfg.manager.api_base, format!("http://{old_addr}"));
+        old_server.abort();
+        new_server.abort();
+    }
+
+    #[tokio::test]
+    async fn reload_rejects_excessive_mirror_count_without_changing_scheduler() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("worker.conf");
+        let config_for = |report_max_resources: usize, mirrors: &[&str]| {
+            let mut config = format!(
+                "[global]\nname = \"w1\"\ninterval = 1\nreport_max_resources = {report_max_resources}\n"
+            );
+            for mirror in mirrors {
+                config.push_str(&format!(
+                    "\n[[mirrors]]\nname = {mirror:?}\nprovider = \"rsync\"\nupstream = \"rsync://localhost/test/\"\ninterval = 1\n"
+                ));
+            }
+            config
+        };
+        std::fs::write(&config_path, config_for(1, &["old"])).unwrap();
+
+        let mut cfg: crate::config::WorkerConfig =
+            tunasync_common::config::load_toml(&config_path).unwrap();
+        cfg.mirrors = crate::config::flatten_mirrors(&cfg.mirrors_conf);
+        let mut worker = super::Worker::new(
+            cfg,
+            config_path.clone(),
+            |_| Vec::new(),
+            reqwest::Client::new(),
+        );
+        let old_due = chrono::Utc::now() + chrono::Duration::hours(1);
+        worker.schedule.push("old".into(), old_due);
+
+        std::fs::write(&config_path, config_for(2, &["old", "excess"])).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            worker.handle_reload(),
+        )
+        .await
+        .expect("excessive mirror count was not rejected locally");
+
+        assert_eq!(
+            worker
+                .cfg
+                .mirrors
+                .iter()
+                .map(|mirror| mirror.name.as_str())
+                .collect::<Vec<_>>(),
+            ["old"]
+        );
+        assert_eq!(worker.schedule.len(), 1);
+        let retained = worker.schedule.peek().expect("old schedule was removed");
+        assert_eq!(retained.name, "old");
+        assert_eq!(retained.scheduled_at, old_due);
+        assert_eq!(worker.cfg.global.effective_report_max_resources(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconfigure_result_updates_config_and_token_only_for_latest_success() {
+        let mut worker = test_worker("http://old".into());
+        let old_token = worker.api_token.read().await.clone();
+        let requested = crate::config::ManagerApiConfig {
+            api_base: "http://new".into(),
+            api_token: "new-token".into(),
+            ..Default::default()
+        };
+        worker.pending_manager_config = Some((2, requested.clone()));
+
+        worker
+            .handle_reconfigure_result(crate::report_actor::ReconfigureResult {
+                generation: 1,
+                outcome: crate::report_actor::ReconfigureOutcome::Success,
+            })
+            .await;
+        assert_eq!(worker.cfg.manager.api_base, "http://old");
+        assert_eq!(*worker.api_token.read().await, old_token);
+
+        worker
+            .handle_reconfigure_result(crate::report_actor::ReconfigureResult {
+                generation: 2,
+                outcome: crate::report_actor::ReconfigureOutcome::Failed("no".into()),
+            })
+            .await;
+        assert_eq!(worker.cfg.manager.api_base, "http://old");
+        assert_eq!(*worker.api_token.read().await, old_token);
+
+        worker.pending_manager_config = Some((3, requested));
+        worker
+            .handle_reconfigure_result(crate::report_actor::ReconfigureResult {
+                generation: 3,
+                outcome: crate::report_actor::ReconfigureOutcome::Success,
+            })
+            .await;
+        assert_eq!(worker.cfg.manager.api_base, "http://new");
+        assert_eq!(*worker.api_token.read().await, "new-token");
+    }
+
+    #[tokio::test]
+    async fn restore_and_reconfigure_revisions_are_both_applied_once() {
+        let mut worker = test_worker("http://old".into());
+        worker.local_versions.insert("mirror".into(), 0);
+        worker.initialize_local_schedules();
+        let requested = crate::config::ManagerApiConfig {
+            api_base: "http://new".into(),
+            api_token: "new-token".into(),
+            ..Default::default()
+        };
+        worker.pending_manager_config = Some((4, requested));
+        let results = crate::report_actor::ActorResultState {
+            restore: Some(crate::report_actor::RevisedResult {
+                revision: 1,
+                value: crate::report_actor::RestoreResult {
+                    captured_versions: worker.local_versions.clone(),
+                    outcome: crate::report_actor::RestoreOutcome::Success(vec![
+                        tunasync_protocol::MirrorStatus {
+                            name: "mirror".into(),
+                            worker: "w1".into(),
+                            status: SyncStatus::Disabled,
+                            ..Default::default()
+                        },
+                    ]),
+                },
+            }),
+            reconfigure: Some(crate::report_actor::RevisedResult {
+                revision: 1,
+                value: crate::report_actor::ReconfigureResult {
+                    generation: 4,
+                    outcome: crate::report_actor::ReconfigureOutcome::Success,
+                },
+            }),
+        };
+
+        worker.apply_actor_results(results.clone()).await;
+        assert_eq!(worker.cfg.manager.api_base, "http://new");
+        assert_eq!(worker.applied_restore_revision, 1);
+        assert_eq!(worker.applied_reconfigure_revision, 1);
+
+        worker.mirror_statuses.get_mut("mirror").unwrap().status = SyncStatus::Success;
+        worker.apply_actor_results(results).await;
+        assert_eq!(worker.mirror_statuses["mirror"].status, SyncStatus::Success);
+    }
 
     fn mirror_with_cron(expr: &str) -> (MirrorConfig, GlobalConfig) {
         let global = GlobalConfig::default();
