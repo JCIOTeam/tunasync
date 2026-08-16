@@ -6,20 +6,23 @@
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
-use std::time::Instant;
+
+use chrono::{DateTime, Utc};
 
 /// One entry in the schedule queue.
 #[derive(Debug, Clone)]
 pub struct ScheduleEntry {
     /// Mirror name.
     pub name: String,
-    /// When this job should next run.
-    pub next_run: Instant,
+    /// Intended UTC wall-clock time for this occurrence.
+    pub scheduled_at: DateTime<Utc>,
+    /// Monotonic replacement generation for stale-entry detection.
+    pub generation: u64,
 }
 
 impl PartialEq for ScheduleEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.next_run == other.next_run
+        self.generation == other.generation && self.name == other.name
     }
 }
 impl Eq for ScheduleEntry {}
@@ -32,8 +35,11 @@ impl PartialOrd for ScheduleEntry {
 }
 impl Ord for ScheduleEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Reverse: smaller `next_run` wins.
-        other.next_run.cmp(&self.next_run)
+        // Reverse: smaller scheduled time wins; generation breaks ties.
+        other
+            .scheduled_at
+            .cmp(&self.scheduled_at)
+            .then_with(|| other.generation.cmp(&self.generation))
     }
 }
 
@@ -44,9 +50,9 @@ impl Ord for ScheduleEntry {
 #[derive(Default)]
 pub struct ScheduleQueue {
     heap: BinaryHeap<ScheduleEntry>,
-    /// Tracks the latest next_run for each job name. Stale heap entries
-    /// (whose next_run doesn't match this map) are skipped on pop.
-    latest: HashMap<String, Instant>,
+    /// Tracks the latest generation for each job name.
+    latest: HashMap<String, u64>,
+    next_generation: u64,
 }
 
 impl ScheduleQueue {
@@ -56,9 +62,18 @@ impl ScheduleQueue {
 
     /// Insert or update a job's next-run time.
     /// If a job with the same name already exists, it is replaced.
-    pub fn push(&mut self, name: String, next_run: Instant) {
-        self.latest.insert(name.clone(), next_run);
-        self.heap.push(ScheduleEntry { name, next_run });
+    pub fn push(&mut self, name: String, scheduled_at: DateTime<Utc>) {
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("schedule generation exhausted");
+        let generation = self.next_generation;
+        self.latest.insert(name.clone(), generation);
+        self.heap.push(ScheduleEntry {
+            name,
+            scheduled_at,
+            generation,
+        });
     }
 
     /// Peek at the earliest-due entry, removing stale duplicates from the top.
@@ -66,7 +81,7 @@ impl ScheduleQueue {
     /// caller doesn't hold a borrow that would conflict with a subsequent `pop()`.
     pub fn peek(&mut self) -> Option<ScheduleEntry> {
         while let Some(top) = self.heap.peek() {
-            if self.latest.get(&top.name) == Some(&top.next_run) {
+            if self.latest.get(&top.name) == Some(&top.generation) {
                 return Some(top.clone());
             }
             // Stale entry — remove from heap and continue.
@@ -79,7 +94,8 @@ impl ScheduleQueue {
     pub fn pop(&mut self) -> Option<ScheduleEntry> {
         while let Some(entry) = self.heap.pop() {
             // Skip if this is a stale entry (a newer push replaced it).
-            if self.latest.get(&entry.name) == Some(&entry.next_run) {
+            if self.latest.get(&entry.name) == Some(&entry.generation) {
+                self.latest.remove(&entry.name);
                 return Some(entry);
             }
         }
@@ -105,7 +121,7 @@ impl ScheduleQueue {
         self.heap.iter().all(|e| {
             self.latest
                 .get(&e.name)
-                .map(|&latest| latest != e.next_run)
+                .map(|&latest| latest != e.generation)
                 .unwrap_or(true)
         })
     }
@@ -117,7 +133,7 @@ impl ScheduleQueue {
     pub fn len(&self) -> usize {
         self.heap
             .iter()
-            .filter(|e| self.latest.get(&e.name) == Some(&e.next_run))
+            .filter(|e| self.latest.get(&e.name) == Some(&e.generation))
             .count()
     }
 }
@@ -125,11 +141,29 @@ impl ScheduleQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
+    use chrono::{DateTime, Duration, Utc};
 
-    fn at(offset_secs: u64) -> Instant {
-        // Use a fixed base so tests are deterministic.
-        Instant::now() + Duration::from_secs(offset_secs)
+    fn utc(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn retains_intended_utc_time_and_stales_same_time_replacement_by_generation() {
+        let mut q = ScheduleQueue::new();
+        let due = utc("2026-01-01T00:00:00Z");
+        q.push("ubuntu".into(), due);
+        q.push("ubuntu".into(), due);
+
+        let entry = q.pop().unwrap();
+        assert_eq!(entry.scheduled_at, due);
+        assert!(entry.generation > 1);
+        assert!(q.pop().is_none());
+    }
+
+    fn at(offset_secs: i64) -> DateTime<Utc> {
+        utc("2026-01-01T00:00:00Z") + Duration::seconds(offset_secs)
     }
 
     #[test]
@@ -156,7 +190,7 @@ mod tests {
 
         let entry = q.pop().unwrap();
         assert_eq!(entry.name, "ubuntu");
-        assert_eq!(entry.next_run, t_new);
+        assert_eq!(entry.scheduled_at, t_new);
 
         // Only one logical entry — subsequent pop must return None.
         assert!(q.pop().is_none());
@@ -172,7 +206,7 @@ mod tests {
         q.push("ubuntu".into(), t_late);
 
         let entry = q.pop().unwrap();
-        assert_eq!(entry.next_run, t_late);
+        assert_eq!(entry.scheduled_at, t_late);
         assert!(q.pop().is_none());
     }
 

@@ -19,6 +19,7 @@ pub mod provider;
 pub mod providers;
 pub mod runner;
 pub mod schedule;
+pub mod scheduling;
 pub mod worker;
 
 use std::collections::HashMap;
@@ -137,6 +138,30 @@ pub(crate) fn validate_worker_config(cfg: &config::WorkerConfig) -> Vec<String> 
         errors.push(e);
     }
 
+    if !cfg.global.timezone.is_empty() {
+        if let Err(e) = cfg.global.timezone.parse::<chrono_tz::Tz>() {
+            errors.push(format!(
+                "global.timezone {:?} is not a valid IANA timezone name: {e}",
+                cfg.global.timezone
+            ));
+        }
+    }
+    match cfg.global.interval_mode {
+        config::IntervalMode::FixedDelay => {
+            if !cfg.global.fixed_rate_anchor.is_empty() {
+                errors.push("global.fixed_rate_anchor is invalid with fixed-delay mode".into());
+            }
+        }
+        config::IntervalMode::FixedRate => {
+            validate_fixed_rate(
+                "global",
+                cfg.global.interval,
+                &cfg.global.fixed_rate_anchor,
+                &mut errors,
+            );
+        }
+    }
+
     let mut seen = std::collections::HashSet::new();
     for mc in &cfg.mirrors {
         if !seen.insert(mc.name.as_str()) {
@@ -164,8 +189,73 @@ pub(crate) fn validate_worker_config(cfg: &config::WorkerConfig) -> Vec<String> 
                 ));
             }
         }
+        if !mc.timezone.is_empty() {
+            if let Err(e) = mc.timezone.parse::<chrono_tz::Tz>() {
+                errors.push(format!(
+                    "mirror {:?}: timezone {:?} is not a valid IANA timezone name: {e}",
+                    mc.name, mc.timezone
+                ));
+            }
+        }
+        if !mc.cron.is_empty() {
+            if let Err(e) = crate::worker::parse_cron_lenient(&mc.cron) {
+                errors.push(format!(
+                    "mirror {:?}: invalid cron expression {:?}: {e}",
+                    mc.name, mc.cron
+                ));
+            }
+        }
+
+        let mode = mc.effective_interval_mode(&cfg.global);
+        let anchor = mc.effective_fixed_rate_anchor(&cfg.global);
+        match mode {
+            config::IntervalMode::FixedDelay => {
+                if !anchor.is_empty() {
+                    errors.push(format!(
+                        "mirror {:?}: fixed_rate_anchor is invalid with fixed-delay mode",
+                        mc.name
+                    ));
+                }
+            }
+            config::IntervalMode::FixedRate => {
+                if !mc.cron.is_empty() {
+                    errors.push(format!(
+                        "mirror {:?}: cron conflicts with fixed-rate interval_mode",
+                        mc.name
+                    ));
+                }
+                let interval_minutes = if mc.interval > 0 {
+                    mc.interval
+                } else {
+                    cfg.global.interval
+                };
+                validate_fixed_rate(
+                    &format!("mirror {:?}", mc.name),
+                    interval_minutes,
+                    anchor,
+                    &mut errors,
+                );
+            }
+        }
     }
     errors
+}
+
+fn validate_fixed_rate(scope: &str, interval: u64, anchor: &str, errors: &mut Vec<String>) {
+    if !(1..=1440).contains(&interval) {
+        errors.push(format!(
+            "{scope}: fixed-rate interval must be in 1..=1440 minutes"
+        ));
+    } else if 1440 % interval != 0 {
+        errors.push(format!(
+            "{scope}: fixed-rate interval {interval} must divide 1440 minutes"
+        ));
+    }
+    if let Err(e) = crate::scheduling::parse_fixed_rate_anchor(anchor) {
+        errors.push(format!(
+            "{scope}: invalid fixed_rate_anchor {anchor:?}: {e}"
+        ));
+    }
 }
 
 /// Entry point invoked by `tunasync worker`.
@@ -199,46 +289,6 @@ pub async fn run(config_path: std::path::PathBuf) -> Result<()> {
     let config_errors = validate_worker_config(&cfg);
     if !config_errors.is_empty() {
         anyhow::bail!("{}", config_errors.join("; "));
-    }
-
-    // Validate cron expressions at startup so a misconfigured mirror fails
-    // fast rather than silently falling back to the interval scheduler.
-    // Accept both classic 5-field POSIX cron and the cron-crate's native
-    // 6/7-field format (see `worker::parse_cron_lenient`).
-    for mc in &cfg.mirrors {
-        if !mc.cron.is_empty() {
-            if let Err(e) = crate::worker::parse_cron_lenient(&mc.cron) {
-                anyhow::bail!(
-                    "mirror {:?}: invalid cron expression {:?}: {e}",
-                    mc.name,
-                    mc.cron
-                );
-            }
-        }
-    }
-
-    // Validate IANA timezone names at startup so silently-wrong schedules
-    // can't happen. Empty string = use global default (also validated) =
-    // UTC. Validate global first so a bad per-mirror override doesn't mask
-    // a bad global setting.
-    if !cfg.global.timezone.is_empty() {
-        if let Err(e) = cfg.global.timezone.parse::<chrono_tz::Tz>() {
-            anyhow::bail!(
-                "global.timezone {:?} is not a valid IANA timezone name: {e}",
-                cfg.global.timezone
-            );
-        }
-    }
-    for mc in &cfg.mirrors {
-        if !mc.timezone.is_empty() {
-            if let Err(e) = mc.timezone.parse::<chrono_tz::Tz>() {
-                anyhow::bail!(
-                    "mirror {:?}: timezone {:?} is not a valid IANA timezone name: {e}",
-                    mc.name,
-                    mc.timezone
-                );
-            }
-        }
     }
 
     // Do not start a partially configured worker. Every mirror must build
@@ -555,14 +605,6 @@ pub fn check_config(config_path: &std::path::Path) -> Result<ConfigCheckReport> 
     cfg.mirrors = config::flatten_mirrors(&cfg.mirrors_conf);
 
     // Global-level checks.
-    if !cfg.global.timezone.is_empty() {
-        if let Err(e) = cfg.global.timezone.parse::<chrono_tz::Tz>() {
-            errors.push(format!(
-                "global.timezone {:?} is not a valid IANA timezone: {e}",
-                cfg.global.timezone
-            ));
-        }
-    }
     if cfg.manager.api_base_list().iter().all(|b| b.is_empty()) {
         warnings.push(
             "[manager] api_base is empty — the worker will not be able to \
@@ -573,24 +615,8 @@ pub fn check_config(config_path: &std::path::Path) -> Result<ConfigCheckReport> 
 
     errors.extend(validate_worker_config(&cfg));
 
-    // Per-mirror checks. Collect everything rather than bailing early.
+    // Per-mirror provider checks. Scheduling validation is centralized above.
     for mc in &cfg.mirrors {
-        if !mc.cron.is_empty() {
-            if let Err(e) = crate::worker::parse_cron_lenient(&mc.cron) {
-                errors.push(format!(
-                    "mirror {:?}: invalid cron expression {:?}: {e}",
-                    mc.name, mc.cron
-                ));
-            }
-        }
-        if !mc.timezone.is_empty() {
-            if let Err(e) = mc.timezone.parse::<chrono_tz::Tz>() {
-                errors.push(format!(
-                    "mirror {:?}: timezone {:?} is not a valid IANA timezone: {e}",
-                    mc.name, mc.timezone
-                ));
-            }
-        }
         // Try to actually construct the provider + hooks: catches bad
         // provider options, unsupported combinations, bad template syntax.
         if let Err(e) = build_one_provider(mc, &cfg) {
@@ -607,8 +633,53 @@ pub fn check_config(config_path: &std::path::Path) -> Result<ConfigCheckReport> 
 
 #[cfg(test)]
 mod tests {
-    use crate::config::MirrorConfig;
-    use crate::config::ProviderKind;
+    use crate::config::{IntervalMode, MirrorConfig, ProviderKind, WorkerConfig};
+
+    fn validated_config(mirror: MirrorConfig) -> WorkerConfig {
+        let mut cfg = WorkerConfig::default();
+        cfg.global.interval = 60;
+        cfg.mirrors = vec![mirror];
+        cfg
+    }
+
+    #[test]
+    fn scheduling_validation_is_centralized() {
+        let mut fixed_rate = MirrorConfig {
+            name: "rate".into(),
+            interval: 60,
+            interval_mode: Some(IntervalMode::FixedRate),
+            fixed_rate_anchor: Some("03:15".into()),
+            ..Default::default()
+        };
+        assert!(crate::validate_worker_config(&validated_config(fixed_rate.clone())).is_empty());
+
+        fixed_rate.interval = 7;
+        let errors = crate::validate_worker_config(&validated_config(fixed_rate.clone()));
+        assert!(errors.iter().any(|e| e.contains("divide 1440")));
+
+        fixed_rate.interval = 60;
+        fixed_rate.cron = "0 3 * * *".into();
+        let errors = crate::validate_worker_config(&validated_config(fixed_rate));
+        assert!(errors.iter().any(|e| e.contains("conflicts")));
+
+        let fixed_delay_with_anchor = MirrorConfig {
+            name: "delay".into(),
+            fixed_rate_anchor: Some("03:15".into()),
+            ..Default::default()
+        };
+        let errors = crate::validate_worker_config(&validated_config(fixed_delay_with_anchor));
+        assert!(errors.iter().any(|e| e.contains("fixed-delay")));
+
+        let invalid_cron_and_timezone = MirrorConfig {
+            name: "invalid".into(),
+            cron: "not cron".into(),
+            timezone: "Not/AZone".into(),
+            ..Default::default()
+        };
+        let errors = crate::validate_worker_config(&validated_config(invalid_cron_and_timezone));
+        assert!(errors.iter().any(|e| e.contains("invalid cron")));
+        assert!(errors.iter().any(|e| e.contains("timezone")));
+    }
 
     #[test]
     fn expand_log_dir_name() {

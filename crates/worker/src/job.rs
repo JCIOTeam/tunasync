@@ -82,6 +82,10 @@ impl JobState {
 /// Status update pushed by a job to the worker scheduler.
 #[derive(Debug, Clone)]
 pub struct JobMessage {
+    /// Identifies the concrete MirrorJob instance that emitted this message.
+    /// Reload replaces a job with a new generation; buffered messages from the
+    /// retired task are discarded by the worker.
+    pub job_generation: u64,
     pub status: SyncStatus,
     pub name: String,
     pub msg: String,
@@ -110,6 +114,9 @@ pub struct MirrorJob {
     state: Arc<AtomicU32>,
     ctrl_tx: mpsc::Sender<CtrlAction>,
     kill_tx: watch::Sender<bool>,
+    /// Permanent task retirement used by reload/shutdown. Unlike Halt in the
+    /// bounded FIFO control queue, this cannot sit behind queued Start actions.
+    retire_tx: watch::Sender<bool>,
     /// Handle of the spawned job task; consumed by graceful shutdown to
     /// join the task (so in-flight hooks/publish can finish) instead of
     /// abandoning it behind a fixed sleep.
@@ -125,11 +132,13 @@ impl MirrorJob {
         semaphore: Arc<PrioritySemaphore>,
         per_upstream_semaphore: Option<Arc<tokio::sync::Semaphore>>,
         priority: i32,
+        job_generation: u64,
     ) -> Self {
         let name = provider.name().to_owned();
         let state = Arc::new(AtomicU32::new(JobState::None as u32));
         let (ctrl_tx, ctrl_rx) = mpsc::channel(4);
         let (kill_tx, kill_rx) = watch::channel(false);
+        let (retire_tx, retire_rx) = watch::channel(false);
 
         let task_state = Arc::clone(&state);
         let task = tokio::spawn(run_job_task(
@@ -137,11 +146,13 @@ impl MirrorJob {
             hooks,
             ctrl_rx,
             kill_rx,
+            retire_rx,
             status_tx,
             semaphore,
             per_upstream_semaphore,
             priority,
             task_state,
+            job_generation,
         ));
 
         Self {
@@ -149,6 +160,7 @@ impl MirrorJob {
             state,
             ctrl_tx,
             kill_tx,
+            retire_tx,
             task: Some(task),
         }
     }
@@ -189,6 +201,12 @@ impl MirrorJob {
     pub fn kill(&self) {
         let _ = self.kill_tx.send(true);
     }
+
+    /// Permanently retire this job task and interrupt any in-flight sync.
+    pub fn retire(&self) {
+        let _ = self.retire_tx.send(true);
+        self.kill();
+    }
 }
 
 // Job task loop
@@ -199,11 +217,13 @@ async fn run_job_task(
     hooks: Vec<Box<dyn JobHook>>,
     mut ctrl_rx: mpsc::Receiver<CtrlAction>,
     mut kill_rx: watch::Receiver<bool>,
+    mut retire_rx: watch::Receiver<bool>,
     status_tx: mpsc::Sender<JobMessage>,
     semaphore: Arc<PrioritySemaphore>,
     per_upstream_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     priority: i32,
     state: Arc<AtomicU32>,
+    job_generation: u64,
 ) {
     let name = provider.name().to_owned();
     let max_retry = provider.retry();
@@ -215,13 +235,28 @@ async fn run_job_task(
         // Wait for a start signal (the scheduler sends Start when the
         // job's next-run time arrives). This matches Go's design where
         // the job itself has no interval sleep — scheduling is external.
-        let action = match ctrl_rx.recv().await {
-            Some(a) => a,
-            None => {
-                info!(mirror = %name, "ctrl channel closed — exiting");
+        let action = tokio::select! {
+            biased;
+            changed = retire_rx.changed() => {
+                if changed.is_ok() && *retire_rx.borrow() {
+                    info!(mirror = %name, "job permanently retired");
+                }
+                set_state(&state, JobState::Halting);
                 break;
             }
+            action = ctrl_rx.recv() => match action {
+                Some(action) => action,
+                None => {
+                    info!(mirror = %name, "ctrl channel closed — exiting");
+                    break;
+                }
+            }
         };
+
+        if *retire_rx.borrow() {
+            set_state(&state, JobState::Halting);
+            break;
+        }
 
         // Handle the control action. Start/Restart/ForceStart fall through
         // to the sync; Stop/Disable loop back to wait; Halt exits.
@@ -313,12 +348,17 @@ async fn run_job_task(
             &state,
             &mut ctrl_rx,
             &mut kill_rx,
+            job_generation,
         )
         .await;
 
         // If the sync was killed (Restart/Stop/Disable/Halt), skip scheduling.
         // Matches Go: `schedule: (m.State() == stateReady)`.
         if killed {
+            if *retire_rx.borrow() {
+                set_state(&state, JobState::Halting);
+                break;
+            }
             // If state was set to Halting (either by the top-of-loop Halt branch
             // or by the retry-loop try_recv handler), exit the task.
             if state.load(Ordering::SeqCst) == JobState::Halting as u32 {
@@ -334,12 +374,17 @@ async fn run_job_task(
             debug!(mirror = %name, "halt detected — exiting job task");
             break;
         }
+        if *retire_rx.borrow() {
+            set_state(&state, JobState::Halting);
+            break;
+        }
 
         // Only schedule the next run if the job is still in Ready state.
         // This matches Go's `(m.State() == stateReady)` check in jobMessage.
         let schedule = state.load(Ordering::SeqCst) == JobState::Ready as u32;
         let _ = status_tx
             .send(JobMessage {
+                job_generation,
                 status: SyncStatus::None,
                 name: name.clone(),
                 msg: String::new(),
@@ -373,6 +418,7 @@ async fn run_sync_with_retry(
     state: &Arc<AtomicU32>,
     ctrl_rx: &mut mpsc::Receiver<CtrlAction>,
     kill_rx: &mut watch::Receiver<bool>,
+    job_generation: u64,
 ) -> bool {
     // Disk-quota pre-check: skip (don't fail) if free space at working_dir is
     // below the configured threshold.  schedule=true keeps the mirror in Ready
@@ -390,6 +436,7 @@ async fn run_sync_with_retry(
                 );
                 let _ = status_tx
                     .send(JobMessage {
+                        job_generation,
                         status: SyncStatus::Failed,
                         name: name.to_owned(),
                         msg: format!("disk quota: only {avail} bytes available, need {quota}"),
@@ -410,6 +457,7 @@ async fn run_sync_with_retry(
         tracing::warn!(mirror = %name, error = %e, "upstream probe failed; skipping sync");
         let _ = status_tx
             .send(JobMessage {
+                job_generation,
                 status: SyncStatus::Failed,
                 name: name.to_owned(),
                 msg: format!("upstream unreachable: {e}"),
@@ -425,6 +473,7 @@ async fn run_sync_with_retry(
     // Announce pre-syncing.
     let _ = status_tx
         .send(JobMessage {
+            job_generation,
             status: SyncStatus::PreSyncing,
             name: name.to_owned(),
             msg: String::new(),
@@ -437,7 +486,7 @@ async fn run_sync_with_retry(
     set_state(state, JobState::Ready);
 
     // pre-job hooks
-    if run_hooks(hooks, HookPhase::PreJob, name, status_tx)
+    if run_hooks(hooks, HookPhase::PreJob, name, status_tx, job_generation)
         .await
         .is_err()
     {
@@ -504,6 +553,7 @@ async fn run_sync_with_retry(
         // Announce syncing.
         let _ = status_tx
             .send(JobMessage {
+                job_generation,
                 status: SyncStatus::Syncing,
                 name: name.to_owned(),
                 msg: String::new(),
@@ -515,7 +565,7 @@ async fn run_sync_with_retry(
             .await;
 
         // pre-exec hooks
-        if run_hooks(hooks, HookPhase::PreExec, name, status_tx)
+        if run_hooks(hooks, HookPhase::PreExec, name, status_tx, job_generation)
             .await
             .is_err()
         {
@@ -568,7 +618,7 @@ async fn run_sync_with_retry(
         };
 
         // post-exec hooks — run in reverse order per Go's behaviour.
-        post_exec_ok = run_hooks(hooks, HookPhase::PostExec, name, status_tx)
+        post_exec_ok = run_hooks(hooks, HookPhase::PostExec, name, status_tx, job_generation)
             .await
             .is_ok();
 
@@ -603,11 +653,18 @@ async fn run_sync_with_retry(
     if success && post_exec_ok {
         let size = provider.data_size();
         let transferred = provider.transferred_bytes();
-        run_hooks(hooks, HookPhase::PostSuccess, name, status_tx)
-            .await
-            .ok();
+        run_hooks(
+            hooks,
+            HookPhase::PostSuccess,
+            name,
+            status_tx,
+            job_generation,
+        )
+        .await
+        .ok();
         let _ = status_tx
             .send(JobMessage {
+                job_generation,
                 status: SyncStatus::Success,
                 name: name.to_owned(),
                 msg: String::new(),
@@ -618,11 +675,12 @@ async fn run_sync_with_retry(
             })
             .await;
     } else if post_exec_ok {
-        run_hooks(hooks, HookPhase::PostFail, name, status_tx)
+        run_hooks(hooks, HookPhase::PostFail, name, status_tx, job_generation)
             .await
             .ok();
         let _ = status_tx
             .send(JobMessage {
+                job_generation,
                 status: SyncStatus::Failed,
                 name: name.to_owned(),
                 msg: last_error,
@@ -645,6 +703,7 @@ async fn run_hooks(
     phase: HookPhase,
     name: &str,
     status_tx: &mpsc::Sender<JobMessage>,
+    job_generation: u64,
 ) -> Result<(), ()> {
     let hooks_to_run: Vec<_> = match phase {
         HookPhase::PostExec | HookPhase::PostSuccess | HookPhase::PostFail => {
@@ -663,6 +722,7 @@ async fn run_hooks(
             );
             let _ = status_tx
                 .send(JobMessage {
+                    job_generation,
                     status: SyncStatus::Failed,
                     name: name.to_owned(),
                     msg: format!("hook {} {:?} failed: {e}", hook.name(), phase),
@@ -757,6 +817,7 @@ mod disk_quota_tests {
             &state,
             &mut ctrl_rx,
             &mut kill_rx,
+            1,
         )
         .await;
 
@@ -907,6 +968,7 @@ mod per_upstream_semaphore_tests {
             Arc::clone(&global_sem),
             Some(Arc::clone(&upstream_sem)),
             50,
+            1,
         );
         let job2 = MirrorJob::spawn(
             Box::new(p2),
@@ -915,6 +977,7 @@ mod per_upstream_semaphore_tests {
             Arc::clone(&global_sem),
             Some(Arc::clone(&upstream_sem)),
             50,
+            2,
         );
 
         // Start both jobs concurrently.
@@ -961,7 +1024,7 @@ mod stale_kill_repro {
     //! in the semaphore-acquire select and gets silently swallowed.
 
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -975,6 +1038,11 @@ mod stale_kill_repro {
     struct FlagProvider {
         working_dir: PathBuf,
         ran: Arc<AtomicBool>,
+    }
+
+    struct BlockingCountProvider {
+        runs: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
     }
 
     #[async_trait]
@@ -1014,6 +1082,39 @@ mod stale_kill_repro {
         fn set_log_path_shared(&mut self, _: Arc<Mutex<PathBuf>>) {}
     }
 
+    #[async_trait]
+    impl MirrorProvider for BlockingCountProvider {
+        fn name(&self) -> &str {
+            "blocking-count"
+        }
+        fn upstream(&self) -> &str {
+            "rsync://localhost/test/"
+        }
+        fn is_master(&self) -> bool {
+            true
+        }
+        fn interval(&self) -> Duration {
+            Duration::from_secs(3600)
+        }
+        fn retry(&self) -> u32 {
+            1
+        }
+        fn timeout(&self) -> Duration {
+            Duration::ZERO
+        }
+        async fn run(&self) -> anyhow::Result<()> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+        async fn terminate(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn set_docker_config(&mut self, _: DockerConfig) {}
+        fn set_log_path_shared(&mut self, _: Arc<Mutex<PathBuf>>) {}
+    }
+
     #[tokio::test]
     async fn start_after_idle_stop_is_swallowed_by_stale_kill() {
         let ran = Arc::new(AtomicBool::new(false));
@@ -1030,7 +1131,7 @@ mod stale_kill_repro {
         // the stale-kill branch in the select deterministic.
         let held = sem.acquire(0).await;
 
-        let job = MirrorJob::spawn(provider, vec![], status_tx, Arc::clone(&sem), None, 0);
+        let job = MirrorJob::spawn(provider, vec![], status_tx, Arc::clone(&sem), None, 0, 1);
 
         // Simulate `tunasynctl stop` on an idle mirror: Stop + kill().
         job.try_send(CtrlAction::Stop);
@@ -1050,6 +1151,40 @@ mod stale_kill_repro {
             ran.load(Ordering::SeqCst),
             "BUG REPRODUCED: Start sent after an idle-time Stop/kill was \
              swallowed by the stale kill watch — sync never ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_preempts_queued_start_actions() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let provider = Box::new(BlockingCountProvider {
+            runs: Arc::clone(&runs),
+            started: Arc::clone(&started),
+        });
+        let (status_tx, mut status_rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(async move { while status_rx.recv().await.is_some() {} });
+        let sem = Arc::new(PrioritySemaphore::new(1));
+        let mut job = MirrorJob::spawn(provider, vec![], status_tx, sem, None, 0, 1);
+
+        job.send(CtrlAction::Start).await;
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("first run should start");
+        assert!(job.try_send(CtrlAction::Start));
+        assert!(job.try_send(CtrlAction::Restart));
+
+        job.retire();
+        let mut task = job.take_task().expect("job task");
+        tokio::time::timeout(Duration::from_secs(2), &mut task)
+            .await
+            .expect("retired job should exit")
+            .expect("retired job task should not panic");
+
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "queued starts must not run after permanent retirement"
         );
     }
 }

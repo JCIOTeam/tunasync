@@ -33,6 +33,17 @@ pub enum ProviderKind {
     Command,
 }
 
+/// Interval scheduling semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum IntervalMode {
+    /// Schedule the next run relative to completion time.
+    #[default]
+    FixedDelay,
+    /// Schedule on local wall-clock slots derived from a daily anchor.
+    FixedRate,
+}
+
 impl FromStr for ProviderKind {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -189,6 +200,14 @@ pub struct GlobalConfig {
     /// Default interval between syncs, in minutes.
     #[serde(default)]
     pub interval: u64,
+
+    /// Default interval scheduling mode.
+    #[serde(default)]
+    pub interval_mode: IntervalMode,
+
+    /// Daily local-time anchor for fixed-rate scheduling (`HH:MM`).
+    #[serde(default)]
+    pub fixed_rate_anchor: String,
 
     /// Default max retry count.
     #[serde(default)]
@@ -511,6 +530,14 @@ pub struct MirrorConfig {
     #[serde(default)]
     pub interval: u64,
 
+    /// Per-mirror scheduling mode override.
+    #[serde(default)]
+    pub interval_mode: Option<IntervalMode>,
+
+    /// Per-mirror fixed-rate anchor override. An empty string clears inheritance.
+    #[serde(default)]
+    pub fixed_rate_anchor: Option<String>,
+
     /// Max retries. 0 = inherit from global.
     #[serde(default)]
     pub retry: u32,
@@ -730,6 +757,14 @@ fn merge_mirror(parent: MirrorConfig, child: MirrorConfig) -> MirrorConfig {
             parent.interval
         } else {
             child.interval
+        },
+        interval_mode: child.interval_mode.or(parent.interval_mode),
+        fixed_rate_anchor: if child.fixed_rate_anchor.is_some() {
+            child.fixed_rate_anchor
+        } else if child.interval_mode == Some(IntervalMode::FixedDelay) {
+            Some(String::new())
+        } else {
+            parent.fixed_rate_anchor
         },
         retry: if child.retry == 0 {
             parent.retry
@@ -951,6 +986,22 @@ impl MirrorConfig {
         Duration::from_secs(mins * 60)
     }
 
+    /// Effective interval scheduling mode.
+    pub fn effective_interval_mode(&self, global: &GlobalConfig) -> IntervalMode {
+        self.interval_mode.unwrap_or(global.interval_mode)
+    }
+
+    /// Effective fixed-rate anchor. Explicit fixed-delay clears inherited anchors.
+    pub fn effective_fixed_rate_anchor<'a>(&'a self, global: &'a GlobalConfig) -> &'a str {
+        if let Some(anchor) = self.fixed_rate_anchor.as_deref() {
+            return anchor;
+        }
+        if self.interval_mode == Some(IntervalMode::FixedDelay) {
+            return "";
+        }
+        &global.fixed_rate_anchor
+    }
+
     /// Effective retry count, falling back to global default.
     pub fn effective_retry(&self, global: &GlobalConfig) -> u32 {
         if self.retry > 0 {
@@ -1042,6 +1093,61 @@ impl MirrorConfig {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduling_config_defaults_to_fixed_delay() {
+        let cfg: WorkerConfig =
+            tunasync_common::config::parse_toml("[global]\ninterval = 60").unwrap();
+        assert_eq!(cfg.global.interval_mode, IntervalMode::FixedDelay);
+        assert!(cfg.global.fixed_rate_anchor.is_empty());
+    }
+
+    #[test]
+    fn scheduling_config_deserializes_global_and_mirror_overrides() {
+        let cfg: WorkerConfig = tunasync_common::config::parse_toml(
+            r#"
+[global]
+interval = 60
+interval_mode = "fixed-rate"
+fixed_rate_anchor = "03:15"
+
+[[mirrors]]
+name = "fixed-delay-child"
+interval_mode = "fixed-delay"
+fixed_rate_anchor = ""
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.global.interval_mode, IntervalMode::FixedRate);
+        assert_eq!(cfg.global.fixed_rate_anchor, "03:15");
+        assert_eq!(
+            cfg.mirrors_conf[0].interval_mode,
+            Some(IntervalMode::FixedDelay)
+        );
+        assert_eq!(cfg.mirrors_conf[0].fixed_rate_anchor.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn nested_mirror_can_explicitly_override_fixed_rate_with_fixed_delay() {
+        let cfg: WorkerConfig = tunasync_common::config::parse_toml(
+            r#"
+[[mirrors]]
+name = "parent"
+interval = 60
+interval_mode = "fixed-rate"
+fixed_rate_anchor = "01:30"
+
+[[mirrors.mirrors]]
+name = "child"
+upstream = "rsync://example/child"
+interval_mode = "fixed-delay"
+"#,
+        )
+        .unwrap();
+        let flat = flatten_mirrors(&cfg.mirrors_conf);
+        assert_eq!(flat[0].interval_mode, Some(IntervalMode::FixedDelay));
+        assert_eq!(flat[0].fixed_rate_anchor.as_deref(), Some(""));
+    }
 
     #[test]
     fn parse_mem_bytes_units() {

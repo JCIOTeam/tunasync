@@ -44,6 +44,7 @@ use crate::log_stream::LogBroadcaster;
 use crate::manager_client::ManagerClient;
 use crate::provider::MirrorProvider;
 use crate::schedule::ScheduleQueue;
+use crate::scheduling::{parse_fixed_rate_anchor, SchedulingPolicy};
 
 /// Extract the upstream host from a sync URL, for per-upstream concurrency.
 ///
@@ -90,41 +91,132 @@ fn upstream_host(upstream: &str) -> Option<String> {
     None
 }
 
-/// Compute the next `Instant` a mirror should run.
-///
-/// `cached_cron` is the precomputed `cron::Schedule` for this mirror, if any
-/// — built once at startup so we don't re-parse the TOML string on every
-/// scheduler tick.
+/// Build the deterministic scheduling policy for one mirror.
+fn scheduling_policy_for(
+    mc: &crate::config::MirrorConfig,
+    global: &crate::config::GlobalConfig,
+    cached_cron: Option<&cron::Schedule>,
+    timezone: chrono_tz::Tz,
+) -> Option<SchedulingPolicy> {
+    if let Some(sched) = cached_cron {
+        return Some(SchedulingPolicy::cron(sched.clone(), timezone));
+    }
+    match mc.effective_interval_mode(global) {
+        crate::config::IntervalMode::FixedDelay => {
+            Some(SchedulingPolicy::fixed_delay(mc.effective_interval(global)))
+        }
+        crate::config::IntervalMode::FixedRate => {
+            let interval_minutes = if mc.interval > 0 {
+                mc.interval
+            } else {
+                global.interval
+            };
+            let anchor = parse_fixed_rate_anchor(mc.effective_fixed_rate_anchor(global)).ok()?;
+            Some(SchedulingPolicy::fixed_rate(
+                interval_minutes,
+                anchor,
+                timezone,
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
 fn next_run_for(
     mc: &crate::config::MirrorConfig,
     global: &crate::config::GlobalConfig,
     cached_cron: Option<&cron::Schedule>,
-) -> (Instant, chrono::DateTime<chrono::Utc>) {
-    let now_instant = Instant::now();
-    let now_utc = chrono::Utc::now();
-    let interval = mc.effective_interval(global);
+) -> (Instant, chrono::DateTime<Utc>) {
+    let now = Utc::now();
+    let timezone = mc
+        .effective_timezone(global)
+        .parse()
+        .unwrap_or(chrono_tz::UTC);
+    let policy = scheduling_policy_for(mc, global, cached_cron, timezone)
+        .expect("validated scheduling policy");
+    let next = policy.next_after(now).expect("next scheduling occurrence");
+    (due_utc_to_instant(next, now), next)
+}
 
-    if let Some(sched) = cached_cron {
-        // Interpret the cron expression in the mirror's configured timezone.
-        // `sched.upcoming(tz)` returns DateTime<Tz>; we convert to UTC for the
-        // returned schedule timestamp and convert the delta to an Instant.
-        //
-        // Why this matters: a cron of "0 3 * * *" in Asia/Shanghai must fire
-        // at 03:00 CST = 19:00 UTC the previous day, not at 03:00 UTC. The
-        // global default is UTC so existing UTC-based configs keep working.
-        let tz_name = mc.effective_timezone(global);
-        // tz_name has been validated at config load — parse error here would
-        // mean someone hot-reloaded with a bad value past startup validation;
-        // fall back to UTC defensively rather than panicking.
-        let tz: chrono_tz::Tz = tz_name.parse().unwrap_or(chrono_tz::UTC);
-        if let Some(next_in_tz) = sched.upcoming(tz).next() {
-            let next_utc = next_in_tz.with_timezone(&chrono::Utc);
-            let delta = (next_utc - now_utc).to_std().unwrap_or(interval);
-            return (now_instant + delta, next_utc);
-        }
+fn build_scheduling_cache(
+    mirrors: &[crate::config::MirrorConfig],
+    global: &crate::config::GlobalConfig,
+    crons: &HashMap<String, cron::Schedule>,
+    timezones: &HashMap<String, chrono_tz::Tz>,
+) -> HashMap<String, SchedulingPolicy> {
+    mirrors
+        .iter()
+        .filter_map(|mc| {
+            scheduling_policy_for(
+                mc,
+                global,
+                crons.get(&mc.name),
+                timezones.get(&mc.name).copied().unwrap_or(chrono_tz::UTC),
+            )
+            .map(|policy| (mc.name.clone(), policy))
+        })
+        .collect()
+}
+
+fn due_utc_to_instant(due: chrono::DateTime<Utc>, now_utc: chrono::DateTime<Utc>) -> Instant {
+    let delay = (due - now_utc).to_std().unwrap_or(Duration::ZERO);
+    Instant::now() + delay
+}
+
+fn blackout_check_at(
+    policy: Option<&SchedulingPolicy>,
+    scheduled_at: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+) -> chrono::DateTime<Utc> {
+    if policy.is_some_and(SchedulingPolicy::is_wall_clock) {
+        scheduled_at
+    } else {
+        now
     }
-    let next_dt = now_utc + chrono::Duration::from_std(interval).unwrap_or_default();
-    (now_instant + interval, next_dt)
+}
+
+fn is_active_job_message(active_generations: &HashMap<String, u64>, message: &JobMessage) -> bool {
+    active_generations.get(&message.name) == Some(&message.job_generation)
+}
+
+fn next_reload_schedule(
+    mc: &crate::config::MirrorConfig,
+    global: &crate::config::GlobalConfig,
+    now: chrono::DateTime<Utc>,
+) -> chrono::DateTime<Utc> {
+    let timezone = mc
+        .effective_timezone(global)
+        .parse()
+        .unwrap_or(chrono_tz::UTC);
+    let cron = if mc.cron.is_empty() {
+        None
+    } else {
+        parse_cron_lenient(&mc.cron).ok()
+    };
+    scheduling_policy_for(mc, global, cron.as_ref(), timezone)
+        .and_then(|policy| policy.next_reload_after(now))
+        .unwrap_or(now)
+}
+
+fn global_scheduling_change_affects(
+    mc: &crate::config::MirrorConfig,
+    old: &crate::config::GlobalConfig,
+    new: &crate::config::GlobalConfig,
+) -> bool {
+    let old_mode = mc.effective_interval_mode(old);
+    let new_mode = mc.effective_interval_mode(new);
+    if old_mode != new_mode {
+        return true;
+    }
+    if old_mode == crate::config::IntervalMode::FixedRate
+        && mc.effective_fixed_rate_anchor(old) != mc.effective_fixed_rate_anchor(new)
+    {
+        return true;
+    }
+    (!mc.cron.is_empty()
+        || old_mode == crate::config::IntervalMode::FixedRate
+        || !mc.blackout.is_empty())
+        && mc.effective_timezone(old) != mc.effective_timezone(new)
 }
 
 /// Build the per-mirror blackout-windows cache from config.
@@ -278,6 +370,10 @@ pub struct Worker {
     /// Original config file path — used by hot-reload to re-read from disk.
     config_path: PathBuf,
     jobs: HashMap<String, MirrorJob>,
+    /// Active MirrorJob generation per mirror. Buffered messages from a job
+    /// retired by reload are ignored when their generation no longer matches.
+    job_generations: HashMap<String, u64>,
+    next_job_generation: u64,
     manager: Arc<ManagerClient>,
     api_token: Arc<RwLock<String>>,
     #[allow(dead_code)] // cloned into job tasks; field not read directly
@@ -315,6 +411,8 @@ pub struct Worker {
     /// timezone string on every tick when evaluating blackout windows
     /// and cron schedules. Built once at startup and rebuilt on hot-reload.
     timezones_by_mirror: HashMap<String, chrono_tz::Tz>,
+    /// Pure scheduling policy per mirror, rebuilt after validated reloads.
+    scheduling_by_mirror: HashMap<String, SchedulingPolicy>,
     /// Function to build a single mirror's provider+hooks pair.
     /// Used at startup and on hot-reload for new/modified mirrors.
     #[allow(clippy::type_complexity)]
@@ -328,6 +426,35 @@ pub struct Worker {
 }
 
 impl Worker {
+    fn allocate_job_generation(&mut self, name: &str) -> u64 {
+        self.next_job_generation = self
+            .next_job_generation
+            .checked_add(1)
+            .expect("job generation exhausted");
+        self.job_generations
+            .insert(name.to_owned(), self.next_job_generation);
+        self.next_job_generation
+    }
+
+    async fn stop_and_join_job(&mut self, name: &str) -> Option<JobState> {
+        self.schedule.remove(name);
+        self.job_generations.remove(name);
+        let mut job = self.jobs.remove(name)?;
+        let state = job.state();
+        job.retire();
+        if let Some(mut task) = job.take_task() {
+            if tokio::time::timeout(Duration::from_secs(10), &mut task)
+                .await
+                .is_err()
+            {
+                tracing::warn!(mirror = %name, "old job did not stop within 10s; aborting task");
+                task.abort();
+                let _ = task.await;
+            }
+        }
+        Some(state)
+    }
+
     /// Build a worker from config, using the supplied provider factory.
     ///
     /// `build_jobs` is a closure that receives the resolved config and returns
@@ -363,6 +490,8 @@ impl Worker {
 
         let provider_list = build_jobs(&cfg);
         let mut jobs = HashMap::new();
+        let mut job_generations = HashMap::new();
+        let mut next_job_generation = 0_u64;
         let mut mirror_statuses = HashMap::new();
 
         // Live-log broadcast registry — wired to every provider below so the
@@ -409,6 +538,9 @@ impl Worker {
                 .map(|m| m.priority)
                 .unwrap_or(50);
 
+            next_job_generation += 1;
+            let job_generation = next_job_generation;
+            job_generations.insert(name.clone(), job_generation);
             let job = MirrorJob::spawn(
                 provider,
                 hooks,
@@ -416,12 +548,12 @@ impl Worker {
                 Arc::clone(&semaphore),
                 upstream_sem,
                 priority,
+                job_generation,
             );
             jobs.insert(name, job);
         }
 
-        // Schedule queue is populated in restore_job_state() after startup,
-        // using last_update + interval from the manager (matching Go's runSchedule).
+        // Schedule queue is populated in restore_job_state() after startup.
         let schedule = ScheduleQueue::new();
 
         let mirror_names = Arc::new(RwLock::new(jobs.keys().cloned().collect()));
@@ -430,11 +562,19 @@ impl Worker {
         let blackouts_by_mirror = build_blackout_cache(&cfg.mirrors);
         let crons_by_mirror = build_cron_cache(&cfg.mirrors);
         let timezones_by_mirror = build_timezone_cache(&cfg.mirrors, &cfg.global);
+        let scheduling_by_mirror = build_scheduling_cache(
+            &cfg.mirrors,
+            &cfg.global,
+            &crons_by_mirror,
+            &timezones_by_mirror,
+        );
 
         Self {
             cfg,
             config_path,
             jobs,
+            job_generations,
+            next_job_generation,
             manager,
             api_token,
             status_tx,
@@ -450,6 +590,7 @@ impl Worker {
             blackouts_by_mirror,
             crons_by_mirror,
             timezones_by_mirror,
+            scheduling_by_mirror,
             build_one_provider: crate::build_one_provider,
         }
     }
@@ -535,9 +676,8 @@ impl Worker {
     ///
     /// - Disabled → send Disable, remove from schedule
     /// - Paused   → send Stop, remove from schedule
-    /// - All other known mirrors → schedule at `last_update + interval`
-    ///   (if that time has passed, fires immediately; otherwise waits)
-    /// - Mirrors not yet in manager (brand new) → schedule now (immediate)
+    /// - Fixed-delay mirrors preserve legacy last-completion/immediate semantics
+    /// - Cron/fixed-rate mirrors schedule their next strictly future occurrence
     ///
     /// This is the ONLY place that populates the schedule queue on startup.
     async fn restore_job_state(&mut self, worker_id: &str) {
@@ -561,6 +701,9 @@ impl Worker {
                                 job.try_send(CtrlAction::Disable);
                             }
                             self.schedule.remove(&status.name);
+                            if let Some(entry) = self.mirror_statuses.get_mut(&status.name) {
+                                entry.scheduled = zero_time();
+                            }
                             tracing::info!(mirror = %status.name, "restored Disabled state");
                             continue; // do not enqueue
                         }
@@ -569,6 +712,9 @@ impl Worker {
                                 job.try_send(CtrlAction::Stop);
                             }
                             self.schedule.remove(&status.name);
+                            if let Some(entry) = self.mirror_statuses.get_mut(&status.name) {
+                                entry.scheduled = zero_time();
+                            }
                             tracing::info!(mirror = %status.name, "restored Paused state");
                             continue; // do not enqueue
                         }
@@ -597,48 +743,22 @@ impl Worker {
                         _ => {}
                     }
 
-                    // Compute next_run. When the mirror has a cron expression it
-                    // takes precedence over `last_update + interval`. Otherwise
-                    // next_run = last_update + interval — matching Go's
-                    // `stime := m.LastUpdate.Add(job.provider.Interval())`.
-                    // If last_update is zero (never synced) or next_run is in the
-                    // past the job fires immediately.
-                    //
-                    // We also compute the corresponding UTC DateTime (next_dt)
+                    // Compute the next intended UTC occurrence from the policy
                     // and write it to `mirror_statuses.scheduled` so the
                     // manager UI shows a real upcoming time instead of
                     // 0001-01-01T00:00:00Z until the first sync completes.
                     let job_cfg = self.cfg.mirrors.iter().find(|m| m.name == status.name);
 
-                    let now_instant = Instant::now();
                     let now_utc = Utc::now();
-                    let (next_run, next_dt) = if let Some(mc) = job_cfg {
-                        if !mc.cron.is_empty() {
-                            // Cron: ignore last_update and compute the next tick.
-                            let cached = self.crons_by_mirror.get(&mc.name);
-                            next_run_for(mc, &self.cfg.global, cached)
-                        } else {
-                            // Interval: last_update + interval, clamped to now.
-                            let interval = mc.effective_interval(&self.cfg.global);
-                            let interval_chrono = chrono::Duration::from_std(interval)
-                                .unwrap_or(chrono::Duration::seconds(3600));
-                            if tunasync_protocol::is_zero_time(&status.last_update) {
-                                // Never synced — fire immediately, "scheduled at" = now.
-                                (now_instant, now_utc)
-                            } else {
-                                let next_utc = status.last_update + interval_chrono;
-                                if next_utc <= now_utc {
-                                    (now_instant, next_utc)
-                                } else {
-                                    let delay =
-                                        (next_utc - now_utc).to_std().unwrap_or(Duration::ZERO);
-                                    (now_instant + delay, next_utc)
-                                }
-                            }
-                        }
-                    } else {
-                        (now_instant, now_utc)
-                    };
+                    let next_dt = job_cfg
+                        .and_then(|mc| self.scheduling_by_mirror.get(&mc.name))
+                        .and_then(|policy| {
+                            let last_completion =
+                                (!tunasync_protocol::is_zero_time(&status.last_update))
+                                    .then_some(status.last_update);
+                            policy.next_startup_after(now_utc, last_completion)
+                        })
+                        .unwrap_or(now_utc);
 
                     // Persist the scheduled time so it's visible on
                     // /workers/:id/jobs and propagates to manager.
@@ -648,30 +768,35 @@ impl Worker {
 
                     tracing::info!(
                         mirror = %status.name,
-                        next_run_secs = next_run.saturating_duration_since(Instant::now()).as_secs(),
+                        next_run_secs = (next_dt - now_utc).to_std().unwrap_or_default().as_secs(),
                         scheduled = %next_dt,
                         "scheduled (from last_update)"
                     );
-                    self.schedule.push(status.name.clone(), next_run);
+                    self.schedule.push(status.name.clone(), next_dt);
                 }
                 tracing::info!(mirrors = statuses.len(), "restored job states from manager");
             }
             Err(e) => {
-                warn!(error = %e, "failed to fetch job status from manager — all jobs start immediately");
+                warn!(error = %e, "failed to fetch job status from manager — applying new-mirror startup policy");
                 // Fall through: unseen still contains all job names, so they
                 // all get scheduled now below.
             }
         }
 
-        // Mirrors not found in manager (brand new, never registered) — schedule
-        // for immediate run, matching Go's `w.schedule.AddJob(time.Now(), job)`.
+        // New mirrors retain legacy immediate startup only for fixed-delay.
+        // Cron and fixed-rate always wait for the next strictly future slot.
         for name in &unseen {
-            tracing::info!(mirror = %name, "new mirror (not in manager) — scheduling immediately");
             let now = Utc::now();
+            let scheduled = self
+                .scheduling_by_mirror
+                .get(name)
+                .and_then(|policy| policy.next_startup_after(now, None))
+                .unwrap_or(now);
+            tracing::info!(mirror = %name, scheduled = %scheduled, "new mirror scheduled");
             if let Some(entry) = self.mirror_statuses.get_mut(name) {
-                entry.scheduled = now;
+                entry.scheduled = scheduled;
             }
-            self.schedule.push(name.clone(), Instant::now());
+            self.schedule.push(name.clone(), scheduled);
         }
     }
 
@@ -750,7 +875,8 @@ impl Worker {
         loop {
             // Fire any jobs that are due.
             while let Some(entry) = self.schedule.peek() {
-                if entry.next_run <= Instant::now() {
+                let now_utc = Utc::now();
+                if entry.scheduled_at <= now_utc {
                     let entry = self.schedule.pop().unwrap();
 
                     // Blackout check: if this mirror is inside a blackout window,
@@ -764,6 +890,7 @@ impl Worker {
                     // `GlobalConfig::timezone`, falling back to UTC). We
                     // convert `Utc::now()` to that timezone before passing
                     // it to `is_active_at`, which is itself generic over Tz.
+                    let policy = self.scheduling_by_mirror.get(&entry.name);
                     let in_blackout = self
                         .blackouts_by_mirror
                         .get(&entry.name)
@@ -773,18 +900,22 @@ impl Worker {
                                 .get(&entry.name)
                                 .copied()
                                 .unwrap_or(chrono_tz::UTC);
-                            let now_local = chrono::Utc::now().with_timezone(&tz);
-                            crate::blackout::is_in_blackout(windows, &now_local)
+                            let check_at = blackout_check_at(policy, entry.scheduled_at, now_utc);
+                            let local = check_at.with_timezone(&tz);
+                            crate::blackout::is_in_blackout(windows, &local)
                         })
                         .unwrap_or(false);
 
                     if in_blackout {
-                        let retry_at = Instant::now() + Duration::from_secs(300);
-                        tracing::info!(
-                            mirror = %entry.name,
-                            "in blackout window — deferring sync by 5 minutes"
-                        );
+                        let retry_at = policy
+                            .and_then(|policy| policy.next_after_blackout(now_utc))
+                            .unwrap_or(now_utc + chrono::Duration::minutes(5));
+                        tracing::info!(mirror = %entry.name, scheduled = %retry_at, "in blackout window — rescheduling");
+                        if let Some(status) = self.mirror_statuses.get_mut(&entry.name) {
+                            status.scheduled = retry_at;
+                        }
                         self.schedule.push(entry.name, retry_at);
+                        self.report_schedules(&worker_id).await;
                     } else if let Some(job) = self.jobs.get(&entry.name) {
                         if !job.try_send(CtrlAction::Start) {
                             // The ctrl channel is full (e.g. buffered Pings
@@ -797,8 +928,12 @@ impl Worker {
                                 mirror = %entry.name,
                                 "could not queue scheduled Start (ctrl channel                                  full or task dead) — retrying in 30s"
                             );
-                            self.schedule
-                                .push(entry.name, Instant::now() + Duration::from_secs(30));
+                            let retry_at = now_utc + chrono::Duration::seconds(30);
+                            if let Some(status) = self.mirror_statuses.get_mut(&entry.name) {
+                                status.scheduled = retry_at;
+                            }
+                            self.schedule.push(entry.name, retry_at);
+                            self.report_schedules(&worker_id).await;
                         }
                     }
                 } else {
@@ -810,8 +945,10 @@ impl Worker {
             let sleep_dur = self
                 .schedule
                 .peek()
-                .map(|e| e.next_run.saturating_duration_since(Instant::now()))
-                .unwrap_or(Duration::from_secs(60));
+                .map(|e| due_utc_to_instant(e.scheduled_at, Utc::now()))
+                .map(|due| due.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::from_secs(30))
+                .min(Duration::from_secs(30));
 
             tokio::select! {
                 // A job reported a status update.
@@ -821,7 +958,7 @@ impl Worker {
 
                 // Manager/CLI sent us a command via HTTP.
                 Some(cmd) = self.cmd_rx.recv() => {
-                    self.handle_worker_cmd(cmd).await;
+                    self.handle_worker_cmd(cmd, &worker_id).await;
                 }
 
                 // Time to check the schedule again.
@@ -831,8 +968,7 @@ impl Worker {
                 _ = &mut shutdown => {
                     info!("received shutdown signal — halting all jobs");
                     for job in self.jobs.values() {
-                        job.kill();
-                        job.try_send(CtrlAction::Halt);
+                        job.retire();
                     }
                     // Join all job tasks (instead of the old fixed 5s sleep)
                     // so in-flight publishes/post-exec hooks can complete and
@@ -875,6 +1011,15 @@ impl Worker {
 
     /// Process a status update from a job task.
     async fn handle_job_message(&mut self, msg: JobMessage, worker_id: &str) {
+        if !is_active_job_message(&self.job_generations, &msg) {
+            tracing::debug!(
+                mirror = %msg.name,
+                generation = msg.job_generation,
+                "discarding status from retired job generation"
+            );
+            return;
+        }
+
         let status_entry = self
             .mirror_statuses
             .entry(msg.name.clone())
@@ -943,10 +1088,10 @@ impl Worker {
         // The schedule flag is set by the job task only when state == Ready,
         // so Stop/Disable during sync correctly prevents re-scheduling.
         if msg.schedule {
-            if let Some(job_cfg) = self.cfg.mirrors.iter().find(|m| m.name == msg.name) {
-                let cached_cron = self.crons_by_mirror.get(&msg.name);
-                let (next_run, next_dt) = next_run_for(job_cfg, &self.cfg.global, cached_cron);
-                self.schedule.push(msg.name.clone(), next_run);
+            if let Some(policy) = self.scheduling_by_mirror.get(&msg.name) {
+                let now_utc = Utc::now();
+                let next_dt = policy.next_after(now_utc).unwrap_or(now_utc);
+                self.schedule.push(msg.name.clone(), next_dt);
 
                 // Update scheduled time.
                 if let Some(s) = self.mirror_statuses.get_mut(&msg.name) {
@@ -960,7 +1105,7 @@ impl Worker {
     }
 
     /// Dispatch an incoming `WorkerCmd` to the appropriate job.
-    async fn handle_worker_cmd(&mut self, cmd: WorkerCmd) {
+    async fn handle_worker_cmd(&mut self, cmd: WorkerCmd, worker_id: &str) {
         use CmdVerb::*;
         match cmd.cmd {
             Reload => {
@@ -977,6 +1122,18 @@ impl Worker {
                 // schedule should be flushed" — always remove from schedule.
                 if !cmd.mirror_id.is_empty() {
                     self.schedule.remove(&cmd.mirror_id);
+                    if matches!(cmd.cmd, Stop | Disable) {
+                        if let Some(status) = self.mirror_statuses.get_mut(&cmd.mirror_id) {
+                            status.scheduled = zero_time();
+                        }
+                    }
+                } else if matches!(cmd.cmd, Stop | Disable) {
+                    for name in self.jobs.keys() {
+                        self.schedule.remove(name);
+                        if let Some(status) = self.mirror_statuses.get_mut(name) {
+                            status.scheduled = zero_time();
+                        }
+                    }
                 }
 
                 if cmd.mirror_id.is_empty() {
@@ -1014,6 +1171,7 @@ impl Worker {
                             {
                                 match (self.build_one_provider)(job_cfg, &self.cfg) {
                                     Ok((mut provider, hooks)) => {
+                                        let priority = job_cfg.priority;
                                         provider.set_log_publisher(
                                             self.log_broadcaster.publisher_for(name),
                                         );
@@ -1021,21 +1179,21 @@ impl Worker {
                                             .and_then(|h| {
                                                 self.per_upstream_semaphores.get(&h).cloned()
                                             });
+                                        let job_generation = self.allocate_job_generation(name);
                                         let new_job = MirrorJob::spawn(
                                             provider,
                                             hooks,
                                             self.status_tx.clone(),
                                             Arc::clone(&self.semaphore),
                                             upstream_sem,
-                                            job_cfg.priority,
+                                            priority,
+                                            job_generation,
                                         );
                                         self.jobs.insert(name.clone(), new_job);
                                         // Fall through — send Start to the new job.
                                         if let Some(new_job) = self.jobs.get(name) {
                                             new_job.try_send(CtrlAction::Start);
                                         }
-                                        // Schedule immediately.
-                                        self.schedule.push(name.clone(), Instant::now());
                                         tracing::info!(
                                             mirror = %name,
                                             "re-enabled disabled job via Start/Restart"
@@ -1068,6 +1226,9 @@ impl Worker {
                     }
                 } else {
                     tracing::warn!(mirror = %cmd.mirror_id, "cmd for unknown mirror");
+                }
+                if matches!(cmd.cmd, Stop | Disable) {
+                    self.report_schedules(worker_id).await;
                 }
             }
         }
@@ -1150,6 +1311,11 @@ impl Worker {
                 ))
                 .ok();
 
+        let scheduling_globals_changed = self.cfg.global.interval_mode
+            != new_cfg.global.interval_mode
+            || self.cfg.global.fixed_rate_anchor != new_cfg.global.fixed_rate_anchor
+            || self.cfg.global.timezone != new_cfg.global.timezone;
+
         let mut diff = diff_mirror_config(&self.cfg.mirrors, &new_cfg.mirrors);
         if provider_globals_changed {
             let already_changed: HashSet<&str> = diff
@@ -1162,6 +1328,27 @@ impl Worker {
                 .filter(|mc| {
                     self.cfg.mirrors.iter().any(|old| old.name == mc.name)
                         && !already_changed.contains(mc.name.as_str())
+                })
+                .cloned()
+                .map(|config| MirrorCfgTrans {
+                    op: DiffOp::Modify,
+                    config,
+                })
+                .collect();
+            diff.extend(inherited_changes);
+        }
+        if scheduling_globals_changed {
+            let already_changed: HashSet<&str> = diff
+                .iter()
+                .map(|trans| trans.config.name.as_str())
+                .collect();
+            let inherited_changes: Vec<MirrorCfgTrans> = new_cfg
+                .mirrors
+                .iter()
+                .filter(|mc| {
+                    self.cfg.mirrors.iter().any(|old| old.name == mc.name)
+                        && !already_changed.contains(mc.name.as_str())
+                        && global_scheduling_change_affects(mc, &self.cfg.global, &new_cfg.global)
                 })
                 .cloned()
                 .map(|config| MirrorCfgTrans {
@@ -1254,13 +1441,8 @@ impl Worker {
             let name = &trans.config.name;
             match trans.op {
                 DiffOp::Delete => {
-                    if let Some(job) = self.jobs.get(name) {
-                        job.try_send(CtrlAction::Disable);
-                        job.kill();
-                    }
-                    self.jobs.remove(name);
+                    self.stop_and_join_job(name).await;
                     self.mirror_statuses.remove(name);
-                    self.schedule.remove(name);
                     // ALSO remove from cfg.mirrors. Without this, the next
                     // hot-reload's diff_mirror_config compares the new TOML
                     // against a stale list still containing the deleted
@@ -1286,14 +1468,9 @@ impl Worker {
                     // — upstream, is_master — are refreshed below.
                     let preserved = self.mirror_statuses.get(name).cloned();
 
-                    // Disable and remove the old job.
-                    if let Some(job) = self.jobs.get(name) {
-                        job.try_send(CtrlAction::Disable);
-                        job.kill();
-                    }
-                    self.jobs.remove(name);
+                    // Stop and join the old job before spawning its replacement.
+                    self.stop_and_join_job(name).await;
                     self.mirror_statuses.remove(name);
-                    self.schedule.remove(name);
 
                     // Update config.
                     if let Some(pos) = self.cfg.mirrors.iter().position(|m| &m.name == name) {
@@ -1306,14 +1483,13 @@ impl Worker {
                     let upstream = provider.upstream().to_owned();
                     let is_master = provider.is_master();
 
-                    // Merge preserved telemetry with the new provider-derived
-                    // fields and reset the visible schedule to the immediate
-                    // run enqueued below.
                     let now_utc = Utc::now();
+                    let next_schedule =
+                        next_reload_schedule(&trans.config, &new_cfg.global, now_utc);
                     let merged = if let Some(mut prev) = preserved {
                         prev.upstream = upstream;
                         prev.is_master = is_master;
-                        prev.scheduled = now_utc;
+                        prev.scheduled = next_schedule;
                         prev
                     } else {
                         MirrorStatus {
@@ -1321,7 +1497,7 @@ impl Worker {
                             worker: new_cfg.global.name.clone(),
                             is_master,
                             upstream,
-                            scheduled: now_utc,
+                            scheduled: next_schedule,
                             ..Default::default()
                         }
                     };
@@ -1329,6 +1505,7 @@ impl Worker {
 
                     let upstream_sem2 = upstream_host(provider.upstream())
                         .and_then(|h| self.per_upstream_semaphores.get(&h).cloned());
+                    let job_generation = self.allocate_job_generation(name);
                     let job = MirrorJob::spawn(
                         provider,
                         hooks,
@@ -1336,6 +1513,7 @@ impl Worker {
                         Arc::clone(&self.semaphore),
                         upstream_sem2,
                         trans.config.priority,
+                        job_generation,
                     );
                     self.jobs.insert(name.clone(), job);
 
@@ -1346,18 +1524,23 @@ impl Worker {
                             if let Some(job) = self.jobs.get(name) {
                                 job.try_send(CtrlAction::Stop);
                             }
+                            if let Some(status) = self.mirror_statuses.get_mut(name) {
+                                status.scheduled = zero_time();
+                            }
                             tracing::info!(mirror = %name, "hot-reload: modified job — kept Paused");
                         }
                         Some(JobState::Disabled) => {
                             if let Some(job) = self.jobs.get(name) {
                                 job.try_send(CtrlAction::Disable);
                             }
+                            if let Some(status) = self.mirror_statuses.get_mut(name) {
+                                status.scheduled = zero_time();
+                            }
                             tracing::info!(mirror = %name, "hot-reload: modified job — kept Disabled");
                         }
                         _ => {
-                            // Ready/None — schedule for immediate sync.
                             tracing::info!(mirror = %name, "hot-reload: modified job — scheduling");
-                            self.schedule.push(name.clone(), Instant::now());
+                            self.schedule.push(name.clone(), next_schedule);
                         }
                     }
                 }
@@ -1377,12 +1560,18 @@ impl Worker {
                             worker: new_cfg.global.name.clone(),
                             is_master,
                             upstream,
+                            scheduled: next_reload_schedule(
+                                &trans.config,
+                                &new_cfg.global,
+                                Utc::now(),
+                            ),
                             ..Default::default()
                         },
                     );
 
                     let upstream_sem3 = upstream_host(provider.upstream())
                         .and_then(|h| self.per_upstream_semaphores.get(&h).cloned());
+                    let job_generation = self.allocate_job_generation(name);
                     let job = MirrorJob::spawn(
                         provider,
                         hooks,
@@ -1390,11 +1579,14 @@ impl Worker {
                         Arc::clone(&self.semaphore),
                         upstream_sem3,
                         trans.config.priority,
+                        job_generation,
                     );
                     self.jobs.insert(name.clone(), job);
 
                     tracing::info!(mirror = %name, "hot-reload: new job");
-                    self.schedule.push(name.clone(), std::time::Instant::now());
+                    if let Some(status) = self.mirror_statuses.get(name) {
+                        self.schedule.push(name.clone(), status.scheduled);
+                    }
                 }
             }
         }
@@ -1516,6 +1708,14 @@ impl Worker {
         self.blackouts_by_mirror = build_blackout_cache(&self.cfg.mirrors);
         self.crons_by_mirror = build_cron_cache(&self.cfg.mirrors);
         self.timezones_by_mirror = build_timezone_cache(&self.cfg.mirrors, &self.cfg.global);
+        self.scheduling_by_mirror = build_scheduling_cache(
+            &self.cfg.mirrors,
+            &self.cfg.global,
+            &self.crons_by_mirror,
+            &self.timezones_by_mirror,
+        );
+        let worker_id = self.cfg.global.name.clone();
+        self.report_schedules(&worker_id).await;
     }
 }
 
@@ -1582,6 +1782,8 @@ mod cron_schedule_tests {
     use std::time::Duration;
 
     use crate::config::{GlobalConfig, MirrorConfig, ProviderKind};
+    use crate::job::JobMessage;
+    use tunasync_protocol::SyncStatus;
 
     fn mirror_with_cron(expr: &str) -> (MirrorConfig, GlobalConfig) {
         let global = GlobalConfig::default();
@@ -1608,6 +1810,55 @@ mod cron_schedule_tests {
             ..MirrorConfig::default()
         };
         (mc, global)
+    }
+
+    #[test]
+    fn retired_job_messages_are_rejected_by_generation() {
+        let mut generations = std::collections::HashMap::new();
+        generations.insert("debian".to_owned(), 2);
+        let stale = JobMessage {
+            job_generation: 1,
+            status: SyncStatus::None,
+            name: "debian".into(),
+            msg: String::new(),
+            schedule: true,
+            size: String::new(),
+            transferred_bytes: 0,
+            skip_sync: false,
+        };
+        let active = JobMessage {
+            job_generation: 2,
+            ..stale.clone()
+        };
+
+        assert!(!super::is_active_job_message(&generations, &stale));
+        assert!(super::is_active_job_message(&generations, &active));
+    }
+
+    #[test]
+    fn wall_clock_blackout_uses_intended_occurrence_time() {
+        let scheduled = chrono::DateTime::parse_from_rfc3339("2026-01-01T02:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let delayed_processing = chrono::DateTime::parse_from_rfc3339("2026-01-01T03:01:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let rate = crate::scheduling::SchedulingPolicy::fixed_rate(
+            60,
+            chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+            chrono_tz::UTC,
+        );
+        let delay =
+            crate::scheduling::SchedulingPolicy::fixed_delay(std::time::Duration::from_secs(3600));
+
+        assert_eq!(
+            super::blackout_check_at(Some(&rate), scheduled, delayed_processing),
+            scheduled
+        );
+        assert_eq!(
+            super::blackout_check_at(Some(&delay), scheduled, delayed_processing),
+            delayed_processing
+        );
     }
 
     /// A cron expression `0 3 * * *` (daily at 03:00, POSIX 5-field) must
@@ -1962,6 +2213,46 @@ mod cron_schedule_tests {
         assert_eq!(mc.effective_timezone(&global), "UTC");
     }
 
+    #[test]
+    fn global_scheduling_changes_only_affect_relevant_mirrors() {
+        use crate::config::IntervalMode;
+
+        let old = GlobalConfig {
+            interval: 60,
+            interval_mode: IntervalMode::FixedRate,
+            fixed_rate_anchor: "01:00".into(),
+            timezone: "UTC".into(),
+            ..Default::default()
+        };
+        let new = GlobalConfig {
+            fixed_rate_anchor: "02:00".into(),
+            timezone: "Asia/Shanghai".into(),
+            ..old.clone()
+        };
+
+        let inherited = MirrorConfig::default();
+        assert!(super::global_scheduling_change_affects(
+            &inherited, &old, &new
+        ));
+
+        let fixed_delay_override = MirrorConfig {
+            interval_mode: Some(IntervalMode::FixedDelay),
+            ..Default::default()
+        };
+        assert!(!super::global_scheduling_change_affects(
+            &fixed_delay_override,
+            &old,
+            &new
+        ));
+
+        let cron = MirrorConfig {
+            cron: "0 3 * * *".into(),
+            interval_mode: Some(IntervalMode::FixedDelay),
+            ..Default::default()
+        };
+        assert!(super::global_scheduling_change_affects(&cron, &old, &new));
+    }
+
     /// `cron = "0 3 * * *"` with `timezone = "Asia/Shanghai"` must fire at
     /// 03:00 in Shanghai, which is 19:00 UTC the previous day. With UTC
     /// it would fire at 03:00 UTC. The returned DateTime is in UTC; we
@@ -2076,8 +2367,7 @@ mod cron_schedule_tests {
         let new_upstream = "rsync://new-upstream/".to_string();
         let new_is_master = true;
 
-        // Apply the same merge logic the Modify branch uses (including
-        // the N3 scheduled-reset behaviour).
+        // Apply the same fixed-delay merge behavior the Modify branch uses.
         let now_utc = chrono::Utc::now();
         let mut merged = prev.clone();
         merged.upstream = new_upstream.clone();
@@ -2097,12 +2387,10 @@ mod cron_schedule_tests {
         assert_eq!(merged.last_update, prev.last_update);
         assert_eq!(merged.last_started, prev.last_started);
         assert_eq!(merged.last_ended, prev.last_ended);
-        // N3: scheduled MUST advance to "now" because the Modify branch
-        // re-enqueues with Instant::now(). The old scheduled would be
-        // misleading (could be hours past or future).
+        // Fixed-delay Modify may still run immediately, so scheduled advances.
         assert!(
             merged.scheduled > prev.scheduled,
-            "scheduled must move forward to now() since the job fires immediately after Modify"
+            "fixed-delay Modify should refresh the immediate schedule"
         );
     }
 
@@ -2140,7 +2428,7 @@ mod cron_schedule_tests {
         let mut old_cfg = MirrorConfig::default();
         old_cfg.name = "failing-mirror".into();
         old_cfg.upstream = "rsync://old/".into();
-        let cfg_mirrors = vec![old_cfg.clone()];
+        let cfg_mirrors = [old_cfg.clone()];
         let status = tunasync_protocol::MirrorStatus {
             name: old_cfg.name.clone(),
             status: tunasync_protocol::SyncStatus::Success,
