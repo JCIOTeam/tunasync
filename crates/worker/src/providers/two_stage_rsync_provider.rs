@@ -183,7 +183,7 @@ impl TwoStageRsyncProvider {
         // Stage2: base options + timeout + IPv4/6 + exclude-file + global/mirror rsync options.
         let stage2_options = append_common_for_stage2(base_opts_s2);
 
-        let mut rsync_env = HashMap::new();
+        let mut rsync_env = mc.env.clone();
         if !mc.username.is_empty() {
             rsync_env.insert("USER".into(), mc.username.clone());
         }
@@ -459,6 +459,7 @@ impl MirrorProvider for TwoStageRsyncProvider {
                 specs.push(super::rsync_provider::probe_plan_spec(
                     url,
                     &self.working_dir,
+                    &self.rsync_env,
                 ));
             }
         }
@@ -505,6 +506,7 @@ impl MirrorProvider for TwoStageRsyncProvider {
                         url,
                         self.broker_config.as_ref(),
                         &self.working_dir,
+                        &self.rsync_env,
                     ),
                 )
                 .await;
@@ -623,6 +625,53 @@ mod tests {
         mc.upstream_fallback = vec!["rsync://fallback.example.com/data/".into()];
         let p = super::TwoStageRsyncProvider::from_config(&mc, &global).expect("from_config");
         assert_eq!(p.upstream_fallback.len(), 1);
+    }
+
+    #[test]
+    fn launch_plans_include_mirror_env_with_credentials_taking_precedence() {
+        let global = base_global();
+        let mut mc = base_mirror();
+        mc.username = "configured-user".into();
+        mc.password = "configured-password".into();
+        mc.check_upstream = true;
+        mc.env.insert("LANG".into(), "C.UTF-8".into());
+        mc.env
+            .insert("RSYNC_PROXY".into(), "proxy.invalid:873".into());
+        mc.env.insert("USER".into(), "env-user".into());
+        mc.env
+            .insert("RSYNC_PASSWORD".into(), "env-password".into());
+
+        let provider = super::TwoStageRsyncProvider::from_config(&mc, &global).unwrap();
+        let plans = provider.launch_plan_specs();
+
+        for operation in ["stage1", "stage2"] {
+            let plan = plans
+                .iter()
+                .find(|plan| plan.operation == operation)
+                .unwrap();
+            assert_eq!(plan.env.get("LANG").map(String::as_str), Some("C.UTF-8"));
+            assert_eq!(
+                plan.env.get("RSYNC_PROXY").map(String::as_str),
+                Some("proxy.invalid:873")
+            );
+            assert_eq!(
+                plan.env.get("USER").map(String::as_str),
+                Some("configured-user")
+            );
+            assert_eq!(
+                plan.env.get("RSYNC_PASSWORD").map(String::as_str),
+                Some("configured-password")
+            );
+        }
+        let probe = plans
+            .iter()
+            .find(|plan| plan.operation.starts_with("probe-rsync-"))
+            .unwrap();
+        let stage1 = plans
+            .iter()
+            .find(|plan| plan.operation == "stage1")
+            .unwrap();
+        assert_eq!(probe.env, stage1.env);
     }
 
     #[test]

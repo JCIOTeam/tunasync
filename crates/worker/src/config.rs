@@ -1,7 +1,8 @@
 //! Worker configuration.
 //!
-//! Wire-compatible with Go tunasync's `worker/config.go`. TOML field names
-//! are preserved exactly so existing `worker.conf` files work without change.
+//! Closely follows Go tunasync's `worker/config.go`. Common TOML field names
+//! and inheritance rules are preserved, with migration diagnostics for known
+//! legacy fields.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -60,12 +61,20 @@ impl FromStr for ProviderKind {
 // Memory bytes — matches Go's units.RAMInBytes semantics
 // ---------------------------------------------------------------------------
 
-/// A memory limit expressed as bytes, parseable from human strings like `"512M"`.
+/// A memory limit expressed as bytes, parseable from human strings like
+/// `"512M"` or `"256MiB"`.
 ///
 /// Matches Go's `MemBytes` type (backed by `docker/go-units`).
-/// We support the same suffixes: `K`, `M`, `G`, `T`, `P` (base-1024).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+/// Supported suffixes are `K`/`KB`/`KiB` through `P`/`PB`/`PiB`, using
+/// base-1024 multipliers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MemBytes(pub i64);
+
+impl Serialize for MemBytes {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
 
 impl<'de> Deserialize<'de> for MemBytes {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -77,27 +86,205 @@ impl<'de> Deserialize<'de> for MemBytes {
 }
 
 fn parse_mem_bytes(s: &str) -> Result<MemBytes, String> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Ok(MemBytes(0));
-    }
-    let (num_part, suffix) = s
-        .find(|c: char| c.is_ascii_alphabetic())
-        .map(|i| s.split_at(i))
-        .unwrap_or((s, ""));
-    let base: f64 = num_part
-        .parse()
-        .map_err(|_| format!("invalid number in memory limit: {s:?}"))?;
-    let mult = match suffix.to_uppercase().as_str() {
-        "" | "B" => 1,
-        "K" | "KB" => 1_024,
-        "M" | "MB" => 1_024 * 1_024,
-        "G" | "GB" => 1_024 * 1_024 * 1_024,
-        "T" | "TB" => 1_024_i64.pow(4),
-        "P" | "PB" => 1_024_i64.pow(5),
+    let separator = s
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_ascii_digit() || matches!(character, '.' | ' '))
+        .map(|(index, _)| index)
+        .ok_or_else(|| format!("invalid memory limit: {s:?}"))?;
+    let (num_part, suffix) = if s.as_bytes()[separator] == b' ' {
+        (&s[..separator], &s[separator + 1..])
+    } else {
+        (&s[..=separator], &s[separator + 1..])
+    };
+    let suffix = suffix.to_ascii_lowercase();
+    let mult: u128 = match suffix.as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1_024,
+        "m" | "mb" | "mib" => 1_024_u128.pow(2),
+        "g" | "gb" | "gib" => 1_024_u128.pow(3),
+        "t" | "tb" | "tib" => 1_024_u128.pow(4),
+        "p" | "pb" | "pib" => 1_024_u128.pow(5),
         other => return Err(format!("unknown memory suffix: {other:?}")),
     };
-    Ok(MemBytes((base * mult as f64) as i64))
+
+    let size = parse_go_float(num_part, s)?;
+    if size < 0.0 {
+        return Err(format!("invalid negative memory limit: {s:?}"));
+    }
+    if size == 0.0 && numeric_mantissa_is_nonzero(num_part) {
+        return Err(format!("memory limit is too small to represent: {s:?}"));
+    }
+    let bytes = size * mult as f64;
+    if !bytes.is_finite() || bytes >= 9_223_372_036_854_775_808.0 {
+        return Err(format!("memory limit is too large: {s:?}"));
+    }
+    Ok(MemBytes(bytes as i64))
+}
+
+fn numeric_mantissa_is_nonzero(num: &str) -> bool {
+    let unsigned = num.strip_prefix(['+', '-']).unwrap_or(num);
+    if let Some(hex) = unsigned
+        .strip_prefix("0x")
+        .or_else(|| unsigned.strip_prefix("0X"))
+    {
+        hex.split(['p', 'P']).next().is_some_and(|mantissa| {
+            mantissa
+                .bytes()
+                .any(|byte| byte.is_ascii_hexdigit() && !matches!(byte, b'0' | b'_'))
+        })
+    } else {
+        unsigned
+            .split(['e', 'E'])
+            .next()
+            .is_some_and(|mantissa| mantissa.bytes().any(|byte| matches!(byte, b'1'..=b'9')))
+    }
+}
+
+fn parse_go_float(num: &str, original: &str) -> Result<f64, String> {
+    let unsigned = num.strip_prefix(['+', '-']).unwrap_or(num);
+    if unsigned.starts_with("0x") || unsigned.starts_with("0X") {
+        return parse_go_hex_float(num, original);
+    }
+
+    for (index, _byte) in num.bytes().enumerate().filter(|(_, byte)| *byte == b'_') {
+        if index == 0
+            || index + 1 == num.len()
+            || !num.as_bytes()[index - 1].is_ascii_digit()
+            || !num.as_bytes()[index + 1].is_ascii_digit()
+        {
+            return Err(format!("invalid number in memory limit: {original:?}"));
+        }
+    }
+    let normalized = num.replace('_', "");
+    normalized
+        .parse::<f64>()
+        .map_err(|_| format!("invalid number in memory limit: {original:?}"))
+}
+
+fn parse_go_hex_float(num: &str, original: &str) -> Result<f64, String> {
+    let sign_len = usize::from(num.starts_with(['+', '-']));
+    let prefix_end = sign_len + 2;
+    let bytes = num.as_bytes();
+    let exponent_index = bytes[prefix_end..]
+        .iter()
+        .position(|byte| matches!(byte, b'p' | b'P'))
+        .map(|index| prefix_end + index)
+        .ok_or_else(|| format!("invalid number in memory limit: {original:?}"))?;
+    for (index, _) in bytes.iter().enumerate().filter(|(_, byte)| **byte == b'_') {
+        let after_prefix = index == prefix_end;
+        let in_exponent = index > exponent_index;
+        let after_digit = index > prefix_end
+            && if in_exponent {
+                bytes[index - 1].is_ascii_digit()
+            } else {
+                bytes[index - 1].is_ascii_hexdigit()
+            };
+        let before_digit = bytes.get(index + 1).is_some_and(|next| {
+            if in_exponent {
+                next.is_ascii_digit()
+            } else {
+                next.is_ascii_hexdigit()
+            }
+        });
+        if !before_digit || (!after_prefix && !after_digit) {
+            return Err(format!("invalid number in memory limit: {original:?}"));
+        }
+    }
+
+    let normalized = num.replace('_', "");
+    let unsigned = &normalized[sign_len + 2..];
+    let (mantissa, exponent) = unsigned
+        .split_once(['p', 'P'])
+        .ok_or_else(|| format!("invalid number in memory limit: {original:?}"))?;
+    if exponent.contains(['p', 'P']) {
+        return Err(format!("invalid number in memory limit: {original:?}"));
+    }
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if mantissa.matches('.').count() > 1
+        || (integer.is_empty() && fraction.is_empty())
+        || !integer.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(format!("invalid number in memory limit: {original:?}"));
+    }
+    let exponent_digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+    if exponent_digits.is_empty() || !exponent_digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("invalid number in memory limit: {original:?}"));
+    }
+
+    let c_number = std::ffi::CString::new(normalized)
+        .map_err(|_| format!("invalid number in memory limit: {original:?}"))?;
+    let locale = NumericLocale::new()
+        .ok_or_else(|| "failed to create C numeric locale for memory limit parsing".to_string())?;
+    let rounding = NearestRounding::new()
+        .ok_or_else(|| "failed to set nearest rounding for memory limit parsing".to_string())?;
+    let mut end = std::ptr::null_mut();
+    // SAFETY: `c_number` is a live NUL-terminated allocation; `end` is a valid
+    // out-pointer; `locale` owns a live C locale; and strtod_l returns either a
+    // pointer into this input allocation or its one-past terminator.
+    let value = unsafe { strtod_l(c_number.as_ptr(), &mut end, locale.0) };
+    // SAFETY: `end` is returned by strtod_l for `c_number`, so both pointers
+    // refer to the same allocation as required by `offset_from`.
+    let consumed = unsafe { end.offset_from(c_number.as_ptr()) };
+    drop(rounding);
+    if consumed < 0 || consumed as usize != c_number.as_bytes().len() {
+        return Err(format!("invalid number in memory limit: {original:?}"));
+    }
+    Ok(value)
+}
+
+struct NumericLocale(libc::locale_t);
+
+impl NumericLocale {
+    fn new() -> Option<Self> {
+        // SAFETY: the locale name is a static NUL-terminated C string and the
+        // null base requests a new independent locale object.
+        let locale =
+            unsafe { libc::newlocale(libc::LC_NUMERIC_MASK, c"C".as_ptr(), std::ptr::null_mut()) };
+        (!locale.is_null()).then_some(Self(locale))
+    }
+}
+
+impl Drop for NumericLocale {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` was returned by newlocale and is freed exactly once.
+        unsafe { libc::freelocale(self.0) };
+    }
+}
+
+struct NearestRounding(libc::c_int);
+
+impl NearestRounding {
+    fn new() -> Option<Self> {
+        // SAFETY: these C fenv functions operate on thread-local floating-point
+        // state and require no pointer arguments.
+        let previous = unsafe { fegetround() };
+        if previous < 0 || unsafe { fesetround(FE_TONEAREST) } != 0 {
+            None
+        } else {
+            Some(Self(previous))
+        }
+    }
+}
+
+impl Drop for NearestRounding {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is a rounding mode returned by fegetround.
+        let _ = unsafe { fesetround(self.0) };
+    }
+}
+
+const FE_TONEAREST: libc::c_int = 0;
+
+unsafe extern "C" {
+    fn strtod_l(
+        input: *const libc::c_char,
+        end: *mut *mut libc::c_char,
+        locale: libc::locale_t,
+    ) -> libc::c_double;
+    fn fegetround() -> libc::c_int;
+    fn fesetround(round: libc::c_int) -> libc::c_int;
 }
 
 // ---------------------------------------------------------------------------
@@ -197,7 +384,8 @@ pub struct GlobalConfig {
     #[serde(default)]
     pub mirror_dir: String,
 
-    /// Max concurrent syncing jobs. 0 = unlimited.
+    /// Max concurrent syncing jobs. Use a positive value when mirrors exist;
+    /// migration check rejects zero because Go blocks all jobs at zero.
     #[serde(default)]
     pub concurrent: usize,
 
@@ -353,7 +541,7 @@ impl GlobalConfig {
 // ---------------------------------------------------------------------------
 
 /// How the worker reaches the manager.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct ManagerApiConfig {
     /// Single manager API base URL.
     #[serde(default)]
@@ -375,6 +563,49 @@ pub struct ManagerApiConfig {
     /// Set the SAME value in the manager's `[server] api_token`.
     #[serde(default)]
     pub api_token: String,
+
+    /// Set when the legacy `[manager].token` key supplied the effective token.
+    #[serde(skip)]
+    pub(crate) legacy_token_configured: bool,
+
+    /// Set when no canonical `api_token` was present and `token` was used.
+    #[serde(skip)]
+    pub(crate) legacy_token_used: bool,
+}
+
+impl<'de> Deserialize<'de> for ManagerApiConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        struct RawManagerApiConfig {
+            #[serde(default)]
+            api_base: String,
+            #[serde(default)]
+            api_base_list: Vec<String>,
+            #[serde(default)]
+            ca_cert: String,
+            #[serde(default)]
+            api_token: String,
+            #[serde(default)]
+            token: String,
+        }
+
+        let raw = RawManagerApiConfig::deserialize(deserializer)?;
+        let legacy_token_configured = !raw.token.is_empty();
+        let legacy_token_used = raw.api_token.is_empty() && legacy_token_configured;
+        let api_token = if raw.api_token.is_empty() {
+            raw.token
+        } else {
+            raw.api_token
+        };
+        Ok(Self {
+            api_base: raw.api_base,
+            api_base_list: raw.api_base_list,
+            ca_cert: raw.ca_cert,
+            api_token,
+            legacy_token_configured,
+            legacy_token_used,
+        })
+    }
 }
 
 impl ManagerApiConfig {
@@ -803,6 +1034,8 @@ fn recurse_flatten(
 /// Merge child into parent: for each field, child's non-default value
 /// overrides parent's value. Matches Go's `mergo.Merge` with override.
 fn merge_mirror(parent: MirrorConfig, child: MirrorConfig) -> MirrorConfig {
+    let mut env = parent.env.clone();
+    env.extend(child.env.clone());
     MirrorConfig {
         name: if child.name.is_empty() {
             parent.name
@@ -857,11 +1090,7 @@ fn merge_mirror(parent: MirrorConfig, child: MirrorConfig) -> MirrorConfig {
         } else {
             child.log_dir
         },
-        env: if child.env.is_empty() {
-            parent.env
-        } else {
-            child.env
-        },
+        env,
         network_namespace: if child.network_namespace.is_empty() {
             parent.network_namespace
         } else {
@@ -972,11 +1201,10 @@ fn merge_mirror(parent: MirrorConfig, child: MirrorConfig) -> MirrorConfig {
         } else {
             child.stage1_profile
         },
-        memory_limit: if child.memory_limit.is_none() {
-            parent.memory_limit
-        } else {
-            child.memory_limit
-        },
+        memory_limit: child
+            .memory_limit
+            .filter(|limit| limit.0 != 0)
+            .or(parent.memory_limit),
         docker_image: if child.docker_image.is_empty() {
             parent.docker_image
         } else {
@@ -1233,7 +1461,96 @@ interval_mode = "fixed-delay"
         assert_eq!(parse_mem_bytes("512M").unwrap().0, 512 * 1024 * 1024);
         assert_eq!(parse_mem_bytes("2G").unwrap().0, 2 * 1024 * 1024 * 1024);
         assert_eq!(parse_mem_bytes("1K").unwrap().0, 1024);
+        assert_eq!(parse_mem_bytes("1KiB").unwrap().0, 1024);
+        assert_eq!(parse_mem_bytes("1.5MiB").unwrap().0, 1_572_864);
+        assert_eq!(parse_mem_bytes("1.25 GiB").unwrap().0, 1_342_177_280);
+        assert_eq!(parse_mem_bytes("2GiB").unwrap().0, 2_147_483_648);
+        assert_eq!(parse_mem_bytes("+1M").unwrap().0, 1024 * 1024);
+        assert_eq!(parse_mem_bytes("1e3M").unwrap().0, 1000 * 1024 * 1024);
+        assert_eq!(parse_mem_bytes("1_024K").unwrap().0, 1024 * 1024);
+        assert_eq!(parse_mem_bytes("0x1p+10M").unwrap().0, 1024 * 1024 * 1024);
+        assert_eq!(parse_mem_bytes("0x1.8p+10K").unwrap().0, 1_572_864);
+        assert_eq!(parse_mem_bytes("0x1.00000000000001p0").unwrap().0, 1);
+        assert_eq!(parse_mem_bytes("0x_1p0K").unwrap().0, 1024);
+        assert!(parse_mem_bytes("0x1__0p0").is_err());
+        assert!(parse_mem_bytes("1e-1000MiB").is_err());
+        assert!(parse_mem_bytes("0x1p-1075MiB").is_err());
+        assert_eq!(parse_mem_bytes(".3MB").unwrap().0, 314_572);
+        assert_eq!(parse_mem_bytes("0.99999999999999999K").unwrap().0, 1024);
+        assert_eq!(parse_mem_bytes("1.9999999999999999K").unwrap().0, 2048);
+        assert_eq!(
+            parse_mem_bytes("9007199254740993").unwrap().0,
+            9_007_199_254_740_992
+        );
+        assert_eq!(parse_mem_bytes("0 ").unwrap().0, 0);
+        assert_eq!(parse_mem_bytes("-0").unwrap().0, 0);
         assert_eq!(parse_mem_bytes("0").unwrap().0, 0);
+        assert!(parse_mem_bytes("-1M").is_err());
+        assert!(parse_mem_bytes("").is_err());
+        assert!(parse_mem_bytes(" 1M").is_err());
+        assert!(parse_mem_bytes("1M ").is_err());
+        assert!(parse_mem_bytes("1KiiB").is_err());
+        assert!(parse_mem_bytes("1e100P").is_err());
+        assert_eq!(
+            parse_mem_bytes("9223372036854774784").unwrap().0,
+            9_223_372_036_854_774_784
+        );
+        assert!(parse_mem_bytes(&i64::MAX.to_string()).is_err());
+        assert!(parse_mem_bytes("8192P").is_err());
+    }
+
+    #[test]
+    fn hex_memory_parser_restores_thread_rounding_mode() {
+        const FE_DOWNWARD: libc::c_int = 0x400;
+
+        // SAFETY: fenv operations affect only this test thread and use a
+        // platform-defined rounding constant for supported Linux targets.
+        let previous = unsafe { super::fegetround() };
+        assert!(previous >= 0);
+        assert_eq!(unsafe { super::fesetround(FE_DOWNWARD) }, 0);
+        assert_eq!(parse_mem_bytes("0x1.8p+10K").unwrap().0, 1_572_864);
+        assert_eq!(unsafe { super::fegetround() }, FE_DOWNWARD);
+        assert_eq!(unsafe { super::fesetround(previous) }, 0);
+    }
+
+    #[test]
+    fn mem_bytes_toml_and_json_round_trip() {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Limit {
+            memory_limit: MemBytes,
+        }
+
+        let value = Limit {
+            memory_limit: MemBytes(256 * 1024 * 1024),
+        };
+        let toml = toml::to_string(&value).unwrap();
+        assert!(toml.contains("\"268435456\""));
+        assert_eq!(toml::from_str::<Limit>(&toml).unwrap(), value);
+
+        let json = serde_json::to_string(&value).unwrap();
+        assert_eq!(serde_json::from_str::<Limit>(&json).unwrap(), value);
+    }
+
+    #[test]
+    fn legacy_manager_token_maps_to_api_token_without_overriding_canonical_key() {
+        let legacy: WorkerConfig = tunasync_common::config::parse_toml(
+            r#"
+[manager]
+token = "legacy-token"
+"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.manager.api_token, "legacy-token");
+
+        let both: WorkerConfig = tunasync_common::config::parse_toml(
+            r#"
+[manager]
+token = "legacy-token"
+api_token = "canonical-token"
+"#,
+        )
+        .unwrap();
+        assert_eq!(both.manager.api_token, "canonical-token");
     }
 
     #[test]
@@ -1364,6 +1681,73 @@ interval = 120
         assert_eq!(flat[0].provider, ProviderKind::TwoStageRsync);
         assert_eq!(flat[0].interval, 120);
         assert_eq!(flat[0].upstream, "rsync://mirror.centos.org/centos-stream/");
+    }
+
+    #[test]
+    fn flatten_nested_mirrors_merges_env_with_child_precedence() {
+        let cfg: WorkerConfig = tunasync_common::config::parse_toml(
+            r#"
+[[mirrors]]
+name = "parent"
+
+[mirrors.env]
+INHERITED = "parent-only"
+OVERRIDDEN = "parent-value"
+
+[[mirrors.mirrors]]
+name = "child"
+upstream = "rsync://example.invalid/module/"
+
+[mirrors.mirrors.env]
+OVERRIDDEN = "child-value"
+CHILD_ONLY = "child-only"
+"#,
+        )
+        .unwrap();
+
+        let flat = flatten_mirrors(&cfg.mirrors_conf);
+        let env = &flat[0].env;
+        assert_eq!(
+            env.get("INHERITED").map(String::as_str),
+            Some("parent-only")
+        );
+        assert_eq!(
+            env.get("OVERRIDDEN").map(String::as_str),
+            Some("child-value")
+        );
+        assert_eq!(
+            env.get("CHILD_ONLY").map(String::as_str),
+            Some("child-only")
+        );
+        assert_eq!(env.len(), 3);
+    }
+
+    #[test]
+    fn nested_zero_memory_limit_inherits_parent_like_go_zero_value() {
+        let cfg: WorkerConfig = tunasync_common::config::parse_toml(
+            r#"
+[[mirrors]]
+name = "parent"
+memory_limit = "256MiB"
+
+[[mirrors.mirrors]]
+name = "inherit-zero"
+upstream = "rsync://example.invalid/zero/"
+memory_limit = "0"
+
+[[mirrors.mirrors]]
+name = "override"
+upstream = "rsync://example.invalid/override/"
+memory_limit = "128MiB"
+"#,
+        )
+        .unwrap();
+
+        let flat = flatten_mirrors(&cfg.mirrors_conf);
+        let inherited = flat.iter().find(|m| m.name == "inherit-zero").unwrap();
+        assert_eq!(inherited.memory_limit, Some(MemBytes(256 * 1024 * 1024)));
+        let overridden = flat.iter().find(|m| m.name == "override").unwrap();
+        assert_eq!(overridden.memory_limit, Some(MemBytes(128 * 1024 * 1024)));
     }
 
     /// Verify that `provider = "rsync"` in a child (== default) does NOT

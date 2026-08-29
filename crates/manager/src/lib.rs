@@ -17,6 +17,51 @@ use crate::config::ManagerConfig;
 use crate::db::open as open_db;
 use crate::server::{build_router, AppState};
 
+pub struct ConfigCheckReport {
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+pub fn check_config(cfg: &ManagerConfig) -> ConfigCheckReport {
+    let mut errors = Vec::new();
+    let warnings = Vec::new();
+
+    if !cfg.files.db_type_explicitly_configured {
+        errors.push(
+            "manager files.db_type must be set explicitly before migration: the Go manager defaults to bolt while tunasync-rs defaults to redb; migrate existing data, then select redb, sqlite, or redis"
+                .into(),
+        );
+    }
+
+    if let Err(error) = cfg.server.validate_tls() {
+        errors.push(error);
+    }
+    if let Err(error) = cfg.server.bind_addr() {
+        errors.push(error);
+    }
+    match cfg.files.db_type.as_str() {
+        "redb" | "sqlite" | "redis" => {}
+        "bolt" | "badger" | "leveldb" => errors.push(format!(
+            "manager files.db_type {:?} is supported by the Go manager but not tunasync-rs; migrate the data and use redb, sqlite, or redis",
+            cfg.files.db_type
+        )),
+        other => errors.push(format!(
+            "unsupported manager files.db_type {other:?}; valid values are redb, sqlite, or redis"
+        )),
+    }
+    if cfg.files.db_type == "redis" {
+        match cfg.files.db_file.to_str() {
+            Some(url) if url.starts_with("redis://") || url.starts_with("rediss://") => {}
+            _ => errors.push(
+                "manager files.db_file must be a redis:// or rediss:// URL when files.db_type is redis"
+                    .into(),
+            ),
+        }
+    }
+
+    ConfigCheckReport { errors, warnings }
+}
+
 /// Start the manager from a config file path, blocking until the server exits.
 ///
 /// Only falls back to defaults when the file does not exist. Parse errors,
@@ -42,23 +87,22 @@ pub async fn run(config_path: std::path::PathBuf) -> Result<()> {
 /// file, matching Go's `LoadConfig` which accepts a `*cli.Context` and
 /// patches the struct fields with CLI flag values.
 pub async fn run_with_config(cfg: ManagerConfig) -> Result<()> {
-    cfg.server.validate_tls().map_err(anyhow::Error::msg)?;
+    let report = check_config(&cfg);
+    if !report.errors.is_empty() {
+        anyhow::bail!("{}", report.errors.join("; "));
+    }
+    let db_target = db_target_for_diagnostic(&cfg);
     tracing::info!(
         addr = %cfg.server.addr,
         port = cfg.server.port,
         db_type = %cfg.files.db_type,
-        db_file = %cfg.files.db_file.display(),
+        db_file = %db_target,
         "starting tunasync manager"
     );
 
     // Open DB adapter.
-    let db = open_db(&cfg.files.db_type, &cfg.files.db_file).with_context(|| {
-        format!(
-            "open {} DB at {}",
-            cfg.files.db_type,
-            cfg.files.db_file.display()
-        )
-    })?;
+    let db = open_db(&cfg.files.db_type, &cfg.files.db_file)
+        .with_context(|| format!("open {} DB at {db_target}", cfg.files.db_type))?;
 
     // Build HTTP client (used by manager to forward commands to workers).
     let http_client = if cfg.files.ca_cert.is_empty() {
@@ -163,6 +207,22 @@ pub async fn run_with_config(cfg: ManagerConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn db_target_for_diagnostic(cfg: &ManagerConfig) -> String {
+    if cfg.files.db_type != "redis" {
+        return cfg.files.db_file.display().to_string();
+    }
+
+    let raw = cfg.files.db_file.to_string_lossy();
+    let Ok(mut url) = url::Url::parse(&raw) else {
+        return "<invalid Redis URL>".into();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
 }
 
 async fn shutdown_signal() {
@@ -410,5 +470,76 @@ async fn stale_detector(state: std::sync::Arc<AppState>, stale_secs: u64) {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod config_check_tests {
+    use super::{check_config, db_target_for_diagnostic};
+    use crate::config::ManagerConfig;
+
+    #[test]
+    fn rejects_go_only_database_backends_with_migration_guidance() {
+        for backend in ["bolt", "badger", "leveldb"] {
+            let mut cfg = ManagerConfig::default();
+            cfg.files.db_type = backend.into();
+            cfg.files.db_type_explicitly_configured = true;
+            let errors = check_config(&cfg).errors.join(" ");
+            assert!(errors.contains(backend));
+            assert!(errors.contains("migrate"));
+            assert!(errors.contains("sqlite"));
+        }
+    }
+
+    #[test]
+    fn accepts_supported_backends_and_validates_redis_url() {
+        for backend in ["redb", "sqlite"] {
+            let mut cfg = ManagerConfig::default();
+            cfg.files.db_type = backend.into();
+            cfg.files.db_type_explicitly_configured = true;
+            assert!(check_config(&cfg).errors.is_empty());
+        }
+
+        let mut redis = ManagerConfig::default();
+        redis.files.db_type = "redis".into();
+        redis.files.db_type_explicitly_configured = true;
+        redis.files.db_file = "redis://127.0.0.1:6379/0".into();
+        assert!(check_config(&redis).errors.is_empty());
+        redis.files.db_file = "/var/lib/tunasync/redis".into();
+        assert!(check_config(&redis)
+            .errors
+            .iter()
+            .any(|error| error.contains("redis://")));
+    }
+
+    #[test]
+    fn rejects_omitted_database_type_before_migration() {
+        let cfg: ManagerConfig = tunasync_common::config::parse_toml(
+            r#"
+[files]
+db_file = "/var/lib/tunasync/tunasync.db"
+"#,
+        )
+        .unwrap();
+
+        let errors = check_config(&cfg).errors.join(" ");
+        assert!(errors.contains("must be set explicitly"));
+        assert!(errors.contains("Go manager defaults to bolt"));
+    }
+
+    #[test]
+    fn redis_diagnostic_target_redacts_credentials_and_tokens() {
+        let mut cfg = ManagerConfig::default();
+        cfg.files.db_type = "redis".into();
+        cfg.files.db_file =
+            "rediss://user:manager-secret@redis.example.invalid:6380/0?token=query-secret#fragment"
+                .into();
+
+        let target = db_target_for_diagnostic(&cfg);
+        assert!(target.contains("redis.example.invalid:6380/0"));
+        assert!(!target.contains("user"));
+        assert!(!target.contains("manager-secret"));
+        assert!(!target.contains("query-secret"));
+        assert!(!target.contains("fragment"));
     }
 }

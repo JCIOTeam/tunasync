@@ -2493,6 +2493,7 @@ dependencies = [
  "anyhow",
  "clap",
  "rustls",
+ "tempfile",
  "tokio",
  "tracing",
  "tunasync-common",
@@ -2538,6 +2539,7 @@ dependencies = [
  "tracing",
  "tunasync-common",
  "tunasync-protocol",
+ "url",
 ]
 
 [[package]]
@@ -2624,6 +2626,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "toml",
  "tracing",
  "tunasync-common",
  "tunasync-netns",

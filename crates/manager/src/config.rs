@@ -1,7 +1,7 @@
 //! Manager configuration.
 //!
-//! Wire-compatible with Go tunasync's `manager/config.go`. TOML field names
-//! are preserved exactly so existing `manager.conf` files work without change.
+//! Closely follows Go tunasync's `manager/config.go`. Common TOML field names
+//! are preserved, while database backend differences require migration.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -110,7 +110,7 @@ impl Default for ServerConfig {
 }
 
 /// Filesystem paths owned by the manager.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FilesConfig {
     /// Path to the JSON status file written by the manager every 30 seconds.
     ///
@@ -132,8 +132,35 @@ pub struct FilesConfig {
     ///   redis://:password@redis.example.com:6379/1
     #[serde(default = "FilesConfig::default_db_type")]
     pub db_type: String,
+    #[serde(skip)]
+    pub db_type_explicitly_configured: bool,
     #[serde(default)]
     pub ca_cert: String,
+}
+
+impl<'de> Deserialize<'de> for FilesConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct RawFilesConfig {
+            #[serde(default = "FilesConfig::default_status_file")]
+            status_file: PathBuf,
+            #[serde(default = "FilesConfig::default_db_file")]
+            db_file: PathBuf,
+            #[serde(default)]
+            db_type: Option<String>,
+            #[serde(default)]
+            ca_cert: String,
+        }
+
+        let raw = RawFilesConfig::deserialize(deserializer)?;
+        Ok(Self {
+            status_file: raw.status_file,
+            db_file: raw.db_file,
+            db_type_explicitly_configured: raw.db_type.is_some(),
+            db_type: raw.db_type.unwrap_or_else(Self::default_db_type),
+            ca_cert: raw.ca_cert,
+        })
+    }
 }
 
 impl FilesConfig {
@@ -154,6 +181,7 @@ impl Default for FilesConfig {
             status_file: Self::default_status_file(),
             db_file: Self::default_db_file(),
             db_type: Self::default_db_type(),
+            db_type_explicitly_configured: false,
             ca_cert: String::new(),
         }
     }

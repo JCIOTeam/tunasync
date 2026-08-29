@@ -145,7 +145,7 @@ impl RsyncProvider {
         }
 
         // Environment.
-        let mut rsync_env = HashMap::new();
+        let mut rsync_env = mc.env.clone();
         if !mc.username.is_empty() {
             rsync_env.insert("USER".into(), mc.username.clone());
         }
@@ -467,7 +467,12 @@ impl MirrorProvider for RsyncProvider {
             .map(|&url| async move {
                 let res = tokio::time::timeout(
                     std::time::Duration::from_secs(15),
-                    probe_configured_url(url, self.broker_config.as_ref(), &self.working_dir),
+                    probe_configured_url(
+                        url,
+                        self.broker_config.as_ref(),
+                        &self.working_dir,
+                        &self.rsync_env,
+                    ),
                 )
                 .await;
                 (url, res)
@@ -540,7 +545,7 @@ impl MirrorProvider for RsyncProvider {
         }];
         if self.check_upstream {
             for url in std::iter::once(&self.upstream).chain(&self.upstream_fallback) {
-                specs.push(probe_plan_spec(url, &self.working_dir));
+                specs.push(probe_plan_spec(url, &self.working_dir, &self.rsync_env));
             }
         }
         specs
@@ -800,23 +805,17 @@ pub(crate) async fn probe_rsync_url(
     url: &str,
     broker: Option<&crate::runner::BrokerConfig>,
     working_dir: &std::path::Path,
+    env: &HashMap<String, String>,
 ) -> anyhow::Result<()> {
-    let mut spec = rsync_probe_spec(url, working_dir);
+    let mut spec = rsync_probe_spec(url, working_dir, env);
     if broker.is_none() {
         spec.argv[0] = "rsync".into();
     }
     let placement = broker
         .map(|broker| broker.placement(spec.operation.clone()))
         .unwrap_or_default();
-    let proc = runner::spawn_placed(
-        &spec.argv,
-        working_dir,
-        &HashMap::new(),
-        None,
-        None,
-        &placement,
-    )
-    .await?;
+    let proc =
+        runner::spawn_placed(&spec.argv, working_dir, &spec.env, None, None, &placement).await?;
     proc.wait(&[]).await
 }
 
@@ -824,9 +823,10 @@ pub(crate) async fn probe_configured_url(
     url: &str,
     broker: Option<&crate::runner::BrokerConfig>,
     working_dir: &std::path::Path,
+    rsync_env: &HashMap<String, String>,
 ) -> anyhow::Result<()> {
     if url.starts_with("rsync://") {
-        return probe_rsync_url(url, broker, working_dir).await;
+        return probe_rsync_url(url, broker, working_dir, rsync_env).await;
     }
     if url.starts_with("http://") || url.starts_with("https://") {
         if let Some(broker) = broker {
@@ -864,9 +864,13 @@ pub(crate) async fn probe_configured_url(
     anyhow::bail!("unsupported probe URL scheme")
 }
 
-pub(crate) fn probe_plan_spec(url: &str, working_dir: &std::path::Path) -> LaunchPlanSpec {
+pub(crate) fn probe_plan_spec(
+    url: &str,
+    working_dir: &std::path::Path,
+    rsync_env: &HashMap<String, String>,
+) -> LaunchPlanSpec {
     if url.starts_with("rsync://") {
-        rsync_probe_spec(url, working_dir)
+        rsync_probe_spec(url, working_dir, rsync_env)
     } else {
         http_probe_spec(url, working_dir)
     }
@@ -895,7 +899,11 @@ pub(crate) fn http_probe_spec(url: &str, working_dir: &std::path::Path) -> Launc
     }
 }
 
-pub(crate) fn rsync_probe_spec(url: &str, working_dir: &std::path::Path) -> LaunchPlanSpec {
+pub(crate) fn rsync_probe_spec(
+    url: &str,
+    working_dir: &std::path::Path,
+    env: &HashMap<String, String>,
+) -> LaunchPlanSpec {
     LaunchPlanSpec {
         operation: format!("probe-rsync-{}", short_operation_hash(url)),
         argv: vec![
@@ -906,7 +914,7 @@ pub(crate) fn rsync_probe_spec(url: &str, working_dir: &std::path::Path) -> Laun
             url.into(),
         ],
         cwd: working_dir.to_path_buf(),
-        env: HashMap::new(),
+        env: env.clone(),
     }
 }
 
@@ -923,6 +931,61 @@ impl RsyncProvider {
     /// Set the docker container name when DockerHook wraps the command.
     pub fn set_docker_container(&mut self, name: String) {
         self.docker_container_name = Some(name);
+    }
+}
+
+#[cfg(test)]
+mod config_compat_tests {
+    use crate::config::{GlobalConfig, MirrorConfig, ProviderKind};
+    use crate::provider::MirrorProvider;
+
+    #[test]
+    fn launch_plan_includes_mirror_env_with_credentials_taking_precedence() {
+        let global = GlobalConfig {
+            log_dir: "/tmp/tunasync-rsync-env-log".into(),
+            mirror_dir: "/tmp/tunasync-rsync-env-mirror".into(),
+            ..Default::default()
+        };
+        let mut mirror = MirrorConfig {
+            name: "rsync-env".into(),
+            provider: ProviderKind::Rsync,
+            upstream: "rsync://example.invalid/module/".into(),
+            username: "configured-user".into(),
+            password: "configured-password".into(),
+            check_upstream: true,
+            ..Default::default()
+        };
+        mirror.env.insert("LANG".into(), "C.UTF-8".into());
+        mirror
+            .env
+            .insert("RSYNC_PROXY".into(), "proxy.invalid:873".into());
+        mirror.env.insert("USER".into(), "env-user".into());
+        mirror
+            .env
+            .insert("RSYNC_PASSWORD".into(), "env-password".into());
+
+        let provider = super::RsyncProvider::from_config(&mirror, &global).unwrap();
+        let plans = provider.launch_plan_specs();
+        let sync = plans.iter().find(|plan| plan.operation == "sync").unwrap();
+
+        assert_eq!(sync.env.get("LANG").map(String::as_str), Some("C.UTF-8"));
+        assert_eq!(
+            sync.env.get("RSYNC_PROXY").map(String::as_str),
+            Some("proxy.invalid:873")
+        );
+        assert_eq!(
+            sync.env.get("USER").map(String::as_str),
+            Some("configured-user")
+        );
+        assert_eq!(
+            sync.env.get("RSYNC_PASSWORD").map(String::as_str),
+            Some("configured-password")
+        );
+        let probe = plans
+            .iter()
+            .find(|plan| plan.operation.starts_with("probe-rsync-"))
+            .unwrap();
+        assert_eq!(probe.env, sync.env);
     }
 }
 
@@ -946,6 +1009,7 @@ mod upstream_probe_tests {
             "rsync://127.0.0.1:1/nonexistent",
             None,
             std::path::Path::new("/tmp"),
+            &std::collections::HashMap::new(),
         )
         .await;
         assert!(

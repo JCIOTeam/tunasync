@@ -504,7 +504,13 @@ async fn probe_url(
     working_dir: &std::path::Path,
 ) -> anyhow::Result<()> {
     if url.starts_with("rsync://") {
-        return super::rsync_provider::probe_configured_url(url, broker, working_dir).await;
+        return super::rsync_provider::probe_configured_url(
+            url,
+            broker,
+            working_dir,
+            &HashMap::new(),
+        )
+        .await;
     }
     if url.starts_with("http://") || url.starts_with("https://") {
         if let Some(broker) = broker {
@@ -549,7 +555,7 @@ async fn probe_url(
 }
 
 fn probe_spec(url: &str, working_dir: &std::path::Path) -> LaunchPlanSpec {
-    super::rsync_provider::probe_plan_spec(url, working_dir)
+    super::rsync_provider::probe_plan_spec(url, working_dir, &HashMap::new())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

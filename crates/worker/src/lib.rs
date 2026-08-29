@@ -385,6 +385,64 @@ pub(crate) fn validate_worker_config(cfg: &config::WorkerConfig) -> Vec<String> 
     errors
 }
 
+fn migration_zero_value_errors(cfg: &config::WorkerConfig) -> Vec<String> {
+    let mut errors = Vec::new();
+    if !cfg.mirrors.is_empty() && cfg.global.concurrent == 0 {
+        errors.push(
+            "global.concurrent must be greater than zero when mirrors are configured; the Go worker blocks all jobs at zero, while older Rust builds silently used one"
+                .into(),
+        );
+    }
+    if cfg.server.port == 0 {
+        errors.push(
+            "server.listen_port must be greater than zero; the Go worker binds an ephemeral port but advertises port 0, while older Rust builds silently used 6000"
+                .into(),
+        );
+    }
+    for mc in &cfg.mirrors {
+        if mc.cron.is_empty()
+            && mc.effective_interval_mode(&cfg.global) == config::IntervalMode::FixedDelay
+            && mc.interval == 0
+            && cfg.global.interval == 0
+        {
+            errors.push(format!(
+                "mirror {:?}: effective interval is zero; set mirror.interval or global.interval to a positive number",
+                mc.name
+            ));
+        }
+    }
+    errors
+}
+
+fn migration_compatibility_diagnostics(cfg: &config::WorkerConfig) -> (Vec<String>, Vec<String>) {
+    let mut errors = migration_zero_value_errors(cfg);
+    let mut warnings = Vec::new();
+
+    for mc in &cfg.mirrors {
+        let configured_log_dir = if mc.log_dir.is_empty() {
+            &cfg.global.log_dir
+        } else {
+            &mc.log_dir
+        };
+        let expanded = expand_log_dir_template(configured_log_dir, mc);
+        if expanded.contains("{{") || expanded.contains("}}") {
+            errors.push(format!(
+                "mirror {:?}: log_dir contains unsupported Go template syntax; supported fields are Name, Provider, Upstream, Role, and MirrorSubDir",
+                mc.name
+            ));
+        }
+    }
+
+    if cfg.cgroup.enable {
+        warnings.push(
+            "cgroup.enable is set; tunasync-rs parses the same keys but its cgroup path/controller behavior is not identical to the Go worker. Review the deployed cgroup layout before cutover"
+                .into(),
+        );
+    }
+
+    (errors, warnings)
+}
+
 fn validate_fixed_rate(scope: &str, interval: u64, anchor: &str, errors: &mut Vec<String>) {
     if !(1..=1440).contains(&interval) {
         errors.push(format!(
@@ -731,8 +789,9 @@ fn configure_provider_broker(
 
 /// Compute the full environment map for Docker `-e` flags.
 ///
-/// Includes provider-specific env vars (TUNASYNC_* for all providers,
-/// USER/RSYNC_PASSWORD for rsync providers) plus mirror-level env overrides.
+/// Includes provider-specific env vars (TUNASYNC_* for all providers) plus
+/// mirror-level env. Explicit rsync username/password fields take precedence
+/// over same-named mirror environment entries, matching the Go provider.
 /// TUNASYNC_LOG_FILE is NOT included here — it is set dynamically from
 /// the shared `Arc<Mutex<PathBuf>>` each time `wrap_argv()` is called,
 /// so it always reflects the rotated timestamped log path.
@@ -755,7 +814,10 @@ fn compute_docker_env(
     // TUNASYNC_LOG_FILE is injected dynamically in wrap_argv() from the
     // shared Arc<Mutex<PathBuf>> — not baked into this static env map.
 
-    // Rsync-specific env vars for Rsync and TwoStageRsync providers.
+    // Mirror-level env overrides generated TUNASYNC_* defaults.
+    env.extend(mc.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+
+    // Explicit credentials override same-named mirror env entries.
     match mc.provider {
         ProviderKind::Rsync | ProviderKind::TwoStageRsync => {
             if !mc.username.is_empty() {
@@ -767,9 +829,6 @@ fn compute_docker_env(
         }
         _ => {}
     }
-
-    // Mirror-level env overrides.
-    env.extend(mc.env.iter().map(|(k, v)| (k.clone(), v.clone())));
 
     env
 }
@@ -817,8 +876,22 @@ pub fn check_config(config_path: &std::path::Path) -> Result<ConfigCheckReport> 
                 .to_string(),
         );
     }
+    if cfg.manager.legacy_token_used {
+        warnings.push(
+            "manager.token is a legacy key; it was mapped to manager.api_token. Rename it to api_token before cutover"
+                .to_string(),
+        );
+    } else if cfg.manager.legacy_token_configured {
+        warnings.push(
+            "manager.token is a legacy key and is ignored because manager.api_token is also set. Remove the legacy key before cutover"
+                .to_string(),
+        );
+    }
 
     errors.extend(validate_worker_config(&cfg));
+    let (migration_errors, migration_warnings) = migration_compatibility_diagnostics(&cfg);
+    errors.extend(migration_errors);
+    warnings.extend(migration_warnings);
 
     // Per-mirror provider checks. Scheduling validation is centralized above.
     for mc in &cfg.mirrors {
@@ -996,6 +1069,159 @@ upstream = "rsync://example.invalid/module/"
         .unwrap();
         let flat = crate::config::flatten_mirrors(&cfg.mirrors_conf);
         assert_eq!(flat[0].network_namespace, "warp0");
+    }
+
+    #[test]
+    fn docker_rsync_credentials_override_same_named_mirror_env() {
+        let mut mirror = MirrorConfig {
+            name: "docker-rsync".into(),
+            provider: ProviderKind::Rsync,
+            upstream: "rsync://example.invalid/module/".into(),
+            username: "configured-user".into(),
+            password: "configured-password".into(),
+            ..Default::default()
+        };
+        mirror.env.insert("LANG".into(), "C.UTF-8".into());
+        mirror.env.insert("USER".into(), "env-user".into());
+        mirror
+            .env
+            .insert("RSYNC_PASSWORD".into(), "env-password".into());
+
+        let env = crate::compute_docker_env(
+            &mirror,
+            &Default::default(),
+            std::path::Path::new("/srv/mirrors/docker-rsync"),
+            std::path::Path::new("/var/log/tunasync"),
+        );
+        assert_eq!(env.get("LANG").map(String::as_str), Some("C.UTF-8"));
+        assert_eq!(env.get("USER").map(String::as_str), Some("configured-user"));
+        assert_eq!(
+            env.get("RSYNC_PASSWORD").map(String::as_str),
+            Some("configured-password")
+        );
+    }
+
+    #[test]
+    fn check_config_warns_about_legacy_manager_token_without_leaking_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worker.conf");
+        std::fs::write(
+            &path,
+            r#"
+[global]
+interval = 60
+concurrent = 1
+mirror_dir = "/srv/mirrors"
+log_dir = "/var/log/tunasync"
+
+[manager]
+api_base = "http://127.0.0.1:14242"
+token = "legacy-secret"
+
+[[mirrors]]
+name = "test"
+upstream = "rsync://example.invalid/module/"
+"#,
+        )
+        .unwrap();
+
+        let report = crate::check_config(&path).unwrap();
+        let diagnostics = report.warnings.join(" ");
+        assert!(diagnostics.contains("manager.token"));
+        assert!(diagnostics.contains("api_token"));
+        assert!(!diagnostics.contains("legacy-secret"));
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
+    #[test]
+    fn check_config_prefers_canonical_api_token_and_warns_about_legacy_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worker.conf");
+        std::fs::write(
+            &path,
+            r#"
+[global]
+interval = 60
+concurrent = 1
+mirror_dir = "/srv/mirrors"
+log_dir = "/var/log/tunasync"
+
+[manager]
+api_base = "http://127.0.0.1:14242"
+token = "legacy-secret"
+api_token = "canonical-secret"
+
+[[mirrors]]
+name = "test"
+upstream = "rsync://example.invalid/module/"
+"#,
+        )
+        .unwrap();
+
+        let report = crate::check_config(&path).unwrap();
+        let diagnostics = report.warnings.join(" ");
+        assert!(diagnostics.contains("manager.token"));
+        assert!(diagnostics.contains("api_token"));
+        assert!(!diagnostics.contains("legacy-secret"));
+        assert!(!diagnostics.contains("canonical-secret"));
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
+    #[test]
+    fn migration_check_rejects_ambiguous_global_zero_values() {
+        let mut cfg = WorkerConfig::default();
+        cfg.global.interval = 0;
+        cfg.global.concurrent = 0;
+        cfg.server.port = 0;
+        cfg.mirrors = vec![MirrorConfig {
+            name: "zero-values".into(),
+            upstream: "rsync://example.invalid/module/".into(),
+            ..Default::default()
+        }];
+
+        let errors = crate::migration_zero_value_errors(&cfg).join(" ");
+        assert!(errors.contains("global.concurrent"));
+        assert!(errors.contains("server.listen_port"));
+        assert!(errors.contains("effective interval is zero"));
+    }
+
+    #[test]
+    fn migration_check_rejects_unsupported_go_log_template_and_warns_on_cgroup() {
+        let mut cfg = WorkerConfig::default();
+        cfg.global.interval = 60;
+        cfg.global.concurrent = 1;
+        cfg.global.log_dir = "/var/log/{{.Username}}".into();
+        cfg.cgroup.enable = true;
+        cfg.mirrors = vec![MirrorConfig {
+            name: "template".into(),
+            upstream: "rsync://example.invalid/module/".into(),
+            ..Default::default()
+        }];
+
+        let (errors, warnings) = crate::migration_compatibility_diagnostics(&cfg);
+        assert!(errors.join(" ").contains("log_dir"));
+        assert!(warnings.join(" ").contains("cgroup"));
+    }
+
+    #[test]
+    fn unsupported_log_template_diagnostic_redacts_upstream_and_token_secrets() {
+        let mut cfg = WorkerConfig::default();
+        cfg.global.interval = 60;
+        cfg.global.concurrent = 1;
+        cfg.global.log_dir = "/var/log/{{.Upstream}}/{{.Unsupported}}".into();
+        cfg.manager.api_token = "manager-secret".into();
+        cfg.mirrors = vec![MirrorConfig {
+            name: "secret-template".into(),
+            upstream: "https://user:password@example.invalid/data?token=upstream-secret".into(),
+            ..Default::default()
+        }];
+
+        let (errors, warnings) = crate::migration_compatibility_diagnostics(&cfg);
+        let diagnostics = format!("{} {}", errors.join(" "), warnings.join(" "));
+        assert!(diagnostics.contains("log_dir"));
+        assert!(!diagnostics.contains("password"));
+        assert!(!diagnostics.contains("upstream-secret"));
+        assert!(!diagnostics.contains("manager-secret"));
     }
 
     #[test]

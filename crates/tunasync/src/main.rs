@@ -73,6 +73,11 @@ enum Command {
         #[arg(long)]
         debug: bool,
 
+        /// Validate the config and exit without opening the database or listener.
+        /// Exit code 0 = OK (warnings allowed), 1 = errors found.
+        #[arg(long)]
+        check: bool,
+
         /// PID file path.
         #[arg(long, default_value = "/run/tunasync/tunasync.manager.pid")]
         pidfile: Option<PathBuf>,
@@ -120,11 +125,16 @@ async fn main() -> Result<()> {
             db_file,
             db_type,
             debug,
+            check,
             pidfile,
         } => {
             // debug flag elevates to trace-level; we pass it to the logger.
             tunasync_common::logger::init(cli.verbose || *debug, cli.with_systemd, true);
             tracing::info!(?config, "starting tunasync manager");
+
+            if *check && !config.exists() {
+                anyhow::bail!("manager config {} does not exist", config.display());
+            }
 
             // Load config file, then apply CLI overrides — mirrors Go's LoadConfig
             // which patches the struct with cli.Context values after TOML decode.
@@ -158,6 +168,32 @@ async fn main() -> Result<()> {
             }
             if let Some(t) = db_type {
                 cfg.files.db_type = t.clone();
+                cfg.files.db_type_explicitly_configured = true;
+            }
+
+            if *check {
+                let report = tunasync_manager::check_config(&cfg);
+                for warning in &report.warnings {
+                    eprintln!("warning: {warning}");
+                }
+                for error in &report.errors {
+                    eprintln!("error: {error}");
+                }
+                if report.errors.is_empty() {
+                    println!(
+                        "{}: OK — {} warning(s)",
+                        config.display(),
+                        report.warnings.len()
+                    );
+                    return Ok(());
+                }
+                eprintln!(
+                    "{}: {} error(s), {} warning(s)",
+                    config.display(),
+                    report.errors.len(),
+                    report.warnings.len()
+                );
+                std::process::exit(1);
             }
 
             // Write PID file if requested (best-effort, non-fatal).

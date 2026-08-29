@@ -33,11 +33,11 @@ impl RedisAdapter {
     /// The `url` parameter is the Redis connection URL, matching Go's behaviour
     /// where `db_file` holds the Redis URL.
     pub fn open(url: &str) -> DbResult<Self> {
-        let client =
-            Client::open(url).map_err(|e| DbError::Storage(format!("bad redis URL: {e}")))?;
+        let client = Client::open(url)
+            .map_err(|e| DbError::Storage(format!("bad redis URL: {:?}", e.kind())))?;
         let conn = client
             .get_connection()
-            .map_err(|e| DbError::Storage(format!("redis connect failed: {e}")))?;
+            .map_err(|e| DbError::Storage(format!("redis connect failed: {:?}", e.kind())))?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -159,5 +159,19 @@ impl DbAdapter for RedisAdapter {
 
     fn close(&self) -> DbResult<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RedisAdapter;
+
+    #[test]
+    fn invalid_url_error_does_not_echo_credentials() {
+        let error = RedisAdapter::open("redis://:manager-secret@")
+            .err()
+            .expect("invalid URL must fail")
+            .to_string();
+        assert!(!error.contains("manager-secret"));
     }
 }
