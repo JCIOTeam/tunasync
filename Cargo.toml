@@ -72,6 +72,12 @@ redis    = "0.27"
 # CLI
 clap          = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
+crossterm     = { version = "0.28", features = ["event-stream"] }
+ratatui       = "0.29"
+# Ratatui 0.29 permits newer releases that raised their MSRV above this
+# workspace's Rust 1.80 floor. Keep the compatible versions in the graph.
+instability          = "=0.3.7"
+unicode-segmentation = "=1.12.0"
 
 # Misc
 shell-words = "1"

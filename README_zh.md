@@ -478,6 +478,9 @@ tunasync worker  -c ~/tunasync_demo/worker.conf
 # 列出所有镜像状态
 tunasynctl list --all -p 14242
 
+# 打开交互式运维仪表盘
+tunasynctl tui -p 14242
+
 # 启动 / 停止 / 禁用 / 重启（支持精确名称或 glob）
 tunasynctl start   elvish      -p 14242
 tunasynctl stop    "debian-*"  -p 14242
@@ -496,6 +499,24 @@ tunasynctl maintenance enable  -p 14242
 tunasynctl maintenance status  -p 14242
 tunasynctl maintenance disable -p 14242
 ```
+
+TUI 复用常规的 `ctl.conf`、manager 地址、TLS CA 和 API token 配置。页面每 5 秒自动刷新，网络请求不会阻塞键盘操作。manager 级刷新失败时保留上次成功的完整快照；单个 Worker 暂时不可用时保留该 Worker 的旧镜像行，并在底部提示降级刷新。所有修改操作都需要确认，并精确作用于当前选中的镜像和 Worker。
+
+仪表盘需要交互式终端；脚本和服务请继续使用现有的非交互子命令。
+
+配置 API token 后，TUI 会拒绝远程明文 HTTP，因为周期刷新会反复暴露 bearer token。远程 manager 必须使用 HTTPS；`localhost`、`127.0.0.1`、`::1` 等 loopback 地址仍可使用带 token 的 HTTP。
+
+| 按键 | 操作 |
+|---|---|
+| `↑` / `↓`、`j` / `k` | 选择镜像 |
+| `w` | 循环切换 Worker 筛选 |
+| `s` | 循环切换状态筛选 |
+| `r` | 立即刷新 |
+| `a`、`x`、`R`、`d` | 启动、停止、重启或禁用选中的镜像 |
+| `Enter` / `y`、`Esc` / `n` | 确认或取消操作 |
+| `q`、`Ctrl-C` | 退出并恢复终端 |
+
+详情面板在显示 upstream 地址前会移除 URL 中的用户名、密码、查询参数和 fragment。
 
 ### Shell 自动补全
 
@@ -676,6 +697,7 @@ tunasync worker [OPTIONS]
 ```
 tunasynctl list       [--all] [-w WORKER] [--status STATUS] [--format json|table]
 tunasynctl workers
+tunasynctl tui
 tunasynctl start      <镜像名|GLOB> [-w WORKER] [-f]
 tunasynctl stop       <镜像名|GLOB> [-w WORKER]
 tunasynctl disable    <镜像名|GLOB> [-w WORKER]

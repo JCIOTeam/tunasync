@@ -22,6 +22,8 @@ use futures::future::join_all;
 use serde::Deserialize;
 use tunasync_protocol::{ClientCmd, CmdVerb, MirrorStatus, WebMirrorStatus, WorkerStatus};
 
+mod tui;
+
 // ── i18n ─────────────────────────────────────────────────────────────────────
 
 /// Returns true when the effective locale is Chinese.
@@ -255,6 +257,8 @@ enum Command {
         /// Shell type.
         shell: Shell,
     },
+    /// Open the interactive operations dashboard.
+    Tui,
     /// Manage global maintenance mode on the manager.
     ///
     /// In maintenance mode the manager rejects all incoming sync-start requests.
@@ -358,6 +362,7 @@ fn build_command() -> clap::Command {
                 )
                 .mut_arg("shell", |a| a.help("Shell 类型"))
         })
+        .mut_subcommand("tui", |s| s.about("打开交互式运维仪表盘"))
         .mut_subcommand("maintenance", |s| {
             s.about("管理 manager 全局维护模式")
                 .mut_subcommand("enable", |s| s.about("启用维护模式"))
@@ -370,6 +375,7 @@ fn build_command() -> clap::Command {
 
 // ── HTTP client ───────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct Client {
     base_url: String,
     http: reqwest::Client,
@@ -506,6 +512,32 @@ fn build_base_url(addr: &str, port: u16, has_ca_cert: bool) -> String {
     }
     let scheme = if has_ca_cert { "https" } else { "http" };
     format!("{scheme}://{addr}:{port}")
+}
+
+fn redact_url_for_log(value: &str) -> String {
+    let redacted = if let Ok(mut url) = reqwest::Url::parse(value) {
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        url.set_query(None);
+        url.set_fragment(None);
+        url.to_string()
+    } else {
+        let value = value.split(['?', '#']).next().unwrap_or_default();
+        if let Some((scheme, rest)) = value.split_once("://") {
+            let authority_end = rest.find('/').unwrap_or(rest.len());
+            let (authority, path) = rest.split_at(authority_end);
+            let authority = authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host);
+            format!("{scheme}://{authority}{path}")
+        } else {
+            value.to_owned()
+        }
+    };
+    redacted
+        .chars()
+        .map(|ch| if ch.is_control() { '�' } else { ch })
+        .collect()
 }
 
 async fn resolve_worker(
@@ -687,7 +719,7 @@ async fn main() -> Result<()> {
     });
 
     let base_url = build_base_url(&manager_addr, manager_port, ca_cert_path.is_some());
-    tracing::info!(%base_url, "connecting to manager");
+    tracing::info!(manager = %redact_url_for_log(&base_url), "connecting to manager");
     // CLI flag / env var wins over config file.
     let api_token = cli
         .api_token
@@ -698,6 +730,8 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Completion { .. } => unreachable!(),
+
+        Command::Tui => tui::run(client).await?,
 
         Command::List {
             worker,
@@ -1169,6 +1203,7 @@ mod cli_tests {
             "set-size",
             "maintenance",
             "completion",
+            "tui",
         ] {
             let cmd = build_command();
             let result = cmd.try_get_matches_from(["tunasynctl", sub, "--help"]);
@@ -1214,5 +1249,22 @@ mod cli_tests {
         assert!(result.is_err());
         // Any non-panic outcome is fine — the bug was a panic during
         // mut_arg resolution before we even got to subcommand dispatch.
+    }
+
+    #[test]
+    fn manager_log_url_redacts_credentials_and_controls() {
+        let rendered =
+            redact_url_for_log("https://alice:secret@manager.example.org/path?token=x#fragment\n");
+        assert_eq!(rendered, "https://manager.example.org/path");
+        assert!(!rendered.contains("alice"));
+        assert!(!rendered.contains("secret"));
+        assert!(!rendered.contains("token=x"));
+        assert!(!rendered.contains('\n'));
+
+        let malformed =
+            redact_url_for_log("https://alice:secret@manager.example.org:bad-port/path?token=x");
+        assert_eq!(malformed, "https://manager.example.org:bad-port/path");
+        assert!(!malformed.contains("alice"));
+        assert!(!malformed.contains("secret"));
     }
 }

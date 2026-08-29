@@ -488,6 +488,9 @@ Mirror data will be synced into `/tmp/tunasync/`.
 # List all mirror statuses
 tunasynctl list --all -p 14242
 
+# Open the interactive operations dashboard
+tunasynctl tui -p 14242
+
 # Start / stop / disable / restart a mirror (exact name or glob)
 tunasynctl start  elvish   -p 14242
 tunasynctl stop   "debian-*" -p 14242
@@ -506,6 +509,24 @@ tunasynctl maintenance enable  -p 14242
 tunasynctl maintenance status  -p 14242
 tunasynctl maintenance disable -p 14242
 ```
+
+The TUI reuses the normal `ctl.conf`, manager, TLS CA, and API token settings. It refreshes every 5 seconds without blocking keyboard input. A manager-level refresh failure keeps the last successful snapshot; if one Worker is temporarily unavailable, the dashboard keeps that Worker's previous rows and reports the degraded refresh in the footer. All mutating actions require confirmation and target the exact selected mirror/worker pair.
+
+The dashboard requires an interactive terminal; use the existing non-interactive subcommands in scripts and services.
+
+When an API token is configured, the TUI refuses remote cleartext HTTP because its periodic refreshes would repeatedly expose the bearer token. Use HTTPS for a remote manager; token-authenticated HTTP remains allowed for loopback addresses such as `localhost`, `127.0.0.1`, and `::1`.
+
+| Key | Action |
+|---|---|
+| `↑` / `↓`, `j` / `k` | Select a mirror |
+| `w` | Cycle the worker filter |
+| `s` | Cycle the status filter |
+| `r` | Refresh immediately |
+| `a`, `x`, `R`, `d` | Start, stop, restart, or disable the selected mirror |
+| `Enter` / `y`, `Esc` / `n` | Confirm or cancel an action |
+| `q`, `Ctrl-C` | Exit and restore the terminal |
+
+The detail pane strips URL userinfo, passwords, queries, and fragments from upstream addresses before rendering them.
 
 ### Shell completion
 
@@ -688,6 +709,7 @@ tunasync worker [OPTIONS]
 ```
 tunasynctl list       [--all] [-w WORKER] [--status STATUS] [--format json|table]
 tunasynctl workers
+tunasynctl tui
 tunasynctl start      <MIRROR|GLOB> [-w WORKER] [-f]
 tunasynctl stop       <MIRROR|GLOB> [-w WORKER]
 tunasynctl disable    <MIRROR|GLOB> [-w WORKER]
