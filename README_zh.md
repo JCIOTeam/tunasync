@@ -10,7 +10,17 @@
 
 ## 下载
 
-Linux（x86_64、aarch64、armv7、riscv64、loongarch64、x86_64-musl、aarch64-musl）的预编译二进制文件可在 [GitHub Releases](https://github.com/JCIOTeam/tunasync/releases) 下载。每个压缩包仅包含 `tunasync` 和 `tunasynctl`。
+Linux（x86_64、aarch64、armv7、riscv64、loongarch64、x86_64-musl、aarch64-musl）的预编译发布包可在 [GitHub Releases](https://github.com/JCIOTeam/tunasync/releases) 下载。由当前版本构建的发布包包含：
+
+```
+bin/tunasync
+bin/tunasynctl
+bin/tunasync-netns-broker
+systemd/tunasync-manager.service
+systemd/tunasync-worker.service
+systemd/tunasync-netns-broker.service
+systemd/tunasync-worker.service.d/netns.conf
+```
 
 `tunasync-migrate` 不包含在发布包中 — 它是一次性迁移工具，大多数用户切换到 Rust 版本后不再需要。获取方式：
 
@@ -19,14 +29,19 @@ Linux（x86_64、aarch64、armv7、riscv64、loongarch64、x86_64-musl、aarch64
 
 ## 从 Go 版本迁移
 
-tunasync-rs 与 Go 实现**线路兼容**：Rust manager 可以驱动 Go worker，反之亦然。配置文件格式（TOML）使用相同字段名，现有 Go 配置文件无需修改即可使用。
+tunasync-rs 与受支持的 Go API **线路兼容**：Rust manager 可以驱动 Go worker，反之亦然。Worker TOML 大体兼容，但配置语义和 manager 数据库后端并不完全相同。切换前应对实际部署文件执行两个静态检查：
 
-> **注意：** Go 版本默认端口为 **12345**，而 Rust 版本默认端口为 **14242**。迁移时请将 Rust 配置中的端口改为 Go 使用的端口，或者相应更新 worker 的 `api_base` 和 `tunasynctl` 配置。
+```bash
+tunasync manager --check -c /etc/tunasync/manager.conf
+tunasync worker --check -c /etc/tunasync/worker.conf
+```
+
+当前 Go 与 Rust manager 都默认使用端口 `14242`；较旧部署可能显式配置了其他端口。应以现有 `manager.conf`、worker `api_base` 和运维工具中的实际端口为准，不要假定历史默认值。
 
 ### 迁移步骤
 
 1. **安装 Rust 二进制** — 从 [Releases](https://github.com/JCIOTeam/tunasync/releases) 下载或从源码编译，复制到 `/usr/bin/`。如需 `tunasync-migrate`，单独构建：`cargo build --release -p tunasync-migrate`
-2. **保留配置文件** — Rust 版本读取相同的 TOML 格式，无需修改
+2. **检查并迁移配置** — 复制 TOML 后运行上述两个 `--check`。worker 检查会解析 include 和嵌套镜像、构造全部 provider、拒绝有歧义的零值、检测不支持的 Go `log_dir` 模板，并在不输出密钥值的前提下报告旧 `manager.token`。manager 检查会在打开数据库前拒绝仅 Go 支持的后端，并要求显式设置 `files.db_type`：省略该字段在 Go 中表示 BoltDB，在 Rust 中表示 redb，迁移时不能静默套用 Rust 默认值。
 3. **迁移数据** — Rust 版本默认使用 redb 作为数据库后端（Go 默认 BoltDB）。如果 Go 版本使用 BoltDB（默认），需要通过 `tunasync-migrate` 导出数据。支持两种方式：
 
    **方式 A — 离线迁移（推荐）：**
@@ -37,7 +52,8 @@ tunasync-rs 与 Go 实现**线路兼容**：Rust manager 可以驱动 Go worker�
 
    **方式 B — 在线迁移（Go manager 仍在运行）：**
    ```bash
-   tunasync-migrate http://localhost:12345 /var/lib/tunasync/new.db
+   # 若现有 Go manager 使用其他端口，请替换 14242。
+   tunasync-migrate http://localhost:14242 /var/lib/tunasync/new.db
    ```
 
    完成后修改 Rust manager 配置：
@@ -57,21 +73,25 @@ tunasync-rs 与 Go 实现**线路兼容**：Rust manager 可以驱动 Go worker�
 
 | 功能 | Go 版本 | Rust 版本 |
 |------|---------|----------|
-| 配置格式 | TOML，相同字段名 | ✅ 兼容 |
+| 配置格式 | TOML，大多数字段同名 | 大体兼容；必须运行两个 `--check` |
 | `[include]` 段 | 基于 glob 的镜像配置 | ✅ 支持 |
-| `{{.Name}}` 日志目录 | 模板展开 | ✅ 支持 |
+| `log_dir` 模板 | 完整 Go template 上下文 | 支持 `Name`、`Provider`、`Upstream`、`Role`、`MirrorSubDir`；其他表达式由检查拒绝 |
 | SIGHUP 热重载 | 重载镜像配置 | ✅ 支持 |
 | 数据库后端 | BoltDB、LevelDB、Badger、Redis | redb、sqlite、redis |
 | Docker 钩子 | 容器包装 | ✅ 兼容 |
-| Cgroup 钩子 | v1/v2 内存限制 | ✅ 兼容 |
+| Cgroup 钩子 | v1/v2 内存限制 | 字段相同，但路径/controller 行为不同；切换前需复核 |
 | Btrfs/ZFS 钩子 | 快照 | ✅ 兼容 |
 | 线路协议 | JSON REST API | ✅ 完全兼容 |
-| 默认端口 | 12345 | 14242 |
-| `tunasynctl` CLI | 相同命令 | ✅ 兼容 |
+| Manager 默认端口 | 当前 Go 为 14242 | 14242 |
+| `tunasynctl` CLI | 相同命令 | ✅ 兼容（`-p`、`-w` 短选项） |
+
+本版本补齐了这些兼容项：Go 风格的 `KiB`/`MiB`/`GiB` 内存单位、按键合并的嵌套 `env` 继承、向 rsync/two-stage 同步和 rsync 探针传递镜像 `env`，以及自动映射旧 `manager.token`。若同时存在 `token` 与 `api_token`，以 `api_token` 为准；`worker --check` 会要求删除旧字段，但不会输出任何 token 值。
+
+为保证迁移安全，`worker --check` 要求 `global.concurrent` 为正数、fixed-delay 镜像的有效 interval 为正数、`server.listen_port` 为正数。原版 Go 的这些零值会分别导致所有任务被阻塞、零延迟重复调度、以及绑定临时端口却向 manager 上报端口 0；tunasync-rs 不复现这些故障模式。为保持 Go 兼容，未知 TOML 字段仍会被忽略，因此仍需检查拼写并阅读检查输出。
 
 ## Rust 版本新功能
 
-以下功能是 tunasync-rs 独有的，Go 版本没有对应实现。全部默认关闭、按需配置，现有 Go 配置文件无需修改即可使用。
+以下功能是 tunasync-rs 独有的，Go 版本没有对应实现。它们默认关闭、按需启用，因此不会影响已经通过检查的 Go 配置。
 
 ### 磁盘配额预检
 
@@ -83,9 +103,26 @@ name = "debian"
 disk_quota = "100G"   # 镜像目录剩余空间 < 100 GiB 时跳过同步
 ```
 
-### Cron 调度
+### 调度模式、Cron 与时区
 
-用标准 5 字段 cron 表达式替代固定间隔：
+`interval_mode = "fixed-delay"` 是默认模式。下一次执行时间为本地完成时间加 `interval`；没有已持久化完成时间时，worker 会立即执行。因 blackout 被阻止的启动会在 5 分钟后重试。
+
+`fixed-rate` 按镜像生效的 IANA `timezone` 中的墙上时间槽执行，要求严格的 `fixed_rate_anchor = "HH:MM"`。`interval` 必须是 1 到 1440 分钟且能整除 1440。启动和热重载都会选择下一个未来时间槽；被 blackout 阻止、重叠或错过的时间槽会跳过，不会回补。两种模式都将发生的任务提交到既有的全局及单上游并发控制，不会绕过限制。
+
+```toml
+[global]
+timezone = "Asia/Shanghai"
+interval = 60
+interval_mode = "fixed-rate"
+fixed_rate_anchor = "00:15"
+
+[[mirrors]]
+name = "completion-based"
+interval_mode = "fixed-delay" # 显式清除继承的 fixed-rate anchor
+interval = 120
+```
+
+Cron 同样是墙上时间调度：只选择下一个未来发生时间，不追补历史发生时间。非空 `cron` 仅在 fixed-delay/默认上下文中覆盖 `interval`；它与 `interval_mode = "fixed-rate"` 冲突，校验会拒绝该配置。
 
 ```toml
 [[mirrors]]
@@ -234,7 +271,9 @@ $ tunasync worker --check -c /etc/tunasync/worker.conf
 
 ### 离线上报缓冲
 
-当对**所有** manager 地址都上报失败时，状态/大小/调度上报会被缓冲下来（每个镜像合并到最新一次），并在下一次心跳成功后自动重放——manager 短暂宕机不再永久丢失终态同步状态和流量统计。
+调度器会先提交本地状态，只把 manager I/O 放入队列。注册、持久状态恢复、上报、心跳、重放和重配置均在 report actor 中执行，因此任务发生提交、状态接收及控制命令不会等待 manager I/O。该优先可用性的启动策略意味着，本地 fixed-delay 任务可能在延迟到达的 Paused/Disabled 持久状态恢复之前运行；迟到的恢复有版本保护，不能覆盖更新的本地操作。
+
+`[global].report_max_resources` 约束上报内存：未设置或 `0` 为 1024，生效值限制在 1–4096。它分别限制保留的状态/大小上报项，以及一份完整最新 schedule 快照中的行数。超限快照会整体拒绝，绝不截断，因此配置展开后的镜像总数必须能放入该上限。该值仅在启动时读取，修改后需重启 worker。普通状态/大小遥测在预算或 256 个 FIFO 项之前严格按 FIFO 保存，溢出后才按最新值合并并淘汰最旧项。schedule 上报独立处理：从第一次入队起始终保留一份完整的 latest-wins 快照，并受其独立行数上限约束。长时间 manager 故障时遥测可能被淘汰，但本地调度继续运行；重放是有界且公平的。关闭时最多尽力排空 5 秒。
 
 ### 同步历史
 
@@ -365,6 +404,7 @@ provider = "rsync"
 upstream = "rsync://rsync.elv.sh/elvish/"
 use_ipv4 = true
 # cron = "0 3 * * *"
+# interval = 60           # 分钟；单镜像间隔示例
 # timezone = "Asia/Shanghai"
 # blackout = ["08:00-18:00 Mon-Fri"]
 # disk_quota = "100G"
@@ -407,7 +447,7 @@ db_file = "/tmp/tunasync/manager-db/tunasync.db"
 
 完整注释的参考配置见 [`examples/manager.conf`](examples/manager.conf)。
 
-`db_type` 为 `redis` 时，`db_file` 填写 Redis URL（如 `redis://localhost:6379/0`）。数据格式与 Go 版本兼容，两个版本可共享同一 Redis 实例。
+`db_type` 可取 `redb`（默认）、`sqlite` 或 `redis`。`manager --check` 要求显式填写该字段，防止依赖 Go BoltDB 默认值的旧配置静默切换数据库格式。`db_type` 为 `redis` 时，`db_file` 填写 Redis URL（如 `redis://localhost:6379/0`）。数据格式与 Go 版本兼容，两个版本可共享同一 Redis 实例。
 
 ### tunasynctl 配置 (`~/.config/tunasync/ctl.conf`)
 
@@ -488,19 +528,39 @@ TUNASYNCTL_LANG=en tunasynctl list --format table
 服务文件在 `initscripts/` 目录：
 
 ```bash
-sudo useradd -r -s /bin/false tunasync
-sudo cp target/release/{tunasync,tunasynctl} /usr/bin/
+# 仅在不存在时创建系统组/账户；使用 nologin 或 false shell。
+getent group tunasync >/dev/null || sudo groupadd --system tunasync
+id -u tunasync >/dev/null 2>&1 || sudo useradd --system --gid tunasync --shell /usr/sbin/nologin --no-create-home tunasync
+sudo cp target/release/{tunasync,tunasynctl,tunasync-netns-broker} /usr/bin/
 sudo cp initscripts/tunasync-manager.service /etc/systemd/system/
 sudo cp initscripts/tunasync-worker.service  /etc/systemd/system/
-sudo cp manager.conf worker.conf /etc/tunasync/
+sudo install -d -o root -g tunasync -m 0750 /etc/tunasync
+# 服务需要读取配置，但 tunasync 账户及组不能拥有写权限。
+sudo install -o root -g tunasync -m 0640 manager.conf worker.conf /etc/tunasync/
 sudo systemctl daemon-reload
 sudo systemctl enable --now tunasync-manager tunasync-worker
+sudo systemctl is-active tunasync-manager tunasync-worker
+sudo systemctl status tunasync-manager tunasync-worker
 
 # 热重载 worker 配置
 sudo systemctl reload tunasync-worker
 ```
 
 `--with-systemd` 会关闭日志时间戳和 ANSI 颜色，因为 systemd journal 会自行添加时间戳。
+
+随附 worker 单元使用 `ProtectSystem=strict`。systemd 仍会提供可写的 `RuntimeDirectory=`、`StateDirectory=` 和 `LogsDirectory=` 位置；任意配置的其他路径均保持只读。每个实际使用的自定义 `mirror_dir`、`staging_dir`、`log_dir`，以及必须写入的 hook 输出路径，都必须在本地 drop-in 中加 `ReadWritePaths=`：
+
+```ini
+# /etc/systemd/system/tunasync-worker.service.d/paths.conf
+[Service]
+ReadWritePaths=/data/mirrors /data/tunasync/staging /data/tunasync/log
+```
+
+需要隔离同步出口时，从发布包安装 broker 服务及 worker drop-in，生成策略，并配置 `[netns_broker]` 和镜像的 `network_namespace`；参见[网络命名空间出口](docs/network-namespaces_zh.md)和 [English guide](docs/network-namespaces.md)。完整指南给出必需顺序：创建账户；安装；配置命名空间/防火墙；安装 root 控制的配置；生成/检查策略；daemon-reload；先启用/启动 broker 再启动 worker；验证单元及命名空间。broker 单元对策略使用 `ConditionPathExists=`，故必须先生成策略才能启动。
+
+### 网络命名空间出口
+
+Linux worker 可让一个镜像的同步命令和探针进入预先存在的命名网络命名空间。这是可选的 root broker 设计，并不负责创建命名空间、管理 VPN 或充当出口防火墙。仅有路由/NAT 不能限制目的地；请通过站点 DNS、路由和默认拒绝防火墙强制仅允许的目的地。最小流程：从发布包安装 `tunasync-netns-broker` 与两个 systemd 文件，配置 `[netns_broker]` 和 `network_namespace`，生成 `/etc/tunasync/netns-policy.json`，然后启用 broker 与 worker 依赖 drop-in。完整安全模型、部署步骤、策略生命周期和 Cloudflare One 边界见 [docs/network-namespaces_zh.md](docs/network-namespaces_zh.md)（[English](docs/network-namespaces.md)）。
 
 ### 使用 SysVinit (init.d) 运行
 
@@ -530,7 +590,7 @@ sudo rc-service tunasync-worker reload   # 热重载
 
 ```bash
 cargo build --release
-# 产物：target/release/{tunasync, tunasynctl}
+# 产物：target/release/{tunasync, tunasynctl, tunasync-netns-broker}
 
 cargo test --workspace       # 完整测试套件（含线路兼容性验证）
 cargo clippy --workspace
@@ -542,6 +602,8 @@ cargo fmt --all
 ```
 crates/
 ├── protocol/    # 线路类型 — 与 Go 的 internal/msg.go JSON 兼容
+├── netns/       # Linux 网络命名空间 broker 协议和校验
+├── netns-broker/# 有特权、受策略约束的命名空间执行 broker
 ├── common/      # 日志、HTTP 客户端、配置加载、工具函数
 ├── manager/     # Manager HTTP 服务器（axum），redb/sqlite/redis 存储
 ├── worker/      # Worker 运行时：调度器、任务状态机、provider、hooks
@@ -601,9 +663,12 @@ tunasync manager [OPTIONS]
       --port <PORT>        覆盖监听端口（默认 14242）
       --cert / --key       TLS 证书/密钥（启用 HTTPS）
       --db-file / --db-type  覆盖数据库路径/类型
+      --check              不打开数据库/监听器，仅校验配置
 
 tunasync worker [OPTIONS]
   -c, --config <CONFIG>    配置文件 [默认: /etc/tunasync/worker.conf]
+      --check              不启动 worker，校验配置/include/provider
+      --emit-netns-policy <PATH>  生成 broker policy 后退出
 ```
 
 ### `tunasynctl`
@@ -637,7 +702,7 @@ tunasync-migrate <go-manager-url 或 bolt 文件路径> <sqlite 输出路径>
 tunasync-migrate /var/lib/tunasync/tunasync.db /var/lib/tunasync/new.db
 
 # 在线（Go manager 正在运行）
-tunasync-migrate http://localhost:12345 /var/lib/tunasync/new.db
+tunasync-migrate http://localhost:14242 /var/lib/tunasync/new.db
 ```
 
 ## 线路兼容性
@@ -661,13 +726,15 @@ tunasync-migrate http://localhost:12345 /var/lib/tunasync/new.db
 | Manager：数据库 | redb、sqlite、redis | 不支持 BoltDB/LevelDB/Badger |
 | Manager：GET /jobs/:name | 含 `error_msg` 的镜像详情 | 前端新接口 |
 | Manager：维护模式 | `POST/DELETE/GET /maintenance` | Go 无此功能 |
-| Worker：调度 | Cron + 时区 + Blackout | Go 无此功能 |
+| Worker：调度 | Fixed-delay/fixed-rate + Cron、时区、Blackout | Go 无此功能 |
+| Worker：命名空间出口 | 经 broker 的每镜像 Linux 网络命名空间隔离 | Go 无此功能 |
+| Worker：manager 上报 | 非阻塞 report actor，有界重放/合并 | Go 无此功能 |
 | Worker：磁盘配额 | 同步前空间检查 | Go 无此功能 |
 | Worker：优先级 | `PrioritySemaphore` 排序 | Go 无此功能 |
 | Worker：原子发布 | `renameat2(RENAME_EXCHANGE)` 交换 | Go 无此功能 |
 | Worker：上游探测 | 并发探测，15 秒硬超时 | Go 无此功能 |
 | Worker：实时日志 SSE | `GET /jobs/:mirror/log/stream` | Go 无此功能 |
-| 默认端口 | 14242（Go：12345） | 有意区分，避免冲突 |
+| 配置迁移 | manager/worker 静态 `--check`；仅 Go 支持的数据库必须迁移 | 防止静默语义漂移 |
 
 ## API 参考
 

@@ -10,7 +10,17 @@ A Rust port of [`tuna/tunasync`](https://github.com/tuna/tunasync), the mirror j
 
 ## Download
 
-Pre-built binaries for Linux (x86_64, aarch64, armv7, riscv64, loongarch64, x86_64-musl, aarch64-musl) are available at [GitHub Releases](https://github.com/JCIOTeam/tunasync/releases). Each archive contains `tunasync` and `tunasynctl` only.
+Pre-built Linux archives (x86_64, aarch64, armv7, riscv64, loongarch64, x86_64-musl, aarch64-musl) are available at [GitHub Releases](https://github.com/JCIOTeam/tunasync/releases). Release archives built from this revision contain:
+
+```
+bin/tunasync
+bin/tunasynctl
+bin/tunasync-netns-broker
+systemd/tunasync-manager.service
+systemd/tunasync-worker.service
+systemd/tunasync-netns-broker.service
+systemd/tunasync-worker.service.d/netns.conf
+```
 
 `tunasync-migrate` is not included in the release archives — it is a one-time migration tool that most users won't need after switching to the Rust version. You can obtain it by:
 
@@ -19,14 +29,19 @@ Pre-built binaries for Linux (x86_64, aarch64, armv7, riscv64, loongarch64, x86_
 
 ## Migrating from the Go version
 
-tunasync-rs is **wire-compatible** with the Go implementation: a Rust manager can drive Go workers and vice versa. The config file format (TOML) uses the same keys, so existing Go config files work without modification.
+tunasync-rs is **wire-compatible** with the supported Go API: a Rust manager can drive Go workers and vice versa. Worker TOML is largely compatible, but configuration semantics and manager database backends are not identical. Run both static checks against the exact files you will deploy before cutover:
 
-> **Note:** The Go version defaults to port **12345**, while the Rust version defaults to port **14242**. If you are migrating, either change the Rust config to match the Go port, or update the worker `api_base` and `tunasynctl` config accordingly.
+```bash
+tunasync manager --check -c /etc/tunasync/manager.conf
+tunasync worker --check -c /etc/tunasync/worker.conf
+```
+
+Current Go and Rust managers both default to port `14242`; older deployments may use another explicitly configured port. Use the actual port from the existing `manager.conf`, worker `api_base`, and operator tooling rather than assuming a historical default.
 
 ### Migration steps
 
 1. **Install the Rust binaries** — download `tunasync` and `tunasynctl` from [Releases](https://github.com/JCIOTeam/tunasync/releases) or build from source, then copy to `/usr/bin/`. If you need `tunasync-migrate`, build it separately: `cargo build --release -p tunasync-migrate`.
-2. **Keep the config files** — the Rust version reads the same TOML format. No changes needed.
+2. **Check and migrate the configs** — copy the TOML files, then run the two `--check` commands above. The worker check resolves includes and nested mirrors, constructs every provider, rejects ambiguous zero values, detects unsupported Go `log_dir` templates, and reports legacy `manager.token` without printing its value. The manager check rejects Go-only database backends before opening any database. It also requires an explicit `files.db_type`: omitting it means BoltDB in Go but redb in Rust, so silently applying the Rust default would be unsafe during migration.
 3. **Migrate data** — the Rust version uses a different default DB backend (redb instead of BoltDB). If the Go version uses BoltDB (the default), you need to export the data with `tunasync-migrate`. Two modes are available:
 
    **Option A — Offline migration (recommended, no downtime constraint):**
@@ -41,8 +56,8 @@ tunasync-rs is **wire-compatible** with the Go implementation: a Rust manager ca
    **Option B — Online migration (Go manager still running):**
    Useful when you want to prepare the new DB while the Go version is still serving:
    ```bash
-   # Go manager defaults to port 12345
-   tunasync-migrate http://localhost:12345 /var/lib/tunasync/new.db
+   # Replace 14242 with the existing Go manager's configured port if different.
+   tunasync-migrate http://localhost:14242 /var/lib/tunasync/new.db
    ```
 
    After either option, update the Rust manager config:
@@ -62,21 +77,25 @@ tunasync-rs is **wire-compatible** with the Go implementation: a Rust manager ca
 
 | Feature | Go version | Rust version |
 |---------|-----------|--------------|
-| Config format | TOML, same keys | ✅ Compatible |
+| Config format | TOML, mostly the same keys | Largely compatible; run both `--check` commands |
 | `[include]` section | Glob-based mirror configs | ✅ Supported |
-| `{{.Name}}` in log_dir | Template expansion | ✅ Supported |
+| `log_dir` templates | Full Go template context | Supports `Name`, `Provider`, `Upstream`, `Role`, `MirrorSubDir`; check rejects other expressions |
 | SIGHUP hot-reload | Reload mirror config | ✅ Supported |
 | DB backends | BoltDB, LevelDB, Badger, Redis | redb, sqlite, redis |
 | Docker hook | Container wrapping | ✅ Compatible |
-| Cgroup hook | v1/v2 memory limit | ✅ Compatible |
+| Cgroup hook | v1/v2 memory limit | Same keys, different path/controller behavior; review before cutover |
 | Btrfs/ZFS hooks | Snapshot before/after | ✅ Compatible |
 | Wire protocol | JSON REST API | ✅ Fully compatible |
-| Default port | 12345 | 14242 |
+| Default manager port | 14242 in current Go | 14242 |
 | `tunasynctl` CLI | Same commands | ✅ Compatible (`-p`, `-w` short flags) |
+
+Compatibility fixes in this revision include Go-style `KiB`/`MiB`/`GiB` memory limits, key-by-key nested `env` inheritance, mirror `env` propagation to rsync/two-stage syncs and rsync probes, and automatic legacy `manager.token` mapping. If both `token` and `api_token` are present, `api_token` wins; `worker --check` asks you to remove the legacy key without exposing either value.
+
+For migration safety, `worker --check` requires positive `global.concurrent`, positive effective interval for fixed-delay mirrors, and positive `server.listen_port`. The original Go zero values lead respectively to blocked jobs, zero-delay rescheduling, and an ephemeral listener advertised as port zero; tunasync-rs does not reproduce those failure modes. Unknown TOML keys are still ignored for Go compatibility, so review check output and compare spelling carefully.
 
 ## New features in the Rust port
 
-The following features are unique to tunasync-rs and have no Go equivalent. All are opt-in via config and default to off, so existing Go configs work unchanged.
+The following features are unique to tunasync-rs and have no Go equivalent. They are opt-in and default to off, so they do not affect a checked Go configuration unless explicitly enabled.
 
 ### Disk quota pre-sync check
 
@@ -88,9 +107,26 @@ name = "debian"
 disk_quota = "100G"   # skip sync if < 100 GiB free in mirror dir
 ```
 
-### Cron-style scheduling
+### Scheduling modes, cron, and timezones
 
-Schedule syncs with a standard 5-field cron expression instead of a fixed interval. Overrides the `interval` field when set.
+`interval_mode = "fixed-delay"` is the default. Its next occurrence is local completion plus `interval`; a worker with no persisted completion starts immediately. A start blocked by a blackout retries in five minutes.
+
+`fixed-rate` uses wall-clock slots in the mirror's effective IANA `timezone` and requires a strict `fixed_rate_anchor = "HH:MM"`. Its `interval` must be 1 through 1440 minutes and divide 1440. Startup and reload select the next future slot. A blocked, overlapping, or missed slot is skipped rather than backfilled. Both modes submit occurrences through the existing global and per-upstream concurrency controls; scheduling never bypasses those limits.
+
+```toml
+[global]
+timezone = "Asia/Shanghai"
+interval = 60
+interval_mode = "fixed-rate"
+fixed_rate_anchor = "00:15"  # 00:15, 01:15, ... in Asia/Shanghai
+
+[[mirrors]]
+name = "completion-based"
+interval_mode = "fixed-delay" # explicitly clears the inherited fixed-rate anchor
+interval = 120
+```
+
+Cron schedules are wall-clock schedules: they select the next future occurrence and do not catch up historical occurrences. A non-empty `cron` overrides `interval` only in the fixed-delay/default context. `cron` conflicts with `interval_mode = "fixed-rate"` and is rejected by validation.
 
 ```toml
 [[mirrors]]
@@ -239,7 +275,9 @@ Validates the config without starting anything: TOML parsing, include merging, l
 
 ### Offline report buffering
 
-Status/size/schedule reports that fail against **all** manager bases are buffered (coalesced to the latest per mirror) and replayed automatically on the next successful heartbeat — a manager outage no longer permanently loses terminal sync states or traffic statistics.
+The scheduler commits local state and only enqueues manager I/O. Registration, persisted-state restore, reports, heartbeats, replay, and reconfiguration run in a report actor, so occurrence submission, status intake, and commands never wait for manager I/O. This availability-first startup means a local fixed-delay occurrence may run before a delayed persisted Paused/Disabled restore arrives; a late restore is version-guarded and cannot overwrite a newer local action.
+
+`[global].report_max_resources` bounds reporting memory: absent or `0` means 1024, and effective values clamp to 1–4096. It independently limits retained status/size entries and rows in one complete latest schedule snapshot. Snapshots over the limit are rejected whole, never truncated, so the configured flattened mirror count must fit. It is startup-only: changing it requires a worker restart. Ordinary status/size telemetry is FIFO until the budget or 256 ordinary entries is reached, then overflow coalesces latest values and evicts oldest entries. Schedule reporting is separate: from its first enqueue it retains one complete latest-wins snapshot, subject to its independent row bound. During a long manager outage telemetry can therefore be evicted, but local scheduling continues; replay is bounded and fair. Shutdown makes a best-effort drain for five seconds.
 
 ### Sync history
 
@@ -419,7 +457,7 @@ db_file = "/tmp/tunasync/manager-db/tunasync.db"
 
 A fully-commented reference config is available at [`examples/manager.conf`](examples/manager.conf).
 
-Supported `db_type` values: `redb` (default), `sqlite`, `redis`. When using Redis, set `db_file` to a Redis URL (e.g. `redis://localhost:6379/0`). Data is wire-compatible with Go — both versions can share the same Redis instance.
+Supported `db_type` values: `redb` (default), `sqlite`, `redis`. `manager --check` requires this field to be explicit so an old Go config that relied on the BoltDB default cannot silently switch formats. When using Redis, set `db_file` to a Redis URL (e.g. `redis://localhost:6379/0`). Data is wire-compatible with Go — both versions can share the same Redis instance.
 
 ### tunasynctl config (`~/.config/tunasync/ctl.conf`)
 
@@ -502,19 +540,39 @@ For encrypted worker-manager communication, set both `ssl_cert` and `ssl_key` on
 Service files are provided in the `initscripts/` directory.
 
 ```bash
-sudo useradd -r -s /bin/false tunasync
-sudo cp target/release/{tunasync,tunasynctl} /usr/bin/
+# Create the system group/account only when absent; use a nologin or false shell.
+getent group tunasync >/dev/null || sudo groupadd --system tunasync
+id -u tunasync >/dev/null 2>&1 || sudo useradd --system --gid tunasync --shell /usr/sbin/nologin --no-create-home tunasync
+sudo cp target/release/{tunasync,tunasynctl,tunasync-netns-broker} /usr/bin/
 sudo cp initscripts/tunasync-manager.service /etc/systemd/system/
 sudo cp initscripts/tunasync-worker.service  /etc/systemd/system/
-sudo cp manager.conf worker.conf /etc/tunasync/
+sudo install -d -o root -g tunasync -m 0750 /etc/tunasync
+# The services need read access, but the tunasync account/group must not have write access.
+sudo install -o root -g tunasync -m 0640 manager.conf worker.conf /etc/tunasync/
 sudo systemctl daemon-reload
 sudo systemctl enable --now tunasync-manager tunasync-worker
+sudo systemctl is-active tunasync-manager tunasync-worker
+sudo systemctl status tunasync-manager tunasync-worker
 
 # Hot-reload worker config (reads from disk, diffs against running state)
 sudo systemctl reload tunasync-worker
 ```
 
 The `--with-systemd` flag suppresses timestamps and ANSI colours since systemd journal adds its own timestamps.
+
+The packaged worker unit uses `ProtectSystem=strict`. systemd also provisions writable `RuntimeDirectory=`, `StateDirectory=`, and `LogsDirectory=` locations; arbitrary configured paths remain read-only. Add local `ReadWritePaths=` entries for every effective custom `mirror_dir`, `staging_dir`, and `log_dir`, and for every hook output path which must be writable:
+
+```ini
+# /etc/systemd/system/tunasync-worker.service.d/paths.conf
+[Service]
+ReadWritePaths=/data/mirrors /data/tunasync/staging /data/tunasync/log
+```
+
+For isolated sync egress, install the broker service and worker drop-in from the release archive, generate the policy, and configure `[netns_broker]` plus per-mirror `network_namespace`; see [Network namespace egress](docs/network-namespaces.md) and [中文说明](docs/network-namespaces_zh.md). The full guide gives the required order: create account; install; configure namespace/firewall; install root-controlled config; generate/check policy; daemon-reload; enable/start broker then worker; verify units and namespace. The broker unit has `ConditionPathExists=` for its policy, so generate policy before starting it.
+
+### Network namespace egress
+
+Linux workers can run a mirror's sync commands and probes through a pre-existing named network namespace. This is an opt-in root-broker design, not a namespace, VPN, or egress firewall manager. Routing/NAT alone is not destination containment: enforce approved destinations with site DNS, routing, and a default-deny firewall. Minimal setup: install `tunasync-netns-broker` and the two systemd files from the archive, configure `[netns_broker]` and `network_namespace`, emit `/etc/tunasync/netns-policy.json`, then enable the broker and worker dependency drop-in. Read the full security model, deployment procedure, policy lifecycle, and Cloudflare One boundary in [docs/network-namespaces.md](docs/network-namespaces.md) (or [Chinese](docs/network-namespaces_zh.md)).
 
 ### Running with SysVinit (init.d)
 
@@ -544,7 +602,7 @@ Requires Rust stable (≥ 1.80). See `rust-toolchain.toml`.
 
 ```bash
 cargo build --release
-# Binaries: target/release/{tunasync, tunasynctl}
+# Binaries: target/release/{tunasync, tunasynctl, tunasync-netns-broker}
 
 cargo test --workspace       # full suite including wire-compat conformance
 cargo clippy --workspace
@@ -556,6 +614,8 @@ cargo fmt --all
 ```
 crates/
 ├── protocol/    # Wire types — JSON-compatible with Go's internal/msg.go
+├── netns/       # Shared Linux network-namespace broker protocol and validation
+├── netns-broker/# Privileged, policy-constrained namespace execution broker
 ├── common/      # Logging, HTTP client helpers, config loader, util
 ├── manager/     # Manager HTTP server (axum), redb/sqlite/redis storage
 ├── worker/      # Worker runtime: scheduler, job FSM, providers, hooks
@@ -615,9 +675,12 @@ tunasync manager [OPTIONS]
       --port <PORT>        Override listen port (default 14242)
       --cert / --key       TLS certificate/key (enables HTTPS)
       --db-file / --db-type  Override DB path / type
+      --check              Validate config without opening DB/listener
 
 tunasync worker [OPTIONS]
   -c, --config <CONFIG>    Config file [default: /etc/tunasync/worker.conf]
+      --check              Validate config/includes/providers without starting
+      --emit-netns-policy <PATH>  Generate broker policy and exit
 ```
 
 ### `tunasynctl`
@@ -651,7 +714,7 @@ tunasync-migrate <go-manager-url-or-bolt-file> <sqlite-output-file>
 tunasync-migrate /var/lib/tunasync/tunasync.db /var/lib/tunasync/new.db
 
 # Online (Go manager running)
-tunasync-migrate http://localhost:12345 /var/lib/tunasync/new.db
+tunasync-migrate http://localhost:14242 /var/lib/tunasync/new.db
 ```
 
 ## Wire compatibility
@@ -675,13 +738,15 @@ Notable subtleties:
 | Manager: DB | redb, sqlite, redis | BoltDB/LevelDB/Badger not supported |
 | Manager: GET /jobs/:name | Mirror detail with `error_msg` | New endpoint for frontends |
 | Manager: maintenance mode | `POST/DELETE/GET /maintenance` | No Go equivalent |
-| Worker: scheduling | Cron + timezone + blackout | No Go equivalent |
+| Worker: scheduling | Fixed-delay/fixed-rate + cron, timezone, blackout | No Go equivalent |
+| Worker: namespace egress | Brokered per-mirror Linux network namespace isolation | No Go equivalent |
+| Worker: manager reporting | Nonblocking report actor with bounded replay/coalescing | No Go equivalent |
 | Worker: disk quota | Pre-sync free space check | No Go equivalent |
 | Worker: priority | `PrioritySemaphore` for job ordering | No Go equivalent |
 | Worker: atomic publish | `renameat2(RENAME_EXCHANGE)` swap | No Go equivalent |
 | Worker: upstream probe | Concurrent probe with 15s timeout | No Go equivalent |
 | Worker: live log SSE | `GET /jobs/:mirror/log/stream` | No Go equivalent |
-| Default port | 14242 (Go: 12345) | Intentional, avoids conflict |
+| Configuration migration | Static manager/worker `--check`; Go-only DBs require data migration | Prevent silent semantic drift |
 
 ## API Reference
 

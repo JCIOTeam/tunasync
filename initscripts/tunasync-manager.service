@@ -6,6 +6,7 @@ Requires=network.target
 [Service]
 Type=simple
 User=tunasync
+ExecStartPre=/usr/bin/tunasync manager --check -c /etc/tunasync/manager.conf --with-systemd
 ExecStart=/usr/bin/tunasync manager -c /etc/tunasync/manager.conf --with-systemd
 Restart=on-failure
 RestartSec=5
